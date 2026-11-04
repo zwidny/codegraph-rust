@@ -29,38 +29,112 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_value as mv  # noqa: E402  (reuse the env loader and the MCP stdio client)
 
-SYSTEM = """You are a code agent working inside a git worktree. Solve the task by inspecting
-files and editing them. Reply with exactly one JSON object per turn and nothing else:
+SYSTEM = """You are a code agent working inside a git worktree. Solve the task by
+inspecting files and editing them. Call exactly one tool per turn.
 
-  {"thought": "<short reasoning>", "tool": "read_file", "args": {"path": "crates/x/src/lib.rs"}}
-  {"thought": "...", "tool": "grep", "args": {"pattern": "fn reconcile_catalog"}}
-  {"thought": "...", "tool": "list_files", "args": {"glob": "crates/codegraph-mcp/src/**/*.rs"}}
-  {"thought": "...", "tool": "apply_patch", "args": {"path": "a.rs", "old": "<exact text>", "new": "<replacement>"}}
-  {"thought": "...", "tool": "done", "args": {"summary": "<what you changed>"}}
-
-{tool_doc}
 Rules:
 - Paths are relative to the repository root.
 - `old` in apply_patch must be an exact substring that occurs exactly once in the file.
 - Prefer the smallest correct edit. Do not rewrite whole files.
 - Keep going until you have edited at least one file; reading alone scores zero.
+- Once you have located the code to change, call apply_patch. Do not spend the whole
+  budget reading: a partial edit scores better than no edit.
 - You have at most {max_steps} tool calls. Call done as soon as the change is complete.
 """
 
-CODEGRAPH_DOC = """
-You also have graph tools that answer questions grep cannot:
-  {"thought": "...", "tool": "semantic_code_search", "args": {"query": "where the catalog is reconciled per file"}}
-  {"thought": "...", "tool": "get_reverse_dependencies", "args": {"node_id": "nodes:`...`"}}
-    -> who calls this node (use the node_id returned by semantic_code_search)
+GRAPH_HINT = """
+You also have two graph tools. Use them instead of guessing keywords:
+- semantic_code_search: searches the indexed code by meaning. Call it whenever you do not
+  already know the exact file or symbol name; grep only matches literal strings.
+- get_reverse_dependencies: lists the callers of a node_id returned by semantic_code_search.
 """
 
-BASE_TOOLS = """
-Baseline tools: read_file(path, offset?, limit?), grep(pattern), list_files(glob),
-apply_patch(path, old, new), done(summary).
-"""
-
-MAX_OUTPUT_CHARS = 6000
+MAX_OUTPUT_CHARS = 3000
 MAX_READ_LINES = 160
+
+TOOL_SCHEMAS = {
+    "read_file": {
+        "description": "Read a file from the worktree, with 1-based line numbers.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "path relative to the repo root"},
+                "offset": {"type": "integer", "description": "first line to return (1-based)"},
+                "limit": {"type": "integer", "description": "how many lines to return"},
+            },
+            "required": ["path"],
+        },
+    },
+    "grep": {
+        "description": "Literal text search across source files; returns file:line:content.",
+        "parameters": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    },
+    "list_files": {
+        "description": "List files matching a glob relative to the repo root.",
+        "parameters": {
+            "type": "object",
+            "properties": {"glob": {"type": "string"}},
+            "required": ["glob"],
+        },
+    },
+    "apply_patch": {
+        "description": "Replace one exact substring in a file. `old` must occur exactly once.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old": {"type": "string"},
+                "new": {"type": "string"},
+            },
+            "required": ["path", "old", "new"],
+        },
+    },
+    "done": {
+        "description": "Finish the task. Call this once the edit is complete.",
+        "parameters": {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+        },
+    },
+    "semantic_code_search": {
+        "description": "Search the code graph by meaning; returns name, file:line and node_id.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    },
+    "get_reverse_dependencies": {
+        "description": "List who calls a node. Pass a node_id returned by semantic_code_search.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+                "depth": {"type": "integer"},
+            },
+            "required": ["node_id"],
+        },
+    },
+}
+
+BASE_TOOL_NAMES = ["read_file", "grep", "list_files", "apply_patch", "done"]
+CODEGRAPH_TOOL_NAMES = BASE_TOOL_NAMES + ["semantic_code_search", "get_reverse_dependencies"]
+
+
+def tool_schemas(arm):
+    names = CODEGRAPH_TOOL_NAMES if arm == "codegraph" else BASE_TOOL_NAMES
+    return [
+        {"type": "function", "function": {"name": name, **TOOL_SCHEMAS[name]}}
+        for name in names
+    ]
 
 
 # --------------------------------------------------------------------- tasks
@@ -102,6 +176,8 @@ def pick_tasks(root, count, max_files=1, min_lines=6, max_lines=60):
             continue
         if any(not _is_code(path) for path in task["files"]):
             continue
+        if any(_too_large(root, path, max_lines=900) for path in task["files"]):
+            continue
         if len(task["subject"]) < 20:
             continue
         task["golden"] = sorted(set(task["files"]))
@@ -109,6 +185,14 @@ def pick_tasks(root, count, max_files=1, min_lines=6, max_lines=60):
         if len(picked) >= count:
             break
     return picked
+
+
+def _too_large(root, path, max_lines=900):
+    """A 2000-line file is a navigation task of its own; keep tasks tractable."""
+    try:
+        return sum(1 for _ in (Path(root) / path).open(errors="ignore")) > max_lines
+    except OSError:
+        return True
 
 
 def _is_code(path):
@@ -149,23 +233,31 @@ class Llm:
         self.prompt_tokens = 0
         self.completion_tokens = 0
 
-    def chat(self, messages, max_tokens=1500):
-        payload = json.dumps({
+    def chat(self, messages, tools=None, max_tokens=1500):
+        body = {
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0,
-        }).encode()
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        payload = json.dumps(body).encode()
         request = urllib.request.Request(
             self.url, data=payload, method="POST",
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.key}"},
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            body = json.loads(response.read())
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")[:500]
+            raise RuntimeError(f"LLM HTTP {error.code}: {detail}") from error
         usage = body.get("usage") or {}
         self.prompt_tokens += usage.get("prompt_tokens", 0)
         self.completion_tokens += usage.get("completion_tokens", 0)
-        return (body["choices"][0]["message"].get("content") or "").strip()
+        return body["choices"][0]["message"]
 
 
 def parse_action(text):
@@ -250,61 +342,118 @@ class Workspace:
                        capture_output=True, text=True)
 
 
-def run_agent(llm, workspace, problem, arm, max_steps, client=None, log=None):
-    tool_doc = BASE_TOOLS + (CODEGRAPH_DOC if arm == "codegraph" else "")
+def trim_messages(messages, budget_chars=90000, floor=2000):
+    """Shrink the oldest tool observations until the transcript fits the budget.
+
+    Both arms get the same treatment, so a long run measures the tool list and not which
+    arm happened to overflow first.
+    """
+    total = sum(len(str(message.get("content") or "")) for message in messages)
+    if total <= budget_chars:
+        return
+    for message in messages:
+        if total <= budget_chars:
+            break
+        if message.get("role") != "tool":
+            continue
+        text = str(message.get("content") or "")
+        if len(text) <= floor:
+            continue
+        keep = floor
+        total -= len(text) - keep
+        message["content"] = text[:keep] + "\n[truncated]"
+
+
+def execute_tool(name, args, workspace, client, arm):
+    """Run one tool call and return the observation text."""
+    if name == "semantic_code_search" and arm == "codegraph" and client:
+        payload = client.call("semantic_code_search",
+                              {"query": str(args.get("query", "")),
+                               "limit": int(args.get("limit") or 8)})
+        rows = json.loads(payload).get("result", [])
+        return "\n".join(
+            f"{row.get('name')} | {row.get('file_path')}:{row.get('start_line')} | {row.get('node_id', '')}"
+            for row in rows[:8]
+        ) or "(no results)"
+    if name == "get_reverse_dependencies" and arm == "codegraph" and client:
+        payload = client.call("get_reverse_dependencies",
+                              {"node_id": str(args.get("node_id", "")),
+                               "edge_type": "calls",
+                               "depth": int(args.get("depth") or 1)})
+        rows = json.loads(payload).get("result", [])
+        return "\n".join(
+            f"{row.get('name')} | {(row.get('location') or {}).get('file_path')}"
+            for row in rows[:10]
+        ) or "(no callers)"
+    if name in {"read_file", "grep", "list_files", "apply_patch"}:
+        return getattr(workspace, name)(**args)
+    return f"error: unknown tool {name}"
+
+
+def run_agent(llm, workspace, problem, arm, max_steps, client=None):
+    """Drive the model with native tool calling; one tool per turn, capped at max_steps."""
+    tools = tool_schemas(arm)
+    system = SYSTEM.replace("{max_steps}", str(max_steps))
+    if arm == "codegraph":
+        system += GRAPH_HINT
     messages = [
-        {"role": "system", "content": SYSTEM.replace("{tool_doc}", tool_doc)
-                                          .replace("{max_steps}", str(max_steps))},
+        {"role": "system", "content": system},
         {"role": "user", "content": f"Task: {problem}"},
     ]
     steps, started = [], time.time()
-    step, invalid_streak = 0, 0
-    while step < max_steps and invalid_streak < 3:
-        reply = llm.chat(messages)
-        action = parse_action(reply)
-        if not action:
-            invalid_streak += 1
-            steps.append({"step": step + 1, "tool": "invalid", "reply": reply[:200]})
-            messages.append({"role": "assistant", "content": reply[:2000] or "(empty)"})
-            messages.append({"role": "user", "content":
-                             'Reply with exactly one JSON object containing a "tool" key.'})
-            continue
-        invalid_streak = 0
-        step += 1
-        name = action.get("tool")
-        args = action.get("args") or {}
+    step, no_tool = 0, 0
+    while step < max_steps and no_tool < 2:
+        message = llm.chat(messages, tools)
+        calls = message.get("tool_calls") or []
+        if not calls:
+            # Some models still answer with a JSON action in content; accept that shape.
+            action = parse_action(message.get("content") or "")
+            if action:
+                calls = [{
+                    "id": f"call_{step}",
+                    "type": "function",
+                    "function": {"name": action["tool"],
+                                 "arguments": json.dumps(action.get("args") or {})},
+                }]
+            else:
+                no_tool += 1
+                messages.append({"role": "assistant", "content": message.get("content") or "(no tool call)"})
+                messages.append({"role": "user", "content": "Call exactly one of the provided tools."})
+                continue
+        call = calls[0]
+        function = call.get("function") or {}
+        name = function.get("name") or ""
+        try:
+            args = json.loads(function.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        assistant_message = {
+            "role": "assistant",
+            "content": message.get("content"),
+            "tool_calls": [{"id": call.get("id") or f"call_{step}", "type": "function",
+                            "function": function}],
+        }
+        # Thinking models reject a follow-up turn that drops their reasoning trace.
+        if message.get("reasoning_content"):
+            assistant_message["reasoning_content"] = message["reasoning_content"]
+        messages.append(assistant_message)
         if name == "done":
-            steps.append({"step": step, "tool": "done", "summary": str(args.get("summary"))[:200]})
+            steps.append({"step": step + 1, "tool": "done",
+                          "summary": str(args.get("summary"))[:200]})
             break
         try:
-            if name == "semantic_code_search" and arm == "codegraph" and client:
-                payload = client.call("semantic_code_search",
-                                      {"query": str(args.get("query", "")), "limit": 8})
-                rows = json.loads(payload).get("result", [])
-                observation = "\n".join(
-                    f"{row.get('name')} | {row.get('file_path')}:{row.get('start_line')} | {row.get('node_id', '')}"
-                    for row in rows[:8]
-                ) or "(no results)"
-            elif name == "get_reverse_dependencies" and arm == "codegraph" and client:
-                payload = client.call("get_reverse_dependencies",
-                                      {"node_id": str(args.get("node_id", "")),
-                                       "edge_type": "calls", "depth": 1})
-                rows = json.loads(payload).get("result", [])
-                observation = "\n".join(
-                    f"{row.get('name')} | {(row.get('location') or {}).get('file_path')}"
-                    for row in rows[:10]
-                ) or "(no callers)"
-            elif hasattr(workspace, name) and name in {
-                "read_file", "grep", "list_files", "apply_patch",
-            }:
-                observation = getattr(workspace, name)(**args)
-            else:
-                observation = f"error: unknown tool {name}"
+            observation = execute_tool(name, args, workspace, client, arm)
         except Exception as error:  # a tool failure is an observation, not a crash
             observation = f"error: {error}"
-        steps.append({"step": step, "tool": name, "args": args, "observation": str(observation)[:500]})
-        messages.append({"role": "assistant", "content": reply[:2000]})
-        messages.append({"role": "user", "content": f"Observation:\n{observation[:MAX_OUTPUT_CHARS]}"})
+        observation = str(observation)
+        steps.append({"step": step + 1, "tool": name, "args": args,
+                      "observation": observation[:500]})
+        messages.append({"role": "tool", "tool_call_id": call.get("id") or f"call_{step}",
+                         "content": observation[:MAX_OUTPUT_CHARS]})
+        trim_messages(messages)
+        step += 1
     elapsed = time.time() - started
     return {"steps": steps, "changed": workspace.changed_files(), "elapsed": elapsed}
 
