@@ -1,32 +1,5 @@
 ![CodeGraph](docs/assets/banner.png)
-
 # CodeGraph (with updates)
-
-**Your codebase, understood.**
-
-> [!TIP]
-> **Give your coding agents lasting project memory.**
->
-> Meet [**CodeGraph Agent Memory**](https://github.com/Jakedismo/codegraph-code-agent-memory-rust),
-> our sibling project that builds on CodeGraph with persistent memory for architectural
-> decisions, findings, failed approaches, and reusable procedures. Enable memory
-> retrieval to bring that knowledge into agent workflows alongside current code
-> evidence across sessions.
->
-> [Explore the agent memory guide →](https://github.com/Jakedismo/codegraph-code-agent-memory-rust/blob/main/docs/AGENT_MEMORY.md)
-
-CodeGraph transforms your entire codebase into a semantically searchable knowledge graph that AI agents can actually *reason* about—not just grep through.
-
-> **Ready to get started?** Jump to the [Installation Guide](docs/INSTALLATION_GUIDE.md) for step-by-step setup instructions.
->
-> **Already set up?** See the [Usage Guide](docs/USAGE_GUIDE.md) for tips on getting the most out of CodeGraph with your AI assistant.
->
-> **Prefer shell commands?** Run `codegraph agent context "your question"`. The same four
-> agentic tools are available through the [CLI, with project-local Claude Code/Codex hooks](docs/AGENTIC_CLI.md).
-> `codegraph init` offers hook setup and adds agent instructions before indexing.
-
----
-
 ## Measured value: CodeGraph vs grep
 
 Measured on two real repositories, against the grep workflow an agent has without CodeGraph.
@@ -58,6 +31,31 @@ python3 scripts/benchmarks/mcp_value.py --generate 14       # locate
 python3 scripts/benchmarks/mcp_value.py --mode impact       # who calls
 python3 scripts/benchmarks/mcp_value.py --mode chain --depth 2
 ```
+
+---
+
+**Your codebase, understood.**
+
+> [!TIP]
+> **Give your coding agents lasting project memory.**
+>
+> Meet [**CodeGraph Agent Memory**](https://github.com/Jakedismo/codegraph-code-agent-memory-rust),
+> our sibling project that builds on CodeGraph with persistent memory for architectural
+> decisions, findings, failed approaches, and reusable procedures. Enable memory
+> retrieval to bring that knowledge into agent workflows alongside current code
+> evidence across sessions.
+>
+> [Explore the agent memory guide →](https://github.com/Jakedismo/codegraph-code-agent-memory-rust/blob/main/docs/AGENT_MEMORY.md)
+
+CodeGraph transforms your entire codebase into a semantically searchable knowledge graph that AI agents can actually *reason* about—not just grep through.
+
+> **Ready to get started?** Jump to the [Installation Guide](docs/INSTALLATION_GUIDE.md) for step-by-step setup instructions.
+>
+> **Already set up?** See the [Usage Guide](docs/USAGE_GUIDE.md) for tips on getting the most out of CodeGraph with your AI assistant.
+>
+> **Prefer shell commands?** Run `codegraph agent context "your question"`. The same four
+> agentic tools are available through the [CLI, with project-local Claude Code/Codex hooks](docs/AGENTIC_CLI.md).
+> `codegraph init` offers hook setup and adds agent instructions before indexing.
 
 ---
 
