@@ -143,6 +143,9 @@ pub struct OpenAiConfigCompat {
     pub api_key: String,
     pub model: String,
     pub api_base: String,
+    /// Configured vector width; `OpenAiEmbeddingProvider` uses it for models it
+    /// does not recognise (self-hosted / custom endpoints).
+    pub dimension: usize,
     pub max_retries: usize,
     pub timeout: Duration,
     pub max_tokens_per_request: usize,
@@ -163,6 +166,7 @@ impl From<&OpenAiConfigCompat> for OpenAiConfig {
             api_key: v.api_key.clone(),
             model: v.model.clone(),
             api_base: v.api_base.clone(),
+            dimension: v.dimension,
             max_retries: v.max_retries,
             timeout: v.timeout,
             max_tokens_per_request: v.max_tokens_per_request,
@@ -340,6 +344,7 @@ impl AdvancedEmbeddingGenerator {
                     api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
                     model: "text-embedding-3-small".into(),
                     api_base: "https://api.openai.com/v1".into(),
+                    dimension: 1536,
                     max_retries: 3,
                     timeout: Duration::from_secs(30),
                     max_tokens_per_request: 8000,

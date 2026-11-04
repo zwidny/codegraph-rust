@@ -659,6 +659,7 @@ impl EmbeddingGenerator {
                         model: base.model_config.model_name.clone(),
                         api_base: std::env::var("OPENAI_API_BASE")
                             .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+                        dimension: embedding_config.dimension,
                         max_retries: 3,
                         timeout: std::time::Duration::from_secs(30),
                         max_tokens_per_request: 8191,
@@ -686,6 +687,12 @@ impl EmbeddingGenerator {
     }
 
     pub async fn generate_embeddings(&self, nodes: &[CodeNode]) -> Result<Vec<Vec<f32>>> {
+        Ok(normalize_embeddings(
+            self.generate_embeddings_inner(nodes).await?,
+        ))
+    }
+
+    async fn generate_embeddings_inner(&self, nodes: &[CodeNode]) -> Result<Vec<Vec<f32>>> {
         if nodes.is_empty() {
             return Ok(Vec::new());
         }
@@ -864,6 +871,12 @@ impl EmbeddingGenerator {
     }
 
     pub async fn embed_texts_batched(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(normalize_embeddings(
+            self.embed_texts_batched_inner(texts).await?,
+        ))
+    }
+
+    async fn embed_texts_batched_inner(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let prepared;
         let texts = if let Some(policy) = &self.input_policy {
             prepared = texts
@@ -1005,4 +1018,80 @@ fn simple_hash(text: &str) -> u32 {
         hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
     }
     hash
+}
+
+/// Vectors within this distance of unit length are treated as already normalised.
+const NORMALIZE_EPSILON: f32 = 1e-4;
+
+/// Force every embedding onto the unit sphere.
+///
+/// The store creates its cosine HNSW indexes with `COSINE_NORMALIZED`, which
+/// evaluates distance as `1 - dot(a, b)` and therefore requires unit vectors.
+/// Normalising here — at the single boundary shared by every provider (Jina,
+/// Ollama, LM Studio, OpenAI-compatible, local ONNX) — makes that a property of
+/// the data instead of an assumption about each provider's own settings.
+///
+/// The operation is idempotent: a provider that already returns unit vectors is
+/// left untouched (within [`NORMALIZE_EPSILON`]), so re-indexing does not drift
+/// previously stored values.
+fn normalize_embeddings(mut embeddings: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    for embedding in &mut embeddings {
+        let norm_sq: f32 = embedding.iter().map(|value| value * value).sum();
+        if !norm_sq.is_finite() || norm_sq <= 0.0 {
+            // Leave degenerate vectors alone; the store validates cardinality.
+            continue;
+        }
+        let norm = norm_sq.sqrt();
+        if (norm - 1.0).abs() <= NORMALIZE_EPSILON {
+            continue;
+        }
+        let inverse = 1.0 / norm;
+        for value in embedding.iter_mut() {
+            *value *= inverse;
+        }
+    }
+    embeddings
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::{NORMALIZE_EPSILON, normalize_embeddings};
+
+    fn norm(vector: &[f32]) -> f32 {
+        vector.iter().map(|value| value * value).sum::<f32>().sqrt()
+    }
+
+    #[test]
+    fn scales_unnormalized_vectors_to_unit_length() {
+        let out = normalize_embeddings(vec![vec![3.0, 4.0], vec![0.0, 10.0]]);
+        assert!((norm(&out[0]) - 1.0).abs() < 1e-6);
+        assert!((norm(&out[1]) - 1.0).abs() < 1e-6);
+        // Direction is preserved.
+        assert!((out[0][0] - 0.6).abs() < 1e-6);
+        assert!((out[0][1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn leaves_already_normalized_vectors_untouched() {
+        let mut unit = vec![0.0f32; 4];
+        unit[0] = 1.0;
+        let out = normalize_embeddings(vec![unit.clone()]);
+        assert_eq!(out[0], unit, "idempotent: no drift on unit vectors");
+    }
+
+    #[test]
+    fn tolerates_degenerate_and_non_finite_vectors() {
+        let out = normalize_embeddings(vec![vec![0.0, 0.0], vec![f32::NAN, 1.0], vec![]]);
+        assert_eq!(out[0], vec![0.0, 0.0], "zero vector is left as-is");
+        assert!(out[1][0].is_nan(), "NaN input is not silently rewritten");
+        assert!(out[2].is_empty());
+    }
+
+    #[test]
+    fn epsilon_boundary_is_inclusive() {
+        // A vector whose norm is within epsilon of 1 must not be rescaled.
+        let nearly_unit = vec![1.0 + NORMALIZE_EPSILON / 2.0, 0.0];
+        let out = normalize_embeddings(vec![nearly_unit.clone()]);
+        assert_eq!(out[0], nearly_unit);
+    }
 }

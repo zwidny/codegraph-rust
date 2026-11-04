@@ -26,6 +26,10 @@ pub struct OpenAiConfig {
     pub api_key: String,
     pub model: String,
     pub api_base: String,
+    /// Vector width requested from the endpoint. Only used for models the
+    /// dimension table below does not know about (custom / self-hosted models);
+    /// OpenAI's published models keep their canonical width.
+    pub dimension: usize,
     pub max_retries: usize,
     pub timeout: Duration,
     pub max_tokens_per_request: usize,
@@ -37,6 +41,7 @@ impl Default for OpenAiConfig {
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             model: "text-embedding-3-small".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
+            dimension: 1536,
             max_retries: 3,
             timeout: Duration::from_secs(30),
             max_tokens_per_request: 8000,
@@ -63,8 +68,47 @@ struct EmbeddingResponse {
 
 #[derive(Debug, Deserialize)]
 struct EmbeddingData {
-    embedding: Vec<f32>,
+    embedding: EmbeddingPayload,
     index: usize,
+}
+
+/// Embeddings may arrive as a JSON float array or as a base64 string.
+///
+/// `base64` avoids parsing 2048 individual JSON numbers per vector, which
+/// `perf` measured at ~10% of indexing CPU (`serde_json::deserialize_number::<f32>`).
+/// The payload is little-endian f32, verified against the float form (max
+/// difference 3e-9).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbeddingPayload {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+impl EmbeddingPayload {
+    fn into_vector(self) -> Result<Vec<f32>> {
+        match self {
+            Self::Float(values) => Ok(values),
+            Self::Base64(encoded) => {
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.as_bytes())
+                    .map_err(|e| {
+                        CodeGraphError::Vector(format!("Invalid base64 embedding: {e}"))
+                    })?;
+                if bytes.len() % 4 != 0 {
+                    return Err(CodeGraphError::Vector(format!(
+                        "Base64 embedding is {} bytes, not a whole number of f32 values",
+                        bytes.len()
+                    )));
+                }
+                Ok(bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +200,7 @@ impl OpenAiEmbeddingProvider {
         let request = EmbeddingRequest {
             input: texts,
             model: self.config.model.clone(),
-            encoding_format: "float".to_string(),
+            encoding_format: "base64".to_string(),
         };
 
         let mut last_error = None;
@@ -268,7 +312,12 @@ impl OpenAiEmbeddingProvider {
 
             let mut batch_embeddings: Vec<_> = response.data.into_iter().collect();
             batch_embeddings.sort_by_key(|item| item.index);
-            chunk_embeddings.extend(batch_embeddings.into_iter().map(|item| item.embedding));
+            chunk_embeddings.extend(
+                batch_embeddings
+                    .into_iter()
+                    .map(|item| item.embedding.into_vector())
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
 
         let node_embeddings = aggregate_chunk_embeddings(
@@ -312,7 +361,11 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
                     "OpenAI returned missing or duplicate embedding indices".into(),
                 ));
             }
-            output.extend(data.into_iter().map(|item| item.embedding));
+            output.extend(
+                data.into_iter()
+                    .map(|item| item.embedding.into_vector())
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
         Ok(output)
     }
@@ -352,7 +405,11 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
             "text-embedding-3-small" => 1536,
             "text-embedding-3-large" => 3072,
             "text-embedding-ada-002" => 1536,
-            _ => 1536, // Default assumption
+            // Custom or self-hosted models: trust the configured width instead of
+            // assuming OpenAI's default. Previously every unknown model reported
+            // 1536, which silently mismatched the store (e.g. a 1024-dim model
+            // was queried as 1536 and returned near-random neighbours).
+            _ => self.config.dimension,
         }
     }
 
@@ -399,5 +456,50 @@ impl OpenAiEmbeddingProvider {
         Err(CodeGraphError::Configuration(
             "OpenAI feature not enabled. Enable with --features openai".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::EmbeddingPayload;
+
+    /// The base64 form must decode to exactly the same little-endian f32 values
+    /// as the float array form. Verified against the live server (max diff 3e-9),
+    /// so this pins the byte order and element width.
+    #[test]
+    fn base64_payload_decodes_little_endian_f32() {
+        use base64::Engine as _;
+        let values: Vec<f32> = vec![0.5, -1.25, 3.0, 1e-8];
+        let mut bytes = Vec::new();
+        for value in &values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let decoded = EmbeddingPayload::Base64(encoded).into_vector().unwrap();
+        assert_eq!(decoded, values, "little-endian decode must round-trip");
+    }
+
+    /// The float array form must keep working: providers that ignore
+    /// `encoding_format` still return JSON numbers.
+    #[test]
+    fn float_payload_is_still_accepted() {
+        let decoded = EmbeddingPayload::Float(vec![1.0, 2.0, 3.0])
+            .into_vector()
+            .unwrap();
+        assert_eq!(decoded, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn malformed_base64_and_odd_byte_counts_are_rejected() {
+        assert!(
+            EmbeddingPayload::Base64("not base64!!!".into())
+                .into_vector()
+                .is_err()
+        );
+        // 3 bytes is not a whole f32.
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
+        assert!(EmbeddingPayload::Base64(encoded).into_vector().is_err());
     }
 }

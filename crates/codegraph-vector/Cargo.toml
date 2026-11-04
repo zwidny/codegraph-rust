@@ -8,6 +8,7 @@ license.workspace = true
 description = "Vector storage and similarity search using FAISS for CodeGraph"
 
 [dependencies]
+base64 = { workspace = true }
 codegraph-core = { workspace = true }
 codegraph-parser = { workspace = true }
 codegraph-graph = { path = "../codegraph-graph", features = ["surrealdb"] }

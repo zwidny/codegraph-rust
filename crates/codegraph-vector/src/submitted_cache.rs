@@ -5,6 +5,7 @@ use codegraph_core::{
     artifact_cache::{ArtifactCache, fingerprint},
 };
 use futures::{StreamExt, future::BoxFuture, stream};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -112,16 +113,26 @@ impl SubmittedCache {
     where
         F: Fn(Vec<String>) -> BoxFuture<'a, Result<Vec<Vec<f32>>>> + Sync,
     {
+        // `fingerprint` serialises its input and recursively sorts every object key
+        // before hashing. This loop previously ran it twice per text — once to build
+        // `unique`, once for `keys` — serially, which dominated the embedding phase on
+        // one core (measured: ~100% utime on a single thread). Compute each key exactly
+        // once, in parallel, and reuse it. The hash inputs are unchanged, so cached
+        // vectors and their keys stay identical.
+        let keyed: Vec<(String, &String)> = texts
+            .par_iter()
+            .map(|text| {
+                fingerprint(&(&self.namespace, text))
+                    .map(|key| (key, text))
+                    .map_err(|e| CodeGraphError::Vector(e.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut unique = BTreeMap::new();
-        for text in texts {
-            let key = fingerprint(&(&self.namespace, text))
-                .map_err(|e| CodeGraphError::Vector(e.to_string()))?;
-            unique.entry(key).or_insert_with(|| text.clone());
+        for (key, text) in &keyed {
+            unique.entry(key.clone()).or_insert_with(|| (*text).clone());
         }
-        let keys: Vec<_> = texts
-            .iter()
-            .map(|text| fingerprint(&(&self.namespace, text)).unwrap())
-            .collect();
+        let keys: Vec<String> = keyed.into_iter().map(|(key, _)| key).collect();
         let locks: Vec<_> = {
             let mut registry = self.locks.lock();
             registry.retain(|_, lock| lock.strong_count() > 0);
