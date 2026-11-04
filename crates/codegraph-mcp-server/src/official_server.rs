@@ -235,13 +235,53 @@ fn default_doc_style() -> String {
     "comprehensive".to_string()
 }
 
+/// Free-form parameters for the direct graph tools.
+///
+/// The eight graph tools each accept a small, tool-specific object. Rather than
+/// duplicating eight schemas — and risking drift from `GraphToolSchemas` — this
+/// wrapper advertises an open object and passes the JSON through unchanged.
+/// `Parameters<serde_json::Value>` cannot be used directly: schemars emits no
+/// root `"type"` for `Value`, and MCP requires `inputSchema.type == "object"`.
+#[derive(Debug, Clone)]
+pub struct GraphToolParams(pub Value);
+
+impl<'de> Deserialize<'de> for GraphToolParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Value::deserialize(deserializer).map(GraphToolParams)
+    }
+}
+
+impl JsonSchema for GraphToolParams {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "GraphToolParams".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json!({
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Tool-specific parameters; see each tool's description."
+        })
+        .try_into()
+        .expect("static schema literal")
+    }
+}
+
 /// Clean CodeGraph MCP server following official Counter pattern
 #[derive(Clone)]
+
 pub struct CodeGraphMCPServer {
     /// Simple counter for demonstration
     counter: Arc<Mutex<i32>>,
     /// Official MCP tool router (required by macros)
     tool_router: ToolRouter<Self>,
+    /// Lazily built graph-tool executor backing the direct (LLM-free) query tools.
+    /// Building it opens the project store and the embedding generator, so it is
+    /// created on first use and reused for the server's lifetime.
+    graph_tool_executor: Arc<Mutex<Option<Arc<GraphToolExecutor>>>>,
 }
 
 #[tool_router]
@@ -250,6 +290,7 @@ impl CodeGraphMCPServer {
         Self {
             counter: Arc::new(Mutex::new(0)),
             tool_router: Self::tool_router(),
+            graph_tool_executor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -377,6 +418,119 @@ impl CodeGraphMCPServer {
     ) -> Result<Value, McpError> {
         self.execute_agentic_workflow(tool.analysis_type(focus), query, None, Meta::default())
             .await
+    }
+
+    // ----- Direct graph tools (no LLM) ----------------------------------
+    //
+    // The agentic_* tools above all run a ReAct workflow (measured 55s–2.5min,
+    // dominated by LLM latency). These eight expose the same graph queries the
+    // internal agent uses, directly to the client, in 0.3–5s. A client can
+    // compose them itself instead of paying for a second LLM pass.
+
+    async fn graph_tool_executor(&self) -> Result<Arc<GraphToolExecutor>, McpError> {
+        let mut guard = self.graph_tool_executor.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
+        let executor = build_graph_tool_executor().await?;
+        *guard = Some(executor.clone());
+        Ok(executor)
+    }
+
+    async fn run_graph_tool(&self, name: &str, params: Value) -> Result<CallToolResult, McpError> {
+        let executor = self.graph_tool_executor().await?;
+        let result = executor.execute(name, params).await.map_err(|e| McpError {
+            code: rmcp::model::ErrorCode(-32603),
+            message: format!("{} failed: {}", name, e).into(),
+            data: None,
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
+        )]))
+    }
+
+    #[tool(
+        description = "Vector similarity search over indexed code (no LLM). Params: query (string), limit (int, default 10), threshold (number). Each row has vector_score (cosine, filtered by threshold), text_score (BM25), and combined_score (RRF rank 1/(60+rank), ordering only); score_semantics restates this."
+    )]
+    async fn semantic_code_search(
+        &self,
+        params: Parameters<GraphToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_graph_tool("semantic_code_search", params.0.0)
+            .await
+    }
+
+    #[tool(
+        description = "Reverse dependencies: who points at this node (no LLM). Params: node_id (string, required, form nodes:<uuid> or a bare uuid), edge_type (string, required, e.g. calls), depth (int). An empty result includes diagnostics with the node's kind, the edge types that do exist, and a suggested call."
+    )]
+    async fn get_reverse_dependencies(
+        &self,
+        params: Parameters<GraphToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_graph_tool("get_reverse_dependencies", params.0.0)
+            .await
+    }
+
+    #[tool(
+        description = "Transitive dependency closure of a node (no LLM). Params: node_id (string, required), edge_type (string, required), depth (int)."
+    )]
+    async fn get_transitive_dependencies(
+        &self,
+        params: Parameters<GraphToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_graph_tool("get_transitive_dependencies", params.0.0)
+            .await
+    }
+
+    #[tool(
+        description = "Trace the call chain starting at a node (no LLM). Params: node_id (string, required), max_depth (int)."
+    )]
+    async fn trace_call_chain(
+        &self,
+        params: Parameters<GraphToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_graph_tool("trace_call_chain", params.0.0).await
+    }
+
+    #[tool(
+        description = "Coupling metrics for a node/module (no LLM). Params: node_id (string, required)."
+    )]
+    async fn calculate_coupling_metrics(
+        &self,
+        params: Parameters<GraphToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_graph_tool("calculate_coupling_metrics", params.0.0)
+            .await
+    }
+
+    #[tool(
+        description = "Detect circular dependency cycles (no LLM). Params: edge_type (string, required, e.g. calls)."
+    )]
+    async fn detect_circular_dependencies(
+        &self,
+        params: Parameters<GraphToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_graph_tool("detect_circular_dependencies", params.0.0)
+            .await
+    }
+
+    #[tool(
+        description = "Find complexity hotspots (no LLM). Params: min_complexity (number), limit (int)."
+    )]
+    async fn find_complexity_hotspots(
+        &self,
+        params: Parameters<GraphToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_graph_tool("find_complexity_hotspots", params.0.0)
+            .await
+    }
+
+    #[tool(description = "Find high-degree hub nodes (no LLM). Params: min_degree (int).")]
+    async fn get_hub_nodes(
+        &self,
+        params: Parameters<GraphToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_graph_tool("get_hub_nodes", params.0.0).await
     }
 }
 
@@ -1030,4 +1184,65 @@ mod prompt_tests {
             "codegraph:initial_instructions"
         );
     }
+}
+
+/// Build a `GraphToolExecutor` bound to the project store in the working directory.
+///
+/// Mirrors the construction the agentic workflow performs, without the progress
+/// notifier. Kept separate so the direct tools can build it lazily and share it.
+async fn build_graph_tool_executor() -> Result<Arc<GraphToolExecutor>, McpError> {
+    use codegraph_graph::{GraphFunctions, SurrealDbStorage};
+
+    let config_manager =
+        codegraph_core::config_manager::ConfigManager::load().map_err(|e| McpError {
+            code: rmcp::model::ErrorCode(-32603),
+            message: format!("Failed to load configuration: {e}").into(),
+            data: None,
+        })?;
+    let config = config_manager.config();
+
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let surrealdb_config = codegraph_graph::SurrealDbConfig::for_project(&project_root);
+    let storage = SurrealDbStorage::new(surrealdb_config)
+        .await
+        .map_err(|e| McpError {
+            code: rmcp::model::ErrorCode(-32603),
+            message: format!("Failed to open SurrealDB storage: {e}").into(),
+            data: None,
+        })?;
+
+    let raw_project = std::env::var("CODEGRAPH_PROJECT_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
+        .unwrap_or_else(|| "default-project".to_string());
+    let canonical_project = Path::new(&raw_project)
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or(raw_project);
+
+    let graph_functions = Arc::new(GraphFunctions::new_with_project_id(
+        storage.db(),
+        canonical_project,
+    ));
+
+    let embedding_generator = Arc::new(
+        codegraph_vector::EmbeddingGenerator::with_config(&config)
+            .await
+            .map_err(|e| McpError {
+                code: rmcp::model::ErrorCode(-32603),
+                message: format!("Embedding input policy initialization failed: {e}").into(),
+                data: None,
+            })?,
+    );
+
+    Ok(Arc::new(GraphToolExecutor::new(
+        graph_functions,
+        Arc::new(config.clone()),
+        embedding_generator,
+    )))
 }

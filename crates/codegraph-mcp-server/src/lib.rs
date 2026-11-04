@@ -12,6 +12,7 @@ pub mod http_server;
 pub mod official_server;
 pub mod project_init;
 pub mod prompts;
+pub mod query_cli;
 
 pub use codegraph_mcp_core::analysis::AnalysisType;
 #[cfg(feature = "server-http")]

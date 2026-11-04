@@ -87,7 +87,7 @@ pub struct SemanticSearchArgs {
     /// Maximum results to return, 1-50 (default: 10)
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// Minimum similarity, 0.0-1.0 (default: 0.6). Lower it if a search returns nothing.
+    /// Minimum similarity, 0.0-1.0 (default: 0.4). Lower it if a search returns nothing.
     #[serde(default = "default_threshold")]
     pub threshold: f64,
 }
@@ -120,7 +120,7 @@ fn default_limit() -> usize {
     10
 }
 fn default_threshold() -> f64 {
-    0.6
+    0.4
 }
 fn default_min_complexity() -> f32 {
     5.0
@@ -356,7 +356,7 @@ impl Tool for GetReverseDependencies {
     type Output = JsonValue;
 
     fn description(&self) -> String {
-        "List everything that depends on a node, directly and indirectly, by following one relationship type inward to a given depth. Use it to learn what a change to the node could break."
+        "List everything that depends on a node, directly and indirectly, by following one relationship type inward to a given depth. Use it to learn what a change to the node could break. An empty result includes a `diagnostics` object listing the edge types that do exist and the node's kind, so you can retry with a usable type instead of guessing. Type/container nodes often store their relationships on child nodes."
             .to_string()
     }
 
@@ -398,7 +398,7 @@ impl Tool for SemanticCodeSearch {
     type Output = JsonValue;
 
     fn description(&self) -> String {
-        "Search the codebase by meaning or by identifier. Returns matching nodes with their node ID, name, file path, line, and a code snippet. This is the way to obtain the node IDs the other tools require, so it is usually the first call."
+        "Search the codebase by meaning or by identifier. Returns matching nodes with their node ID, name, file path, line, and a code snippet. This is the way to obtain the node IDs the other tools require, so it is usually the first call. Each row has three scores: vector_score (cosine similarity, filtered by `threshold`), text_score (BM25), and combined_score (RRF rank, 1/(60+rank), ordering only); the response's score_semantics field restates this."
             .to_string()
     }
 
@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(default_max_depth(), 5);
         assert_eq!(default_min_degree(), 5);
         assert_eq!(default_limit(), 10);
-        assert_eq!(default_threshold(), 0.6);
+        assert_eq!(default_threshold(), 0.4);
         assert_eq!(default_min_complexity(), 5.0);
         assert_eq!(default_hotspot_limit(), 20);
     }

@@ -163,7 +163,11 @@ impl GraphToolSchemas {
             name: "get_reverse_dependencies".to_string(),
             description: "Get all reverse dependencies (dependents) of a code node - nodes that depend ON this node. \
                 Follows incoming dependency edges recursively up to specified depth. \
-                Critical for change impact analysis - shows what will be affected if you modify this node.".to_string(),
+                Critical for change impact analysis - shows what will be affected if you modify this node. \
+                When nothing matches, the response carries a `diagnostics` object with the node's kind and the \
+                incoming/outgoing edge types that do exist, so retry with a listed type instead of guessing. \
+                Type and container nodes (struct/enum/trait) often hold their relationships on child or member \
+                nodes; query a Function, Method, or Import node for dependency analysis.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -196,7 +200,10 @@ impl GraphToolSchemas {
             description: "Primary code discovery tool using advanced hybrid search with graph-traversal. \
                    Accepts natural language queries ((e.g., How is authentication handled?, database models, error handling code etc.) be robust in your queries). \
                    Works for both conceptual searches and specific identifiers. \
-                   Returns relevant code snippets, definitions, and related nodes ranked by relevance. Best practice: start with a low threshold (e.g., 0.2–0.4) and raise it in follow-up queries to narrow scope.".to_string(),
+                   Returns relevant code snippets, definitions, and related nodes ranked by relevance. Best practice: start with a low threshold (e.g., 0.2–0.4) and raise it in follow-up queries to narrow scope. \
+                   Each row carries three scores: `vector_score` (cosine similarity, the score `threshold` filters on), \
+                   `text_score` (BM25), and `combined_score` (RRF rank, 1/(60+rank) - ordering only, not a similarity). \
+                   The response's `score_semantics` object restates this.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -213,9 +220,10 @@ impl GraphToolSchemas {
                     },
                     "threshold": {
                         "type": "number",
-                        "description": "Similarity threshold 0.0–1.0 (optional, defaults to env CODEGRAPH_SEMSEARCH_THRESHOLD or 0.6)",
+                        "description": "Similarity threshold 0.0–1.0 (optional, defaults to env CODEGRAPH_SEMSEARCH_THRESHOLD or 0.4). Lower thresholds trade precision for recall; 0.4 keeps natural-language queries useful with the shipped embedding model.",
                         "minimum": 0.0,
-                        "maximum": 1.0
+                        "maximum": 1.0,
+                        "default": 0.4
                     }
                 },
                 "required": ["query"]

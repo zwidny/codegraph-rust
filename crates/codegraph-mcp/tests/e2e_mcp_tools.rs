@@ -158,10 +158,21 @@ async fn test_tool_discovery() -> Result<()> {
     let tools = service.list_tools(Default::default()).await?;
 
     let expected_tools = vec![
+        // Consolidated agentic tools (run a ReAct workflow).
         "agentic_context",
         "agentic_impact",
         "agentic_architecture",
         "agentic_quality",
+        // Direct graph tools (no LLM): the same queries the internal agent uses,
+        // exposed so a client can compose them itself.
+        "semantic_code_search",
+        "get_reverse_dependencies",
+        "get_transitive_dependencies",
+        "trace_call_chain",
+        "calculate_coupling_metrics",
+        "detect_circular_dependencies",
+        "find_complexity_hotspots",
+        "get_hub_nodes",
     ];
 
     println!("📋 Discovered {} tools", tools.tools.len());

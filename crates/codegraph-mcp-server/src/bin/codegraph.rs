@@ -10,7 +10,7 @@ use codegraph_mcp_core::debug_logger::DebugLogger;
 #[cfg(feature = "daemon")]
 use codegraph_mcp_daemon::{DaemonManager, PidFile, WatchConfig, WatchDaemon};
 use codegraph_mcp_server::CodeGraphMCPServer;
-use codegraph_mcp_server::{agent_cli, agent_hooks, project_init};
+use codegraph_mcp_server::{agent_cli, agent_hooks, project_init, query_cli};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rmcp::ServiceExt;
@@ -82,6 +82,12 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         action: agent_cli::AgentCommand,
+    },
+
+    #[command(about = "Fast direct graph query, no LLM (symbol, callers, callees)")]
+    Query {
+        #[command(flatten)]
+        args: query_cli::QueryArgs,
     },
 
     #[command(about = "Emit agent guidance or install project-local harness hooks")]
@@ -550,6 +556,9 @@ impl From<IndexTier> for codegraph_core::config_manager::IndexingTier {
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
     // Guidance/hooks must work without valid provider config or any network services.
+    if let Commands::Query { args } = cli.command {
+        return query_cli::run(args);
+    }
     if let Commands::Agent { ref action } = cli.command {
         // SAFETY: No async runtime or application threads have been started yet.
         return unsafe { agent_cli::run(action, cli.verbose, cli.config.as_deref()) };
@@ -626,7 +635,10 @@ async fn run_cli(cli: Cli) -> Result<()> {
     let config = config_mgr.config();
 
     match cli.command {
-        Commands::Init { .. } | Commands::Agent { .. } | Commands::Hooks { .. } => {
+        Commands::Init { .. }
+        | Commands::Agent { .. }
+        | Commands::Hooks { .. }
+        | Commands::Query { .. } => {
             unreachable!("handled before configuration")
         }
         Commands::Start {

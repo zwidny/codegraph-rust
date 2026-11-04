@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -84,6 +85,103 @@ fn content_snippet_chars() -> usize {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(DEFAULT_CONTENT_SNIPPET_CHARS)
+}
+
+/// Remove `build_context` dependency rows whose manifest lives outside the project tree.
+///
+/// `cargo metadata` records every locked crate, so registry manifests become graph nodes with
+/// no project source behind them. They carry no useful content yet rank highly in
+/// natural-language searches. The check only runs when the project id is an absolute path;
+/// custom identifiers leave the rows untouched instead of guessing.
+fn retain_in_project_rows(rows: Vec<JsonValue>, project_root: &Path) -> Vec<JsonValue> {
+    if !project_root.is_absolute() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|row| {
+            let from_build_context = row
+                .get("metadata")
+                .and_then(|metadata| metadata.get("analyzer"))
+                .and_then(|analyzer| analyzer.as_str())
+                == Some("build_context");
+            if !from_build_context {
+                return true;
+            }
+            row.get("file_path")
+                .and_then(|path| path.as_str())
+                .map(|path| Path::new(path).starts_with(project_root))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Explain what each score field from `semantic_code_search` means.
+///
+/// `combined_score` is an RRF rank value (`1/(60+rank)`), not a similarity, so callers must
+/// not read it as confidence and `threshold` does not filter on it.
+fn score_semantics() -> JsonValue {
+    json!({
+        "vector_score": "Cosine similarity from the HNSW chunk search (0..1). The `threshold` parameter filters on this score.",
+        "text_score": "BM25 full-text score over node name and content (higher is better, unbounded).",
+        "combined_score": "Reciprocal Rank Fusion (RRF) of the vector and text lists, computed as 1/(60+rank). Use it for ordering only; it is not a similarity value.",
+        "threshold_applies_to": "vector_score",
+        "ordering": "Rows are ordered by combined_score descending."
+    })
+}
+
+/// Explain an empty dependency result instead of returning a bare empty array.
+///
+/// Distinguishes a missing node from a node that exists but has no edges of the requested
+/// type, suggests the edge types that are actually present, and proposes a concrete retry.
+fn empty_result_diagnostics(
+    summary: &codegraph_graph::NodeEdgeSummary,
+    requested_edge_type: &str,
+    requested_node_id: &str,
+) -> JsonValue {
+    let requested_lower = requested_edge_type.to_ascii_lowercase();
+    let available_incoming = &summary.incoming_edge_types;
+    let node_id = summary.id.as_deref().unwrap_or(requested_node_id);
+
+    let hint = if !summary.found {
+        format!(
+            "Node not found: no node with id `{node_id}` exists in this project's index. Check the id, or locate the symbol first with semantic_code_search."
+        )
+    } else if available_incoming.is_empty() {
+        format!(
+            "The {} node exists but has no incoming edges of any type. Type/container nodes often keep their relationships on child or member nodes; query a Function, Method, or Import node instead.",
+            summary.kind.as_deref().unwrap_or("requested")
+        )
+    } else {
+        format!(
+            "The {} node has no incoming `{}` edges. Available incoming edge types: {}. Retry with one of those, or query a Function/Method/Import node.",
+            summary.kind.as_deref().unwrap_or("requested"),
+            requested_lower,
+            available_incoming.join(", ")
+        )
+    };
+
+    // A retry the caller can issue verbatim beats making it reconstruct the call.
+    let suggested_call = available_incoming.first().map(|edge_type| {
+        json!({
+            "tool": "get_reverse_dependencies",
+            "node_id": node_id,
+            "edge_type": edge_type,
+            "depth": 1,
+        })
+    });
+
+    json!({
+        "node_found": summary.found,
+        "node_kind": summary.kind,
+        "node_id": node_id,
+        "file_path": summary.file_path,
+        "start_line": summary.start_line,
+        "requested_edge_type": requested_lower,
+        "available_incoming_edge_types": available_incoming,
+        "available_outgoing_edge_types": &summary.outgoing_edge_types,
+        "suggested_call": suggested_call,
+        "hint": hint,
+    })
 }
 
 /// Shorten long `content` strings anywhere in a tool result to a leading snippet that ends
@@ -604,7 +702,8 @@ impl GraphToolExecutor {
             .await
             .map_err(|e| McpError::Protocol(format!("get_reverse_dependencies failed: {}", e)))?;
 
-        Ok(json!({
+        let is_empty = result.is_empty();
+        let mut response = json!({
             "tool": "get_reverse_dependencies",
             "parameters": {
                 "node_id": node_id,
@@ -612,7 +711,24 @@ impl GraphToolExecutor {
                 "depth": depth
             },
             "result": result
-        }))
+        });
+
+        // An empty array cannot distinguish "no such node" from "no edges of this type".
+        // Attach a summary so the caller can pick a usable edge type instead of retrying
+        // blind. Diagnostics must never turn a successful empty result into an error.
+        if is_empty {
+            match self.graph_functions.get_node_edge_summary(node_id).await {
+                Ok(summary) => {
+                    response["diagnostics"] =
+                        empty_result_diagnostics(&summary, edge_type, node_id);
+                }
+                Err(error) => {
+                    debug!("reverse dependency diagnostics unavailable: {}", error);
+                }
+            }
+        }
+
+        Ok(response)
     }
 
     /// Execute semantic code search with HNSW, full-text, and graph enrichment
@@ -632,7 +748,7 @@ impl GraphToolExecutor {
                     .ok()
             })
             .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or(0.6);
+            .unwrap_or(0.4);
 
         // Step 1: Generate embedding using shared EmbeddingGenerator
         let query_embedding = self
@@ -665,6 +781,12 @@ impl GraphToolExecutor {
         // Step 4: Apply reranking if configured (Jina OR LM Studio)
         let final_results = self.apply_reranking(query_text, candidates).await?;
 
+        // Step 5: Drop dependency-graph rows that point outside the project. `cargo metadata`
+        // records every locked crate, so registry manifests otherwise surface as search hits
+        // with no project source behind them.
+        let project_id = self.graph_functions.project_id().to_string();
+        let final_results = retain_in_project_rows(final_results, Path::new(&project_id));
+
         Ok(json!({
             "tool": "semantic_code_search",
             "parameters": {
@@ -673,6 +795,9 @@ impl GraphToolExecutor {
                 "dimension": dimension,
                 "threshold": threshold
             },
+            // `combined_score` is an RRF rank (1/(60+rank)), so name each score explicitly
+            // instead of leaving callers to guess whether it is a similarity.
+            "score_semantics": score_semantics(),
             "result": final_results
         }))
     }
@@ -871,6 +996,143 @@ mod tests {
         assert_eq!(params["node_id"].as_str().unwrap(), "nodes:123");
         assert_eq!(params["edge_type"].as_str().unwrap(), "Calls");
         assert_eq!(params["depth"].as_i64().unwrap(), 5);
+    }
+
+    // === Result interpretability tests ===
+
+    #[test]
+    fn test_score_semantics_explains_every_score() {
+        let semantics = score_semantics();
+
+        let vector = semantics["vector_score"].as_str().unwrap();
+        assert!(
+            vector.to_lowercase().contains("cosine"),
+            "vector_score must name its metric: {vector}"
+        );
+
+        let text = semantics["text_score"].as_str().unwrap();
+        assert!(
+            text.to_lowercase().contains("bm25"),
+            "text_score must name BM25: {text}"
+        );
+
+        let combined = semantics["combined_score"].as_str().unwrap();
+        assert!(
+            combined.contains("RRF"),
+            "combined_score must say it is a fusion rank: {combined}"
+        );
+        assert!(
+            combined.contains("1/(60+rank)"),
+            "combined_score must give its formula: {combined}"
+        );
+
+        assert_eq!(semantics["threshold_applies_to"], "vector_score");
+    }
+
+    #[test]
+    fn test_retain_in_project_rows_drops_external_dependency_manifests() {
+        let rows = vec![
+            json!({
+                "name": "indexmap",
+                "file_path": "/home/user/.cargo/registry/src/index.crates.io-1/indexmap/Cargo.toml",
+                "metadata": {"analyzer": "build_context"}
+            }),
+            json!({
+                "name": "app::default",
+                "file_path": "/repo/app/Cargo.toml",
+                "metadata": {"analyzer": "build_context"}
+            }),
+            json!({
+                "name": "parse_config",
+                "file_path": "/repo/app/src/config.rs",
+                "metadata": {"api_visibility": "private"}
+            }),
+        ];
+
+        let kept = retain_in_project_rows(rows, Path::new("/repo/app"));
+
+        let names: Vec<&str> = kept
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["app::default", "parse_config"]);
+    }
+
+    #[test]
+    fn test_retain_in_project_rows_leaves_custom_project_ids_alone() {
+        // Custom identifiers are not paths, so nothing can be classified as external.
+        let rows = vec![json!({
+            "name": "indexmap",
+            "file_path": "/home/user/.cargo/registry/src/indexmap/Cargo.toml",
+            "metadata": {"analyzer": "build_context"}
+        })];
+
+        let kept = retain_in_project_rows(rows, Path::new("my-project"));
+
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_diagnostics_reports_missing_node() {
+        let summary = codegraph_graph::NodeEdgeSummary::default();
+        let diagnostics = empty_result_diagnostics(&summary, "calls", "nodes:`missing-id`");
+
+        assert_eq!(diagnostics["node_found"], false);
+        assert_eq!(diagnostics["requested_edge_type"], "calls");
+        assert_eq!(diagnostics["node_id"], "nodes:`missing-id`");
+        assert!(diagnostics["suggested_call"].is_null());
+        let hint = diagnostics["hint"].as_str().unwrap();
+        assert!(hint.to_lowercase().contains("not found"));
+        assert!(
+            hint.contains("nodes:`missing-id`"),
+            "hint should echo the requested id: {hint}"
+        );
+    }
+
+    #[test]
+    fn test_empty_diagnostics_lists_available_edge_types() {
+        let summary = codegraph_graph::NodeEdgeSummary {
+            found: true,
+            kind: Some("Struct".to_string()),
+            id: Some("nodes:`abc`".to_string()),
+            incoming_edge_types: vec!["contains".to_string()],
+            ..Default::default()
+        };
+        let diagnostics = empty_result_diagnostics(&summary, "calls", "nodes:`abc`");
+
+        assert_eq!(diagnostics["node_found"], true);
+        assert_eq!(diagnostics["node_kind"], "Struct");
+        assert_eq!(
+            diagnostics["available_incoming_edge_types"],
+            json!(["contains"])
+        );
+        assert_eq!(
+            diagnostics["suggested_call"],
+            json!({
+                "tool": "get_reverse_dependencies",
+                "node_id": "nodes:`abc`",
+                "edge_type": "contains",
+                "depth": 1
+            })
+        );
+        let hint = diagnostics["hint"].as_str().unwrap();
+        assert!(hint.contains("contains"), "hint should suggest: {hint}");
+    }
+
+    #[test]
+    fn test_empty_diagnostics_explains_container_nodes() {
+        let summary = codegraph_graph::NodeEdgeSummary {
+            found: true,
+            kind: Some("Trait".to_string()),
+            ..Default::default()
+        };
+        let diagnostics = empty_result_diagnostics(&summary, "calls", "nodes:`t`");
+
+        let hint = diagnostics["hint"].as_str().unwrap().to_lowercase();
+        assert!(
+            hint.contains("child") || hint.contains("member"),
+            "container nodes need guidance, got: {hint}"
+        );
     }
 
     // === Cache Tests ===
