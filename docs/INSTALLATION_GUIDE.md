@@ -53,8 +53,8 @@ allowlist, for example `CODEGRAPH_HTTP_ALLOWED_HOSTS=localhost,codegraph.example
 A shared SurrealDB 3.x server is the supported deployment: run one with Docker or a container
 (see [Using a SurrealDB Server](#optional-using-a-surrealdb-server)) and apply
 `schema/codegraph_v2.surql` to it. No other database software is needed. An embedded
-per-project store remains available when `CODEGRAPH_SURREALDB_URL` is unset, but it is a
-compatibility fallback: substantially slower, and it allows one process per project.
+per-project store is opt-in by setting `CODEGRAPH_SURREALDB_URL` to a `surrealkv://` path,
+but it is a compatibility fallback: substantially slower, and it allows one process per project.
 
 Balanced and full indexing tiers additionally need the language servers for the languages you index (for example `rust-analyzer`); the default fast tier does not.
 
@@ -106,7 +106,7 @@ Init does the per-project setup in one pass:
 
 1. Offers project-local guidance hooks for **Claude Code, Codex, both, or none**, and skips the prompt when CodeGraph hooks are already installed.
 2. Adds or refreshes a managed `# codegraph` section in the project's `AGENTS.md` and `CLAUDE.md`, leaving the rest of those files alone.
-3. Loads the project's `.env` and configuration and indexes the project recursively. When `CODEGRAPH_SURREALDB_URL` is unset, first use creates the embedded fallback store at `<project>/.codegraph/db` with the bundled schema and a `.gitignore` that keeps it out of version control; with a shared server the schema must already be applied.
+3. Loads the project's `.env` and configuration and indexes the project recursively. With no `CODEGRAPH_SURREALDB_URL` it connects to the shared server at `ws://127.0.0.1:8000`, which must already run with `schema/codegraph_v2.surql` applied. Point the URL at a `surrealkv://` path to opt into the embedded store instead: first use then creates `<project>/.codegraph/db` with the bundled schema and a `.gitignore` that keeps it out of version control.
 
 For scripts and CI, pass the choices explicitly:
 
@@ -166,7 +166,7 @@ exclude_patterns = ["**/node_modules/**", "**/target/**", "**/.git/**"]
 level = "info"
 ```
 
-Storage has no config-file section: set `CODEGRAPH_SURREALDB_URL` (plus the `CODEGRAPH_SURREALDB_*` variables) to use a shared server, which is the recommended setup. Without it, the embedded per-project store is used as a compatibility fallback; it is substantially slower and single-writer.
+Storage has no config-file section: `codegraph` connects to a shared server at `ws://127.0.0.1:8000` by default, or to `CODEGRAPH_SURREALDB_URL` (plus the `CODEGRAPH_SURREALDB_*` variables) when set. The embedded per-project store is opt-in through a `surrealkv://` URL; it is a compatibility fallback that is substantially slower and single-writer.
 
 The built-in agent resolves each LLM setting in three steps: the environment variable (a project `.env` counts), then the key in the config file's `[llm]` section, then a default. `enabled = false` in `[llm]` makes the agent ignore the section, and API keys are read from the environment only. `codegraph config agent-status` shows the provider, model and tier in effect; [AI_PROVIDERS.md](AI_PROVIDERS.md) lists every variable and key.
 
@@ -265,7 +265,7 @@ codegraph db-check                                             # prints the stor
 codegraph agent context "Where is the main entry point?" --focus search
 ```
 
-With the recommended shared server (`CODEGRAPH_SURREALDB_URL`), reads and indexing run concurrently, so this restriction does not apply. The **embedded** fallback takes an exclusive file lock, so only one process can hold it at a time: if a `codegraph start` server for the same project has already answered a tool call, stop it before running `codegraph index`, otherwise the index command reports that the database is open in another process.
+With the default shared server (the built-in `ws://127.0.0.1:8000` or your `CODEGRAPH_SURREALDB_URL`), reads and indexing run concurrently, so this restriction does not apply. The **embedded** fallback takes an exclusive file lock, so only one process can hold it at a time: if a `codegraph start` server for the same project has already answered a tool call, stop it before running `codegraph index`, otherwise the index command reports that the database is open in another process.
 
 ---
 
@@ -500,7 +500,7 @@ python tools/view_debug_logs.py --follow
 
 ## Optional: Using a SurrealDB Server
 
-Point CodeGraph at a shared SurrealDB server in `.env`. This is the recommended setup: indexing and queries are substantially faster than the embedded fallback, and a read-only MCP client can run alongside `codegraph index`. Keep the embedded fallback only when you need a fully self-contained, offline machine.
+CodeGraph targets a shared SurrealDB server by default (`ws://127.0.0.1:8000`) and reads namespace, database and credentials from `.env`. Indexing and queries are substantially faster than the embedded fallback, and a read-only MCP client can run alongside `codegraph index`. Use the embedded store only when you need a fully self-contained, offline machine, by setting `CODEGRAPH_SURREALDB_URL` to a `surrealkv://` path.
 
 ```bash
 CODEGRAPH_SURREALDB_URL=ws://localhost:3004
@@ -616,7 +616,7 @@ You should see tables like `nodes`, `edges`, `chunks`, `symbol_embeddings`, and 
 
 **"The embedded database ... is open in another process"**
 - Another `codegraph` process holds this project's embedded store. Stop the running `codegraph start` (or the other client's server) and retry.
-- Embedded mode allows one MCP client per project at a time. If several clients, or a client plus `codegraph index`, must share a database, set `CODEGRAPH_SURREALDB_URL` to a shared server: server mode has no per-client file lock and allows concurrent reads and indexing.
+- Embedded mode (`surrealkv://`) allows one MCP client per project at a time. If several clients, or a client plus `codegraph index`, must share a database, use the shared server: server mode has no per-client file lock and allows concurrent reads and indexing.
 
 **"Embedded database was created from the ... schema at a different revision"**
 - The store keeps the schema it was created with. To move to the current schema, stop all `codegraph` processes, delete `<project>/.codegraph/db` and run `codegraph index` again.

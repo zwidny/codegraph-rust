@@ -56,5 +56,7 @@ batch_timeout_ms = 200
 exclude_patterns = ["**/node_modules/**", "**/target/**", "**/.git/**", "**/dist/**"]
 # languages = ["rust", "typescript"]
 
-# Storage has no section here: each project uses an embedded store at <project>/.codegraph/db
-# unless CODEGRAPH_SURREALDB_URL points at a SurrealDB server.
+# Storage has no section here: CodeGraph connects to a shared SurrealDB server at
+# ws://127.0.0.1:8000 by default, or to CODEGRAPH_SURREALDB_URL when set. The embedded
+# per-project store at <project>/.codegraph/db is opt-in via a surrealkv:// URL and is
+# compatibility-only.

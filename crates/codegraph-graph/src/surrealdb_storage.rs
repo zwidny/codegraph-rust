@@ -39,6 +39,12 @@ const EMBEDDED_GRAPH_DATABASE: &str = "codegraph_graph";
 /// Connection schemes handled by an in-process engine rather than a server.
 const EMBEDDED_SCHEMES: [&str; 4] = ["surrealkv://", "file://", "rocksdb://", "mem://"];
 
+/// Shared server used when `CODEGRAPH_SURREALDB_URL` is unset.
+///
+/// The embedded store is a compatibility fallback: it is substantially slower and allows
+/// only one process per project, so it is opt-in through an explicit `surrealkv://` URL.
+pub const DEFAULT_SERVER_URL: &str = "ws://127.0.0.1:8000";
+
 /// True when the connection string opens an in-process engine.
 pub fn is_embedded_connection(connection: &str) -> bool {
     EMBEDDED_SCHEMES
@@ -112,6 +118,13 @@ fn env_value(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Resolve the connection string for a project.
+///
+/// Split out so the default can be tested without mutating the process environment.
+fn project_connection(configured: Option<String>) -> String {
+    configured.unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
+}
+
 /// SurrealDB storage implementation with flexible schema support
 #[derive(Clone)]
 pub struct SurrealDbStorage {
@@ -138,13 +151,12 @@ impl SurrealDbConfig {
     /// Connection settings for a project.
     ///
     /// With `CODEGRAPH_SURREALDB_URL` set, this targets that server using the
-    /// `CODEGRAPH_SURREALDB_*` settings. Otherwise it opens the project's own
-    /// embedded SurrealKV store at `<project_root>/.codegraph/db`.
+    /// `CODEGRAPH_SURREALDB_*` settings. Otherwise it targets the shared server at
+    /// [`DEFAULT_SERVER_URL`]; the embedded per-project store is opt-in by pointing the
+    /// URL at a `surrealkv://` path.
     pub fn for_project(project_root: &Path) -> Self {
-        match env_value("CODEGRAPH_SURREALDB_URL") {
-            Some(connection) => Self::remote(connection),
-            None => Self::embedded(project_root),
-        }
+        let _ = project_root;
+        Self::remote(project_connection(env_value("CODEGRAPH_SURREALDB_URL")))
     }
 
     /// Settings for the embedded store under `project_root`.
@@ -501,9 +513,22 @@ impl SurrealDbStorage {
     /// Connect to a SurrealDB server (or a fresh `mem://` engine) and authenticate if credentials are set.
     async fn connect_remote(config: &SurrealDbConfig) -> Result<Surreal<Any>> {
         let db: Surreal<Any> = Surreal::init();
-        db.connect(&config.connection)
-            .await
-            .map_err(|e| CodeGraphError::Database(format!("Failed to connect: {}", e)))?;
+        db.connect(&config.connection).await.map_err(|e| {
+            let mut message = format!(
+                "Failed to connect to SurrealDB at {}: {}",
+                config.connection, e
+            );
+            if config.connection == DEFAULT_SERVER_URL {
+                message.push_str(&format!(
+                    "\nCodeGraph now defaults to a shared SurrealDB server. Either start one \
+                         (see docs/INSTALLATION_GUIDE.md) and apply schema/codegraph_v2.surql, or \
+                         set CODEGRAPH_SURREALDB_URL to your server. For the slower single-process \
+                         embedded store, set CODEGRAPH_SURREALDB_URL=surrealkv://<project>/{}/{}.",
+                    EMBEDDED_DB_DIR, EMBEDDED_DB_NAME
+                ));
+            }
+            CodeGraphError::Database(message)
+        })?;
 
         if let (Some(username), Some(password)) = (&config.username, &config.password) {
             let auth_result = if config.connection.starts_with("wss://") {
@@ -3024,6 +3049,22 @@ mod tests {
     #[test]
     fn normalized_embedding_column_rejects_unknown_column() {
         assert!(normalized_embedding_column("embedding_9999").is_none());
+    }
+
+    #[test]
+    fn project_connection_defaults_to_the_shared_server() {
+        assert_eq!(project_connection(None), DEFAULT_SERVER_URL);
+        assert_eq!(DEFAULT_SERVER_URL, "ws://127.0.0.1:8000");
+        assert!(!is_embedded_connection(DEFAULT_SERVER_URL));
+    }
+
+    #[test]
+    fn project_connection_keeps_an_explicit_url() {
+        assert_eq!(
+            project_connection(Some("surrealkv:///tmp/x/.codegraph/db".into())),
+            "surrealkv:///tmp/x/.codegraph/db"
+        );
+        assert!(is_embedded_connection("surrealkv:///tmp/x/.codegraph/db"));
     }
 }
 

@@ -764,8 +764,9 @@ impl CodeGraphMCPServer {
         let graph_functions = {
             use codegraph_graph::SurrealDbStorage;
 
-            // Embedded project store under the working directory unless
-            // CODEGRAPH_SURREALDB_URL points at a server.
+            // Shared SurrealDB server from CODEGRAPH_SURREALDB_URL, or the default
+            // local server when it is unset. The embedded store is opt-in via a
+            // surrealkv:// URL.
             let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let surrealdb_config = codegraph_graph::SurrealDbConfig::for_project(&project_root);
 

@@ -503,13 +503,15 @@ server and do not require reindexing.
 
 ### 3. Database
 
-Use a **shared SurrealDB server**. That is the supported path: the embedded SurrealKV store
-is kept only for local compatibility, and it is substantially slower for indexing and for
-concurrent reads, so it is no longer the recommended setup.
+Use a **shared SurrealDB server**. That is the supported path **and the default**: with no
+`CODEGRAPH_SURREALDB_URL` set, `codegraph` connects to `ws://127.0.0.1:8000`. The embedded
+SurrealKV store is opt-in, kept only for local compatibility, substantially slower for
+indexing and concurrent reads, so it is no longer the recommended setup.
 
-**Shared server (recommended).** Point the client at a running SurrealDB server. There is no
-per-client file lock, so a read-only MCP server and `codegraph index` can run at the same
-time against the same project, and several clients can share it:
+**Shared server (default).** Point the client at a running SurrealDB server — or just start
+one on the default port and skip the `.env`. There is no per-client file lock, so a read-only
+MCP server and `codegraph index` can run at the same time against the same project, and
+several clients can share it:
 
 ```bash
 # .env — one database shared by the MCP server and index runs
@@ -532,12 +534,18 @@ The schema is not created per project directory in this mode: apply
 `schema/codegraph_v2.surql` yourself (see
 [Setting Up SurrealDB](docs/INSTALLATION_GUIDE.md#setting-up-surrealdb)).
 
-**Embedded (compatibility only, slower).** Without `CODEGRAPH_SURREALDB_URL`, `codegraph`
-falls back to running SurrealDB in-process, with a per-project SurrealKV store at
-`<project>/.codegraph/db`. Keep it for offline or single-shot use: indexing and queries are
-much slower than the shared server, and SurrealKV takes an exclusive file lock, so **only one
-process can hold a project's store open at a time** (stop `codegraph start` before
-`codegraph index`). Removing a project's index is `rm -rf <project>/.codegraph/db`.
+**Embedded (opt-in, compatibility only, slower).** The embedded store is no longer the
+default. To use it, point the URL at a `surrealkv://` path; `codegraph` then runs SurrealDB
+in-process with a per-project SurrealKV store at `<project>/.codegraph/db`. Keep it for
+offline or single-shot use: indexing and queries are much slower than the shared server, and
+SurrealKV takes an exclusive file lock, so **only one process can hold a project's store open
+at a time** (stop `codegraph start` before `codegraph index`). Removing a project's index is
+`rm -rf <project>/.codegraph/db`.
+
+```bash
+# .env — opt into the embedded store instead of a server
+CODEGRAPH_SURREALDB_URL=surrealkv:///absolute/path/to/project/.codegraph/db
+```
 
 ### 4. Initialize and Index Your Project
 
@@ -952,8 +960,8 @@ Use any model with dimensions 384-4096:
 - **Cloud:** Anthropic Claude, OpenAI, xAI Grok, OpenAI Compliant
 
 ### Database
-- **SurrealDB 3.x shared server or container** via `CODEGRAPH_SURREALDB_URL` (recommended) with HNSW vector indexes - concurrent MCP reads and `codegraph index` against the same project, and multiple clients; also [Surreal Cloud](https://surrealdb.com/cloud)
-- **Embedded SurrealKV** fallback for offline or single-shot use - compatibility only, substantially slower, single writer per project
+- **SurrealDB 3.x shared server or container** at `ws://127.0.0.1:8000` by default, or via `CODEGRAPH_SURREALDB_URL`, with HNSW vector indexes - concurrent MCP reads and `codegraph index` against the same project, and multiple clients; also [Surreal Cloud](https://surrealdb.com/cloud)
+- **Embedded SurrealKV** opt-in through a `surrealkv://` URL, for offline or single-shot use - compatibility only, substantially slower, single writer per project
 
 ---
 
@@ -993,11 +1001,12 @@ tier = "fast"
 
 The built-in agent resolves each LLM setting in three steps: the environment variable (a project `.env` counts), then the key in the config file's `[llm]` section, then a default. `enabled = false` in `[llm]` makes the agent ignore the section, and API keys are read from the environment only. `codegraph config agent-status` shows the provider, model and tier in effect; [AI_PROVIDERS.md](docs/AI_PROVIDERS.md) lists every variable and key.
 
-Storage: set `CODEGRAPH_SURREALDB_URL` (plus the other `CODEGRAPH_SURREALDB_*` variables)
-to use the shared server, which is the recommended path. Without it, `codegraph` falls back
-to the embedded per-project store: that fallback exists for compatibility, is substantially
-slower, and lets only one process hold the project directory. `CODEGRAPH_SCHEMA=v1` selects
-the original `schema/codegraph.surql` for new stores.
+Storage: `codegraph` connects to a shared SurrealDB server at `ws://127.0.0.1:8000` by
+default, or to `CODEGRAPH_SURREALDB_URL` (plus the other `CODEGRAPH_SURREALDB_*` variables)
+when set. The embedded per-project store is opt-in through a `surrealkv://` URL: it exists
+for compatibility, is substantially slower, and lets only one process hold the project
+directory. `CODEGRAPH_SCHEMA=v1` selects the original `schema/codegraph.surql` for new
+stores.
 
 See [INSTALLATION_GUIDE.md](docs/INSTALLATION_GUIDE.md) for complete configuration options.
 

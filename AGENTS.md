@@ -116,10 +116,9 @@ codegraph index . -r --index-tier balanced --languages rust
 `unless` / `if` / `when` / `except` / `除非` / `如果`，
 必须**显式写出该条件成立与否**，不得只引前半句。
 
-典型陷阱：`config/example.toml` 写的是
-「each project uses an embedded store at `<project>/.codegraph/db`
-**unless** `CODEGRAPH_SURREALDB_URL` points at a SurrealDB server」。
-引用了这句却没回答那个 `unless`，等同于没验证。
+典型陷阱：文档写「默认连 A，**除非**设置了 Y」，你只引了「默认连 A」，
+却没回答 Y 是否设置——等同于没验证。条件句的措辞会随文档改版变化，
+不要背某一句原文，要看**当前**文件里那句是否带条件。
 
 **3. 副作用指令前先看运行态。**
 
@@ -153,7 +152,7 @@ codegraph index . -r --index-tier balanced --languages rust
 ### 本仓库存储模式三连（缺一条不算结论）
 
 ```bash
-grep -E '^CODEGRAPH_SURREALDB_URL' .env                      # 配置源（回答 example.toml 的 unless）
+grep -E '^CODEGRAPH_SURREALDB_URL' .env ~/.codegraph.env     # 配置源（项目 .env 覆盖用户文件）
 codegraph status --detailed                                  # 运行态
 docker ps --filter name=codegraph-db --format '{{.Status}}'   # 服务态
 ```
@@ -172,7 +171,7 @@ Bare Cargo commands target only `codegraph-core`; specify `--workspace` or `-p <
 
 - `cargo check --workspace`: check all crates without producing binaries.
 - `cargo build -p codegraph-mcp-server --bin codegraph --features full`: build the CLI with agent, embedding, and HTTP features; add `--release` for optimized builds.
-- `./target/debug/codegraph start stdio`: run the built MCP server after configuring providers. New embedded stores apply the bundled v2 schema automatically; remote stores require `schema/apply-schema.sh`. Respect `CARGO_TARGET_DIR` when locating binaries.
+- `./target/debug/codegraph start stdio`: run the built MCP server after configuring providers. A shared server is the default target (`ws://127.0.0.1:8000`) and needs `schema/codegraph_v2.surql` applied; only an explicit `surrealkv://` URL opens an embedded per-project store, which applies the bundled v2 schema automatically. Respect `CARGO_TARGET_DIR` when locating binaries.
 - `cargo test -p codegraph-mcp`: test the indexing crate; use `cargo test --workspace` for all crates.
 - `cargo test -p codegraph-mcp-server --lib` and `cargo test -p codegraph-mcp-server --test project_init_integration --test agent_cli_integration`: verify project setup, hook preservation and CLI contracts without live providers.
 - `cargo fmt --all -- --check`: verify formatting; omit `-- --check` to format.
