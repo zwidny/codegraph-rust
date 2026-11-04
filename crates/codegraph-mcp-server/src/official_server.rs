@@ -260,9 +260,23 @@ impl JsonSchema for GraphToolParams {
     }
 
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Every direct graph tool accepts two shared response-size controls; tool-specific
+        // parameters stay documented in each tool's description.
         json!({
             "type": "object",
             "additionalProperties": true,
+            "properties": {
+                "content_chars": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Code snippet length per node. Omit to use the server default \
+                                  (CODEGRAPH_TOOL_CONTENT_CHARS, 2000); 0 keeps the full content."
+                },
+                "include_content": {
+                    "type": "boolean",
+                    "description": "Set false to omit code snippets entirely; identity and location stay."
+                }
+            },
             "description": "Tool-specific parameters; see each tool's description."
         })
         .try_into()

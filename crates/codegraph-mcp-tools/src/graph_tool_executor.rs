@@ -272,6 +272,32 @@ fn compact_called_by(value: &mut JsonValue) {
     }
 }
 
+/// Resolve the snippet length for one call.
+///
+/// Precedence: the call's `content_chars`, then `CODEGRAPH_TOOL_CONTENT_CHARS`, then 2000.
+/// `0` keeps the full snippet, matching the environment variable's meaning.
+fn resolve_content_chars(parameters: &JsonValue) -> usize {
+    parameters
+        .get("content_chars")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .unwrap_or_else(content_snippet_chars)
+}
+
+/// Remove every `content` field in a response, keeping identity and location.
+fn drop_content(value: &mut JsonValue) {
+    match value {
+        JsonValue::Array(items) => items.iter_mut().for_each(drop_content),
+        JsonValue::Object(map) => {
+            map.remove("content");
+            for child in map.values_mut() {
+                drop_content(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn shorten_content(value: &mut JsonValue, max_chars: usize) {
     if max_chars == 0 {
         return;
@@ -605,7 +631,14 @@ impl GraphToolExecutor {
 
             // Shape the result for a model: content snippets first, then the size limit.
             let mut result = result;
-            shorten_content(&mut result, content_snippet_chars());
+            shorten_content(&mut result, resolve_content_chars(&parameters));
+            if parameters
+                .get("include_content")
+                .and_then(|value| value.as_bool())
+                == Some(false)
+            {
+                drop_content(&mut result);
+            }
             trim_metadata(&mut result);
             drop_echoed_parameters(&mut result);
             let result = self.truncate_if_oversized(tool_name, result);
@@ -1017,6 +1050,45 @@ fn log_tool_call_finish(tool_name: &str, result: &JsonValue) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_content_chars_prefers_the_call_argument() {
+        let with_arg = serde_json::json!({"content_chars": 500});
+        assert_eq!(super::resolve_content_chars(&with_arg), 500);
+        let zero = serde_json::json!({"content_chars": 0});
+        assert_eq!(super::resolve_content_chars(&zero), 0);
+    }
+
+    #[test]
+    fn resolve_content_chars_falls_back_to_the_environment_default() {
+        let without = serde_json::json!({"node_id": "x"});
+        assert_eq!(
+            super::resolve_content_chars(&without),
+            super::content_snippet_chars()
+        );
+    }
+
+    #[test]
+    fn drop_content_removes_nested_snippets_and_keeps_identity() {
+        let mut value = serde_json::json!({
+            "result": [
+                {"name": "a", "content": "fn a() {}", "location": {"file_path": "a.rs"}},
+                {"name": "b", "content": "fn b() {}"}
+            ]
+        });
+        super::drop_content(&mut value);
+        assert!(value["result"][0].get("content").is_none());
+        assert_eq!(value["result"][0]["name"], "a");
+        assert_eq!(value["result"][0]["location"]["file_path"], "a.rs");
+        assert!(value["result"][1].get("content").is_none());
+    }
+
+    #[test]
+    fn drop_content_is_a_no_op_without_content() {
+        let mut value = serde_json::json!({"result": [{"name": "a"}]});
+        super::drop_content(&mut value);
+        assert_eq!(value, serde_json::json!({"result": [{"name": "a"}]}));
+    }
 
     #[test]
     fn compact_called_by_becomes_an_id_to_name_map() {

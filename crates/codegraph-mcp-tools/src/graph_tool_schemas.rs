@@ -16,7 +16,10 @@ pub struct ToolSchema {
 pub struct GraphToolSchemas;
 
 impl GraphToolSchemas {
-    /// Get all tool schemas for registration with LLM
+    /// Get all tool schemas for registration with LLM.
+    ///
+    /// Every graph tool accepts the same two response-size controls, so they are injected
+    /// here instead of being repeated in eight schema literals.
     pub fn all() -> Vec<ToolSchema> {
         vec![
             Self::get_transitive_dependencies(),
@@ -28,6 +31,38 @@ impl GraphToolSchemas {
             Self::semantic_code_search(),
             Self::find_complexity_hotspots(),
         ]
+        .into_iter()
+        .map(Self::with_content_controls)
+        .collect()
+    }
+
+    /// Add the two response-size controls every graph tool shares.
+    ///
+    /// `content_chars` overrides `CODEGRAPH_TOOL_CONTENT_CHARS` for one call (0 keeps the full
+    /// snippet); `include_content: false` drops snippets entirely and leaves identity/location.
+    fn with_content_controls(mut schema: ToolSchema) -> ToolSchema {
+        if let Some(properties) = schema
+            .parameters
+            .get_mut("properties")
+            .and_then(|value| value.as_object_mut())
+        {
+            properties.insert(
+            "content_chars".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 0,
+                "description": "Code snippet length per node. Omit to use the server default                                 (CODEGRAPH_TOOL_CONTENT_CHARS, 2000); 0 keeps the full content."
+            }),
+        );
+            properties.insert(
+            "include_content".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Set false to omit code snippets entirely; identity and location stay."
+            }),
+        );
+        }
+        schema
     }
 
     /// Schema for get_transitive_dependencies function
