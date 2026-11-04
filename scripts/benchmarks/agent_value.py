@@ -376,19 +376,37 @@ def format_hit(row, snippet):
     return line
 
 
-def execute_tool(name, args, workspace, client, arm, snippet=300):
-    """Run one tool call and return the observation text."""
+def compact(value):
+    """Serialise without whitespace, the size a tool result really costs."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def execute_tool(name, args, workspace, client, arm, snippet=300, graph_mode="full"):
+    """Run one tool call and return the observation text.
+
+    graph_mode controls what the agent sees from a graph tool:
+      full    - the complete response, compact JSON (what opencode forwards when the
+                program returns the value; execute has no output cap)
+      snippet - identity, location and a short code excerpt per hit
+      pointer - identity and location only
+    """
     if name == "semantic_code_search" and arm == "codegraph" and client:
         limit = int(args.get("limit") or 8)
         payload = client.call("semantic_code_search",
                               {"query": str(args.get("query", "")), "limit": limit})
+        if graph_mode == "full":
+            return compact(json.loads(payload))
         rows = json.loads(payload).get("result", [])
+        if graph_mode == "pointer":
+            snippet = 0
         return "\n".join(format_hit(row, snippet) for row in rows[:limit]) or "(no results)"
     if name == "get_reverse_dependencies" and arm == "codegraph" and client:
         payload = client.call("get_reverse_dependencies",
                               {"node_id": str(args.get("node_id", "")),
                                "edge_type": "calls",
                                "depth": int(args.get("depth") or 1)})
+        if graph_mode == "full":
+            return compact(json.loads(payload))
         rows = json.loads(payload).get("result", [])
         return "\n".join(
             f"{row.get('name')} | {(row.get('location') or {}).get('file_path')} | {row.get('node_id', '')}"
@@ -399,7 +417,8 @@ def execute_tool(name, args, workspace, client, arm, snippet=300):
     return f"error: unknown tool {name}"
 
 
-def run_agent(llm, workspace, problem, arm, max_steps, client=None, snippet=300):
+def run_agent(llm, workspace, problem, arm, max_steps, client=None, snippet=300,
+              graph_mode="full", transcript_chars=90000):
     """Drive the model with native tool calling; one tool per turn, capped at max_steps."""
     tools = tool_schemas(arm)
     system = SYSTEM.replace("{max_steps}", str(max_steps))
@@ -455,7 +474,7 @@ def run_agent(llm, workspace, problem, arm, max_steps, client=None, snippet=300)
                           "summary": str(args.get("summary"))[:200]})
             break
         try:
-            observation = execute_tool(name, args, workspace, client, arm, snippet)
+            observation = execute_tool(name, args, workspace, client, arm, snippet, graph_mode)
         except Exception as error:  # a tool failure is an observation, not a crash
             observation = f"error: {error}"
         observation = str(observation)
@@ -464,9 +483,13 @@ def run_agent(llm, workspace, problem, arm, max_steps, client=None, snippet=300)
                       "observation_bytes": len(observation.encode()),
                       "prompt_tokens": llm.prompt_tokens - prompt_before,
                       "completion_tokens": llm.completion_tokens - completion_before})
+        # opencode forwards an execute() return value with no size cap, so a full graph
+        # response must reach the model intact; built-in tools keep their cap.
+        uncapped = graph_mode == "full" and name in {"semantic_code_search", "get_reverse_dependencies"}
+        cap = len(observation) if uncapped else MAX_OUTPUT_CHARS
         messages.append({"role": "tool", "tool_call_id": call.get("id") or f"call_{step}",
-                         "content": observation[:MAX_OUTPUT_CHARS]})
-        trim_messages(messages)
+                         "content": observation[:cap]})
+        trim_messages(messages, budget_chars=transcript_chars)
         step += 1
     elapsed = time.time() - started
     return {"steps": steps, "changed": workspace.changed_files(), "elapsed": elapsed}
@@ -554,7 +577,11 @@ def main():
     parser.add_argument("--command", default=" ".join(mv.DEFAULT_COMMAND))
     parser.add_argument("--keep-worktrees", action="store_true")
     parser.add_argument("--graph-snippet", type=int, default=300,
-                        help="characters of code shown per graph hit (0 keeps pointers only)")
+                        help="characters of code shown per graph hit in snippet mode")
+    parser.add_argument("--graph-mode", choices=("full", "snippet", "pointer"), default="full",
+                        help="what the agent sees from a graph tool: full response, snippet, or pointer")
+    parser.add_argument("--transcript-chars", type=int, default=90000,
+                        help="transcript budget before old observations are shrunk")
     args = parser.parse_args()
 
     root = args.project.resolve()
@@ -584,7 +611,7 @@ def main():
                 try:
                     run = run_agent(llm, workspace, task["subject"], arm,
                                     args.max_steps, client if arm == "codegraph" else None,
-                                    args.graph_snippet)
+                                    args.graph_snippet, args.graph_mode, args.transcript_chars)
                     tokens = llm.prompt_tokens + llm.completion_tokens - before
                     result = {"score": score(run["changed"], task["golden"]),
                               "run": run, "tokens": tokens}
