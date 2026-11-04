@@ -50,7 +50,11 @@ allowlist, for example `CODEGRAPH_HTTP_ALLOWED_HOSTS=localhost,codegraph.example
 - **A model provider** for embeddings and for the agentic tools: [Ollama](https://ollama.com) or LM Studio locally, or an API key for Anthropic, OpenAI, xAI or Jina. See `docs/AI_PROVIDERS.md`.
 - **macOS** for the installer scripts (Linux users can run the `cargo install` command directly). The scripts use Homebrew.
 
-No separate database installation is required. CodeGraph runs against a shared SurrealDB server (recommended), or against an embedded per-project store when `CODEGRAPH_SURREALDB_URL` is unset. The embedded store is a compatibility fallback: it is substantially slower and allows one process per project. See [Using a SurrealDB Server](#optional-using-a-surrealdb-server).
+A shared SurrealDB 3.x server is the supported deployment: run one with Docker or a container
+(see [Using a SurrealDB Server](#optional-using-a-surrealdb-server)) and apply
+`schema/codegraph_v2.surql` to it. No other database software is needed. An embedded
+per-project store remains available when `CODEGRAPH_SURREALDB_URL` is unset, but it is a
+compatibility fallback: substantially slower, and it allows one process per project.
 
 Balanced and full indexing tiers additionally need the language servers for the languages you index (for example `rust-analyzer`); the default fast tier does not.
 
