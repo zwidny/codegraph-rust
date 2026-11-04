@@ -399,6 +399,80 @@ impl GraphFunctions {
         Ok(result)
     }
 
+    /// Summarize a node and the relationship types that touch it.
+    ///
+    /// Diagnostic helper: when a dependency query returns nothing, callers need to tell
+    /// "no such node" apart from "the node exists but has no edges of that type". The
+    /// summary answers both without re-running the traversal.
+    pub async fn get_node_edge_summary(&self, node_id: &str) -> Result<NodeEdgeSummary> {
+        debug!(
+            "Calling fn::node_edge_summary({}, project={})",
+            node_id, self.project_id
+        );
+
+        let sql = r#"
+            RETURN {
+                node: (SELECT <string>id AS id, name, node_type AS kind, file_path, start_line
+                       FROM fn::parse_record_id('nodes', $node_id))[0],
+                incoming: (SELECT edge_type, count() AS count FROM edges
+                           WHERE to = fn::parse_record_id('nodes', $node_id)
+                             AND (project_id = $project_id OR project_id = NONE)
+                           GROUP BY edge_type),
+                outgoing: (SELECT edge_type, count() AS count FROM edges
+                           WHERE from = fn::parse_record_id('nodes', $node_id)
+                             AND (project_id = $project_id OR project_id = NONE)
+                           GROUP BY edge_type)
+            };
+        "#;
+
+        let mut response = self
+            .db
+            .query(sql)
+            .bind(("project_id", self.project_id.clone()))
+            .bind(("node_id", node_id.to_string()))
+            .await
+            .map_err(|e| {
+                error!("Failed to call node_edge_summary: {}", e);
+                CodeGraphError::Database(format!("node_edge_summary failed: {}", e))
+            })?;
+
+        let value: Option<SurrealValue> = response.take(0).ok();
+        let json = value
+            .map(surreal_to_json)
+            .unwrap_or(serde_json::Value::Null);
+
+        let node = json.get("node").filter(|value| !value.is_null());
+        let text_field = |key: &str| {
+            node.and_then(|n| n.get(key))
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        };
+        let edge_types = |key: &str| -> Vec<String> {
+            json.get(key)
+                .and_then(|value| value.as_array())
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| row.get("edge_type").and_then(|value| value.as_str()))
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        Ok(NodeEdgeSummary {
+            found: node.is_some(),
+            id: text_field("id"),
+            name: text_field("name"),
+            kind: text_field("kind"),
+            file_path: text_field("file_path"),
+            start_line: node
+                .and_then(|n| n.get("start_line"))
+                .and_then(|value| value.as_i64()),
+            incoming_edge_types: edge_types("incoming"),
+            outgoing_edge_types: edge_types("outgoing"),
+        })
+    }
+
     /// Get complexity hotspots - functions with high cyclomatic complexity and coupling
     ///
     /// # Arguments
@@ -710,6 +784,25 @@ pub struct DependencyNode {
     pub metadata: Option<serde_json::Value>,
     pub dependency_depth: Option<i32>,
     pub dependent_depth: Option<i32>,
+}
+
+/// Node identity plus the relationship types that touch it.
+///
+/// Produced by [`GraphFunctions::get_node_edge_summary`] so an empty dependency result can
+/// be explained rather than returned as a bare empty array.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeEdgeSummary {
+    /// Whether the node exists in this project's index.
+    pub found: bool,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub kind: Option<String>,
+    pub file_path: Option<String>,
+    pub start_line: Option<i64>,
+    #[serde(default)]
+    pub incoming_edge_types: Vec<String>,
+    #[serde(default)]
+    pub outgoing_edge_types: Vec<String>,
 }
 
 /// Circular dependency pair
