@@ -592,6 +592,61 @@ Add to your MCP config:
 
 ---
 
+## Measured value: CodeGraph vs grep
+
+Same questions, same repository, same inspection budget. These retrieval numbers come from
+[mcp_value.py](scripts/benchmarks/mcp_value.py); no LLM is involved, so "read" stands in for
+token cost — it is what an agent would have to pull into its context.
+
+### Retrieval: where / who calls / what it reaches
+
+| Scenario | Project | Metric | grep baseline | CodeGraph | Delta |
+|---|---|---|---|---|---|
+| Locate a symbol | Rust (251 files) | hit@1 · read | 79% · 67.5 KB | **93% · 18.1 KB** | +14 pt · **−73% read** |
+| Locate a symbol | Python (511 files) | hit@1 · read | **79% · 64.1 KB** | 64% · 19.4 KB | −15 pt · −70% read |
+| Who calls this | Rust | caller precision · read | 69% · 62.2 KB | **100% · 6.3 KB** | +31 pt · **−90% read** |
+| Who calls this | Python | caller precision · read | 67% · 62.9 KB | **100% · 5.7 KB** | +33 pt · **−91% read** |
+| Call chain, depth 2 | Rust | recall · latency | 26% · 21.6 s | **100% · 0.22 s** | +74 pt · **98× faster** |
+| Call chain, depth 2 | Python | recall · latency | 15% · 5.9 s | **100% · 0.22 s** | +85 pt · **27× faster** |
+
+Reading is the stable win in every scenario. Recall only separates once a question crosses
+files: at depth 2 the grep path needs ~20 searches and 6–22 seconds, while the graph answers
+in one call. Where the name is already known, grep stays competitive and on Python it wins —
+CodeGraph is not a grep replacement for that case.
+
+### Agent: real merged commits, real edits
+
+One task = one merged fix; ground truth = the files that commit touched. Same model
+(`deepseek-flash`), same prompt, same 18-step budget; only the tool list differs. LLM tokens
+are measured from the API response, not estimated.
+
+| Metric | Without CodeGraph | With CodeGraph | Delta |
+|---|---|---|---|
+| Solved | 17% (1/6) | 33% (2/6) | +1 task |
+| **LLM tokens / task** | 111,855 | 113,835 | +2% |
+| **Seconds / task** | 22 | 26 | +18% |
+| Tool calls / task | 16.5 | 17.2 | +4% |
+| Runs that never edited | 5/6 | 4/6 | −1 |
+
+`n=6` cannot support a rate claim, and 9 of 12 runs emitted no edit at all — this layer
+measures whether the model commits to writing, not which tools it has. The one clean
+separation (t01) shows the shape of the benefit: two `semantic_code_search` calls, then
+three patches, versus 18 steps of reading without an edit.
+
+Full method, per-task traces and known limitations:
+[docs/evaluations/mcp-value-2026-11-04.md](docs/evaluations/mcp-value-2026-11-04.md).
+
+Reproduce:
+
+```bash
+python3 scripts/benchmarks/mcp_value.py --generate 14       # locate
+python3 scripts/benchmarks/mcp_value.py --mode impact       # who calls
+python3 scripts/benchmarks/mcp_value.py --mode chain --depth 2
+python3 scripts/benchmarks/agent_value.py --tasks 6 --max-steps 18
+```
+
+---
+
 ## Agent CLI accuracy by indexing tier
 
 The CLI evaluation uses the same eight questions as the HTTP MCP test, defined in
