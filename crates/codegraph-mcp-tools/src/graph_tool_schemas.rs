@@ -54,13 +54,6 @@ impl GraphToolSchemas {
                 "description": "Code snippet length per node. Omit to use the server default                                 (CODEGRAPH_TOOL_CONTENT_CHARS, 2000); 0 keeps the full content."
             }),
         );
-            properties.insert(
-            "include_content".to_string(),
-            json!({
-                "type": "boolean",
-                "description": "Set false to omit code snippets entirely; identity and location stay."
-            }),
-        );
         }
         schema
     }

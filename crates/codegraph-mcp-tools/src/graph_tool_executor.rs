@@ -284,20 +284,6 @@ fn resolve_content_chars(parameters: &JsonValue) -> usize {
         .unwrap_or_else(content_snippet_chars)
 }
 
-/// Remove every `content` field in a response, keeping identity and location.
-fn drop_content(value: &mut JsonValue) {
-    match value {
-        JsonValue::Array(items) => items.iter_mut().for_each(drop_content),
-        JsonValue::Object(map) => {
-            map.remove("content");
-            for child in map.values_mut() {
-                drop_content(child);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn shorten_content(value: &mut JsonValue, max_chars: usize) {
     if max_chars == 0 {
         return;
@@ -632,13 +618,6 @@ impl GraphToolExecutor {
             // Shape the result for a model: content snippets first, then the size limit.
             let mut result = result;
             shorten_content(&mut result, resolve_content_chars(&parameters));
-            if parameters
-                .get("include_content")
-                .and_then(|value| value.as_bool())
-                == Some(false)
-            {
-                drop_content(&mut result);
-            }
             trim_metadata(&mut result);
             drop_echoed_parameters(&mut result);
             let result = self.truncate_if_oversized(tool_name, result);
@@ -1066,28 +1045,6 @@ mod tests {
             super::resolve_content_chars(&without),
             super::content_snippet_chars()
         );
-    }
-
-    #[test]
-    fn drop_content_removes_nested_snippets_and_keeps_identity() {
-        let mut value = serde_json::json!({
-            "result": [
-                {"name": "a", "content": "fn a() {}", "location": {"file_path": "a.rs"}},
-                {"name": "b", "content": "fn b() {}"}
-            ]
-        });
-        super::drop_content(&mut value);
-        assert!(value["result"][0].get("content").is_none());
-        assert_eq!(value["result"][0]["name"], "a");
-        assert_eq!(value["result"][0]["location"]["file_path"], "a.rs");
-        assert!(value["result"][1].get("content").is_none());
-    }
-
-    #[test]
-    fn drop_content_is_a_no_op_without_content() {
-        let mut value = serde_json::json!({"result": [{"name": "a"}]});
-        super::drop_content(&mut value);
-        assert_eq!(value, serde_json::json!({"result": [{"name": "a"}]}));
     }
 
     #[test]
