@@ -186,6 +186,58 @@ fn empty_result_diagnostics(
 
 /// Shorten long `content` strings anywhere in a tool result to a leading snippet that ends
 /// on a line boundary where possible, recording the original length next to it.
+/// Metadata keys a caller can act on; the rest is index bookkeeping.
+const KEPT_METADATA_KEYS: [&str; 2] = ["imports", "qualified_name"];
+
+/// Drop `metadata` keys that only describe the index itself.
+///
+/// `embedding_model`, `project_id`, `chunk_count`, `analyzer_confidence` and friends tell a
+/// model nothing it can use, yet they are the largest field in dependency responses (about a
+/// third of `trace_call_chain`). The key disappears entirely when nothing useful remains.
+fn trim_metadata(value: &mut JsonValue) {
+    match value {
+        JsonValue::Array(items) => items.iter_mut().for_each(trim_metadata),
+        JsonValue::Object(map) => {
+            let empty = match map.get_mut("metadata") {
+                Some(JsonValue::Object(metadata)) => {
+                    metadata.retain(|key, _| KEPT_METADATA_KEYS.contains(&key.as_str()));
+                    metadata.is_empty()
+                }
+                // The store returns metadata as a JSON string, so filter it in place.
+                Some(JsonValue::String(raw)) => match serde_json::from_str::<JsonValue>(raw) {
+                    Ok(JsonValue::Object(mut parsed)) => {
+                        parsed.retain(|key, _| KEPT_METADATA_KEYS.contains(&key.as_str()));
+                        if parsed.is_empty() {
+                            true
+                        } else {
+                            if let Ok(compact) = serde_json::to_string(&parsed) {
+                                *raw = compact;
+                            }
+                            false
+                        }
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if empty {
+                map.remove("metadata");
+            }
+            for child in map.values_mut() {
+                trim_metadata(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The response envelope echoed the request parameters back; the caller still has them.
+fn drop_echoed_parameters(value: &mut JsonValue) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("parameters");
+    }
+}
+
 fn shorten_content(value: &mut JsonValue, max_chars: usize) {
     if max_chars == 0 {
         return;
@@ -520,6 +572,8 @@ impl GraphToolExecutor {
             // Shape the result for a model: content snippets first, then the size limit.
             let mut result = result;
             shorten_content(&mut result, content_snippet_chars());
+            trim_metadata(&mut result);
+            drop_echoed_parameters(&mut result);
             let result = self.truncate_if_oversized(tool_name, result);
 
             // Cache the result if enabled
@@ -926,6 +980,98 @@ fn log_tool_call_finish(tool_name: &str, result: &JsonValue) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_metadata_keeps_only_actionable_keys() {
+        let mut value = serde_json::json!({
+            "result": [{
+                "name": "a",
+                "metadata": {
+                    "imports": ["b"],
+                    "qualified_name": "crate::a",
+                    "embedding_model": "F2LLM",
+                    "project_id": "/repo",
+                    "chunk_count": "3",
+                    "analyzer_confidence": "1.0"
+                }
+            }]
+        });
+        super::trim_metadata(&mut value);
+        let metadata = &value["result"][0]["metadata"];
+        assert_eq!(metadata["imports"][0], "b");
+        assert_eq!(metadata["qualified_name"], "crate::a");
+        assert!(metadata.get("embedding_model").is_none());
+        assert!(metadata.get("project_id").is_none());
+        assert!(metadata.get("chunk_count").is_none());
+    }
+
+    #[test]
+    fn trim_metadata_filters_the_json_string_form_the_store_returns() {
+        let mut value = serde_json::json!({
+            "result": [{
+                "name": "a",
+                "metadata": "{\"imports\":[\"b\"],\"qualified_name\":\"crate::a\",\"embedding_model\":\"F2LLM\",\"project_id\":\"/repo\"}"
+            }]
+        });
+        super::trim_metadata(&mut value);
+        let raw = value["result"][0]["metadata"]
+            .as_str()
+            .expect("string metadata kept");
+        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed["imports"][0], "b");
+        assert!(parsed.get("embedding_model").is_none());
+        assert!(parsed.get("project_id").is_none());
+    }
+
+    #[test]
+    fn trim_metadata_removes_a_string_form_with_no_useful_keys() {
+        let mut value = serde_json::json!({
+            "metadata": "{\"project_id\":\"/repo\",\"chunk_count\":\"2\"}"
+        });
+        super::trim_metadata(&mut value);
+        assert!(value.get("metadata").is_none());
+    }
+
+    #[test]
+    fn trim_metadata_removes_the_key_when_nothing_useful_remains() {
+        let mut value =
+            serde_json::json!({"metadata": {"project_id": "/repo", "chunk_count": "1"}});
+        super::trim_metadata(&mut value);
+        assert!(value.get("metadata").is_none());
+    }
+
+    #[test]
+    fn trim_metadata_reaches_nested_objects_and_arrays() {
+        let mut value = serde_json::json!({
+            "result": {"node": {"metadata": {"embedding_model": "x", "imports": ["i"]}},
+                       "dependents": [{"metadata": {"project_id": "p"}}]}
+        });
+        super::trim_metadata(&mut value);
+        assert_eq!(value["result"]["node"]["metadata"]["imports"][0], "i");
+        assert!(
+            value["result"]["node"]["metadata"]
+                .get("embedding_model")
+                .is_none()
+        );
+        assert!(value["result"]["dependents"][0].get("metadata").is_none());
+    }
+
+    #[test]
+    fn drop_echoed_parameters_removes_only_the_envelope_field() {
+        let mut value = serde_json::json!({"tool": "get_hub_nodes", "parameters": {"min_degree": 3},
+                                            "result": [{"name": "a"}]});
+        super::drop_echoed_parameters(&mut value);
+        assert!(value.get("parameters").is_none());
+        assert_eq!(value["tool"], "get_hub_nodes");
+        assert_eq!(value["result"][0]["name"], "a");
+    }
+
+    #[test]
+    fn drop_echoed_parameters_is_a_no_op_without_the_key() {
+        let mut value = serde_json::json!({"result": []});
+        super::drop_echoed_parameters(&mut value);
+        assert_eq!(value, serde_json::json!({"result": []}));
+    }
 
     #[test]
     fn test_shorten_content_keeps_location_and_marks_truncation() {
