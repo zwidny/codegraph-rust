@@ -403,6 +403,8 @@ def run_agent(llm, workspace, problem, arm, max_steps, client=None):
     steps, started = [], time.time()
     step, no_tool = 0, 0
     while step < max_steps and no_tool < 2:
+        prompt_before = llm.prompt_tokens
+        completion_before = llm.completion_tokens
         message = llm.chat(messages, tools)
         calls = message.get("tool_calls") or []
         if not calls:
@@ -449,7 +451,10 @@ def run_agent(llm, workspace, problem, arm, max_steps, client=None):
             observation = f"error: {error}"
         observation = str(observation)
         steps.append({"step": step + 1, "tool": name, "args": args,
-                      "observation": observation[:500]})
+                      "observation": observation[:500],
+                      "observation_bytes": len(observation.encode()),
+                      "prompt_tokens": llm.prompt_tokens - prompt_before,
+                      "completion_tokens": llm.completion_tokens - completion_before})
         messages.append({"role": "tool", "tool_call_id": call.get("id") or f"call_{step}",
                          "content": observation[:MAX_OUTPUT_CHARS]})
         trim_messages(messages)
