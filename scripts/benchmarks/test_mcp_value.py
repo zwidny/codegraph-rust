@@ -114,6 +114,60 @@ class ImpactSummary(unittest.TestCase):
         self.assertEqual(mcp_value.summarize_impact(per_task, "codegraph"), {"tasks": 0})
 
 
+class GrepOutput(unittest.TestCase):
+    def test_parses_path_line_pairs(self):
+        output = "./crates/a.rs:12:fn alpha() {}\n./crates/b.rs:7:let x = 1;\n"
+        self.assertEqual(
+            mcp_value.parse_hits(output),
+            [("./crates/a.rs", 12), ("./crates/b.rs", 7)],
+        )
+
+    def test_ignores_rows_without_a_line_number(self):
+        self.assertEqual(mcp_value.parse_hits("binary file matches\n"), [])
+
+    def test_keeps_first_occurrence_order_and_first_line(self):
+        hits = [("./a.rs", 30), ("./b.rs", 5), ("./a.rs", 9)]
+        self.assertEqual(mcp_value.ordered_files(hits), ["./a.rs", "./b.rs"])
+        self.assertEqual(mcp_value.first_lines(hits), {"./a.rs": 30, "./b.rs": 5})
+
+
+class WindowBytes(unittest.TestCase):
+    def test_reads_only_the_window_around_the_hit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.rs"
+            path.write_text("".join(f"line {i}\n" for i in range(1, 201)))
+            near = mcp_value.window_bytes(path, 100, window=10)
+            whole = path.stat().st_size
+            self.assertGreater(near, 0)
+            self.assertLess(near, whole / 4)
+
+    def test_window_clamps_at_file_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.rs"
+            path.write_text("only line\n")
+            self.assertEqual(mcp_value.window_bytes(path, 1, window=40), len("only line\n"))
+            self.assertEqual(mcp_value.window_bytes(path, 999, window=40), len("only line\n"))
+
+    def test_missing_file_costs_nothing(self):
+        self.assertEqual(mcp_value.window_bytes(Path("/nonexistent/a.rs"), 1, 5), 0)
+
+
+class Median(unittest.TestCase):
+    def test_odd_and_even_sizes(self):
+        self.assertEqual(mcp_value.median([3, 1, 2]), 2.0)
+        self.assertEqual(mcp_value.median([4, 1, 3, 2]), 2.5)
+        self.assertEqual(mcp_value.median([]), 0.0)
+
+    def test_summary_exposes_median_next_to_mean(self):
+        per_task = [
+            {"grep": {"rank": 1, "rounds": 1, "bytes": 100, "ms": 1}},
+            {"grep": {"rank": 1, "rounds": 1, "bytes": 900, "ms": 1}},
+        ]
+        summary = mcp_value.summarize(per_task, "grep")
+        self.assertEqual(summary["bytes"], 500)
+        self.assertEqual(summary["bytes_median"], 500)
+
+
 class CalledNames(unittest.TestCase):
     def test_extracts_call_sites_and_skips_control_words(self):
         with tempfile.TemporaryDirectory() as directory:

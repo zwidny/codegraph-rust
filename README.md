@@ -2,26 +2,26 @@
 
 ## Measured value: CodeGraph vs grep
 
-Measured on two real repositories, against the grep workflow an agent has without CodeGraph.
-These retrieval numbers come from [mcp_value.py](scripts/benchmarks/mcp_value.py); no LLM is
-involved, so "read" stands in for token cost — it is what an agent would have to pull into
-its context.
+Measured on two real repositories, against the workflow an agent has without CodeGraph:
+grep with line numbers, then read a window around the hit. No chat LLM is involved; the
+graph arm does embed the query, which is why its latency is higher on the locate case.
 
-| Scenario | Project | Metric | grep baseline | CodeGraph | Delta |
-|---|---|---|---|---|---|
-| Locate a symbol | Rust (251 files) | hit@1 · read | 79% · 67.5 KB | **93% · 18.1 KB** | +14 pt · **−73% read** |
-| Locate a symbol | Python (511 files) | hit@1 · read | **79% · 64.1 KB** | 64% · 19.4 KB | −15 pt · −70% read |
-| Who calls this | Rust | caller precision · read | 69% · 62.2 KB | **100% · 6.3 KB** | +31 pt · **−90% read** |
-| Who calls this | Python | caller precision · read | 67% · 62.9 KB | **100% · 5.7 KB** | +33 pt · **−91% read** |
-| Call chain, depth 2 | Rust | recall · latency | 26% · 21.6 s | **100% · 0.22 s** | +74 pt · **98× faster** |
-| Call chain, depth 2 | Python | recall · latency | 15% · 5.9 s | **100% · 0.22 s** | +85 pt · **27× faster** |
+| Question | Repo | grep | CodeGraph | Result |
+|---|---|---|---|---|
+| Where is X defined? | Rust | 79% hit@1 · 10.2 KB · 8 ms | **93%** · 18.1 KB · 0.9 s | graph is more accurate; grep is cheaper and far faster |
+| Where is X defined? | Python | **86%** · 3.9 KB · 8 ms | 64% · 19.4 KB · 0.8 s | grep wins outright |
+| Who calls X? | Rust | 94% recall · 70% precision · 8.5 KB · 6 ms | 93% · **100%** · 6.3 KB · 0.12 s | graph trades latency for precision |
+| Who calls X? | Python | 100% · 69% · 9.2 KB · 8 ms | 100% · **100%** · 5.7 KB · 0.12 s | same trade-off |
+| What does X reach? (depth 2) | Rust | 26% recall · 12% precision · 101 KB · 0.13 s | **100%** · 94% · **10.8 KB** · 0.24 s | graph gives the only usable answer |
+| What does X reach? (depth 2) | Python | 15% · 7% · 78 KB · 0.15 s | **100%** · 100% · **18.2 KB** · 0.17 s | same |
 
-Reading is the stable win in every scenario. Recall only separates once a question crosses
-files: at depth 2 the grep path needs ~20 searches and 6–22 seconds, while the graph answers
-in one call. Where the name is already known, grep stays competitive and on Python it wins —
-CodeGraph is not a grep replacement for that case.
+The honest read: for *"where is this symbol"*, grep is better — it reads less and answers in
+milliseconds, and on Python it is also more accurate. The graph earns its cost on
+**relationships**: caller lists become precise instead of a pile of textual matches, and a
+two-hop question that grep answers at 15–26% recall becomes answerable at all. Reading cost
+per query stays between 6 and 18 KB in every case.
 
-Full method, per-task traces and known limitations:
+Full method, per-task traces and limitations:
 [docs/evaluations/mcp-value-2026-11-04.md](docs/evaluations/mcp-value-2026-11-04.md).
 
 Reproduce:

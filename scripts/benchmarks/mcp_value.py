@@ -71,6 +71,16 @@ def hit_rank(candidates, truth):
     return 0
 
 
+def median(values):
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
 def summarize(per_task, arm):
     rows = [t[arm] for t in per_task if t.get(arm)]
     if not rows:
@@ -83,6 +93,7 @@ def summarize(per_task, arm):
         "miss": sum(1 for r in rows if r["rank"] == 0) / total,
         "rounds": sum(r["rounds"] for r in rows) / total,
         "bytes": sum(r["bytes"] for r in rows) / total,
+        "bytes_median": median([r["bytes"] for r in rows]),
         "ms": sum(r["ms"] for r in rows) / total,
     }
 
@@ -175,6 +186,18 @@ CODE_SUFFIX = {
     ".cxx", ".c", ".h", ".hpp", ".cs", ".rb", ".php", ".kt", ".kts", ".swift", ".dart",
 }
 MAX_READ_BYTES = 1 << 20  # an experienced agent skips a 7 MB tokenizer table
+# Without ripgrep the fallback grep does not read .gitignore, so prune the usual build output.
+GRAPH_EXCLUDES = [
+    "target", ".git", ".codegraph", "node_modules", "dist", "build",
+    ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".next", "coverage",
+]
+GREP_INCLUDES = [
+    "--include=*.rs", "--include=*.py", "--include=*.ts", "--include=*.tsx",
+    "--include=*.js", "--include=*.jsx", "--include=*.go", "--include=*.java",
+    "--include=*.cpp", "--include=*.cc", "--include=*.c", "--include=*.h",
+    "--include=*.cs", "--include=*.rb", "--include=*.php", "--include=*.kt",
+    "--include=*.swift", "--include=*.dart",
+]
 MAX_SECOND_HOP = 12  # files the second hop may add to the candidate set
 
 
@@ -287,45 +310,151 @@ def read_bytes(paths):
     return total
 
 
-def grep_arm(task, root, max_rounds, budget_files):
-    """Replay an agent narrowing candidates with ripgrep (or grep), then reading them."""
+def window_bytes(path, line, window):
+    """Bytes an agent pulls when it reads `window` lines around a hit instead of the file."""
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return 0
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return 0
+    last = len(lines) - 1
+    start = min(max(int(line) - 1 - window, 0), last)
+    stop = min(start + window * 2 + 1, len(lines))
+    return len("".join(lines[start:stop]).encode())
+
+
+HIT_LINE = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):")
+
+
+def parse_hits(output):
+    """Parse `path:line:content` rows from grep/rg output into (path, line) pairs."""
+    hits = []
+    for row in output.splitlines():
+        match = HIT_LINE.match(row)
+        if not match:
+            continue
+        hits.append((match.group("file"), int(match.group("line"))))
+    return hits
+
+
+def ordered_files(hits):
+    seen, files = set(), []
+    for path, _ in hits:
+        if path not in seen:
+            seen.add(path)
+            files.append(path)
+    return files
+
+
+def first_lines(hits):
+    lines = {}
+    for path, line in hits:
+        lines.setdefault(path, line)
+    return lines
+
+
+SEARCH_MAX_PER_FILE = 3
+SEARCH_MAX_LINES = 40
+
+
+def run_search(keyword, scope, rg, grep, max_per_file=SEARCH_MAX_PER_FILE,
+               max_lines=SEARCH_MAX_LINES):
+    """One grep/rg pass with line numbers, capped like an agent piping through head.
+
+    Returns (hits, output_bytes). Without the cap a common word produces hundreds of rows,
+    which no agent reads and which would overstate the baseline.
+    """
+    if rg:
+        command = [rg, "-n", "--no-heading", "--no-messages", "-F",
+                   "-m", str(max_per_file), keyword] + scope
+    else:
+        command = [grep, "-rn", "-m", str(max_per_file), "-F"] + GREP_INCLUDES + [
+            f"--exclude-dir={name}" for name in GRAPH_EXCLUDES
+        ] + [keyword] + scope
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    rows = result.stdout.splitlines()[:max_lines]
+    text = "\n".join(rows)
+    return parse_hits(text), len(text.encode())
+
+
+def readable_hits(hits, root, budget_files):
+    """Project-relative code files in hit order, capped at the inspection budget."""
+    out = []
+    for path in ordered_files(hits):
+        relative = normalize_path(path, root)
+        if not relative or Path(relative).suffix.lower() not in CODE_SUFFIX:
+            continue
+        try:
+            if (root / relative).stat().st_size > MAX_READ_BYTES:
+                continue
+        except OSError:
+            continue
+        out.append(relative)
+        if len(out) >= budget_files:
+            break
+    return out
+
+
+def window_cost(root, files, lines, window):
+    """Bytes billed for reading a line window around each hit."""
+    total = 0
+    for path in files:
+        total += window_bytes(root / path, lines.get(path, 1), window)
+    return total
+
+
+def grep_arm(task, root, max_rounds, budget_files, window=40):
+    """Replay an agent that greps with line numbers, then reads only around the hit.
+
+    Cost is what enters the context: the grep output the agent scans plus the line window it
+    opens per candidate. Reading whole files would overstate what a careful agent does.
+    """
+    started = time.time()
     rg = shutil.which("rg")
     grep = shutil.which("grep")
     if not rg and not grep:
         return None
-    started = time.time()
-    scope = [str(root)]
+    spent = 0
     rounds = 0
+    scope = [str(root)]
+    hits = []
     for keyword in task["keywords"][:max_rounds]:
         rounds += 1
         if rg:
-            command = [rg, "--files-with-matches", "--no-messages", "-F", keyword] + scope
+            command = [rg, "-n", "--no-heading", "--no-messages", "-F", keyword] + scope
         else:
-            command = [grep, "-rIl", "-F", keyword] + scope
-        result = subprocess.run(command, capture_output=True, text=True)
-        found = [line for line in result.stdout.splitlines() if line.strip()]
-        if not found:
+            # `grep -m 5` caps matches per file; without it a common word floods the pipe.
+            command = [grep, "-rn", "-m", "5", "-F"] + GREP_INCLUDES + [
+                f"--exclude-dir={name}" for name in GRAPH_EXCLUDES
+            ] + [keyword] + scope
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        spent += len(result.stdout.encode())
+        hits = parse_hits(result.stdout)
+        files = ordered_files(hits)
+        scope = files or [str(root)]
+        if len(files) <= budget_files:
             break
-        scope = found
-        if len(found) <= budget_files:
-            break
-    candidates = [normalize_path(p, root) for p in scope if normalize_path(p, root)]
-    # An experienced agent skips data files and anything too large to read casually.
-    readable = []
-    for path in candidates:
-        if Path(path).suffix.lower() not in CODE_SUFFIX:
-            continue
+    candidates = [normalize_path(path, root) for path in ordered_files(hits)]
+    candidates = [c for c in candidates if c and Path(c).suffix.lower() in CODE_SUFFIX]
+    read = candidates[:budget_files]
+    lines = {normalize_path(path, root): line for path, line in first_lines(hits).items()}
+    read_cost = 0
+    for path in read:
+        target = root / path
         try:
-            if (root / path).stat().st_size > MAX_READ_BYTES:
+            if target.stat().st_size > MAX_READ_BYTES:
                 continue
         except OSError:
             continue
-        readable.append(path)
-    read = readable[:budget_files]
+        read_cost += window_bytes(target, lines.get(path, 1), window)
     return {
         "rank": hit_rank(read, task["truth"]),
         "rounds": rounds,
-        "bytes": read_bytes([str(root / path) for path in read]),
+        "bytes": spent + read_cost,
+        "grep_bytes": spent,
+        "read_bytes": read_cost,
         "candidates": candidates[:10],
         "ms": int((time.time() - started) * 1000),
     }
@@ -424,6 +553,7 @@ def summarize_impact(per_task, arm):
         "complete": sum(1 for r in rows if r["recall"] >= 1.0) / total,
         "calls": sum(r["rounds"] for r in rows) / total,
         "bytes": sum(r["bytes"] for r in rows) / total,
+        "bytes_median": median([r["bytes"] for r in rows]),
         "ms": sum(r["ms"] for r in rows) / total,
     }
 
@@ -533,39 +663,31 @@ def generate_impact_tasks(root, count, seed, min_name_len=8, min_callers=2, max_
     return tasks
 
 
-def grep_impact_arm(task, root, rounds_budget, budget_files):
-    """Find who calls `target`: grep its name, then read the hits that look like code."""
-    grep = shutil.which("rg") or shutil.which("grep")
-    if not grep:
+def grep_impact_arm(task, root, rounds_budget, budget_files, window=40):
+    """Find who calls `target`: grep its name, then read only around each hit."""
+    rg = shutil.which("rg")
+    grep = shutil.which("grep")
+    if not rg and not grep:
         return None
     started = time.time()
     keyword = task["keywords"][0] if task["keywords"] else task["target_name"]
-    if Path(grep).name == "rg":
-        command = [grep, "--files-with-matches", "--no-messages", "-F", keyword, str(root)]
-    else:
-        command = [grep, "-rIl", "-F", keyword, str(root)]
-    result = subprocess.run(command, capture_output=True, text=True)
-    hits = [line for line in result.stdout.splitlines() if line.strip()]
+    hits, spent = run_search(keyword, [str(root)], rg, grep)
     candidates = []
-    for path in hits:
+    for path in ordered_files(hits):
         relative = normalize_path(path, root)
-        if not relative or Path(relative).suffix.lower() not in CODE_SUFFIX:
-            continue
-        try:
-            if (root / relative).stat().st_size > MAX_READ_BYTES:
-                continue
-        except OSError:
-            continue
-        candidates.append(relative)
-    read = candidates[:budget_files]
-    # An impact answer is a list, so recall scores the whole hit list; bytes bill the
-    # files an agent actually opens to confirm each caller.
+        if relative and Path(relative).suffix.lower() in CODE_SUFFIX:
+            candidates.append(relative)
+    read = readable_hits(hits, root, budget_files)
+    lines = {normalize_path(path, root): line for path, line in first_lines(hits).items()}
+    # An impact answer is a list, so recall scores the whole hit list; bytes bill the grep
+    # output plus the windows an agent opens to confirm each caller.
     recall, precision = overlap(candidates, task["truth"])
     return {
         "recall": recall,
         "precision": precision,
         "rounds": 1 if hits else 0,
-        "bytes": read_bytes([str(root / path) for path in read]),
+        "bytes": spent + window_cost(root, read, lines, window),
+        "grep_bytes": spent,
         "candidates": candidates[:10],
         "ms": int((time.time() - started) * 1000),
     }
@@ -715,58 +837,51 @@ def called_names(paths, limit=20):
     return names
 
 
-def grep_chain_arm(task, root, budget_files):
-    """Two-hop baseline: grep the start name, read the hits, then grep what they call."""
-    grep = shutil.which("rg") or shutil.which("grep")
-    if not grep:
+def grep_chain_arm(task, root, budget_files, window=40):
+    """Two-hop baseline: grep the start name, read around the hits, then grep what they call."""
+    rg = shutil.which("rg")
+    grep = shutil.which("grep")
+    if not rg and not grep:
         return None
     started = time.time()
-    calls = 0
+    calls, spent = 0, 0
 
-    def hits_for(keyword):
-        nonlocal calls
+    def search(keyword):
+        nonlocal calls, spent
         calls += 1
-        if Path(grep).name == "rg":
-            command = [grep, "--files-with-matches", "--no-messages", "-F", keyword, str(root)]
-        else:
-            command = [grep, "-rIl", "-F", keyword, str(root)]
-        result = subprocess.run(command, capture_output=True, text=True)
-        return [line for line in result.stdout.splitlines() if line.strip()]
+        hits, out_bytes = run_search(keyword, [str(root)], rg, grep)
+        spent += out_bytes
+        return hits
 
-    def readable(paths):
-        out = []
-        for path in paths:
-            relative = normalize_path(path, root)
-            if not relative or Path(relative).suffix.lower() not in CODE_SUFFIX:
-                continue
-            try:
-                if (root / relative).stat().st_size > MAX_READ_BYTES:
-                    continue
-            except OSError:
-                continue
-            out.append(relative)
-        return out
+    first_hits = search(task["target_name"])
+    read = readable_hits(first_hits, root, budget_files)
+    first_lines_map = {normalize_path(p, root): l for p, l in first_lines(first_hits).items()}
+    cost = window_cost(root, read, first_lines_map, window)
 
-    first = readable(hits_for(task["target_name"]))
-    read = first[:budget_files]
     # Hop two: resolve each called symbol to its first readable hit. Dumping every hit of
     # twenty names would make the baseline a strawman, not a careful agent.
     second = []
     for name in called_names([root / path for path in read]):
-        hits = readable(hits_for(name))[:1]
-        for hit in hits:
+        hits = search(name)
+        for hit in readable_hits(hits, root, 1):
             if hit not in second:
                 second.append(hit)
+                cost += window_cost(root, [hit],
+                                    {normalize_path(p, root): l for p, l in first_lines(hits).items()},
+                                    window)
         if len(second) >= MAX_SECOND_HOP:
             break
-    candidates = list(dict.fromkeys(first + second))
+
+    candidates = list(dict.fromkeys(
+        readable_hits(first_hits, root, 10_000) + second
+    ))
     recall, precision = overlap(candidates, task["truth"])
-    billed = (read + second[: max(budget_files - len(read), 0)])
     return {
         "recall": recall,
         "precision": precision,
         "rounds": calls,
-        "bytes": read_bytes([str(root / path) for path in billed]),
+        "bytes": spent + cost,
+        "grep_bytes": spent,
         "candidates": candidates[:10],
         "ms": int((time.time() - started) * 1000),
     }
