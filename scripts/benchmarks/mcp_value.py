@@ -411,8 +411,248 @@ def codegraph_arm(task, client, limit, budget_files):
 
 # ----------------------------------------------------------------------- main
 
+def summarize_impact(per_task, arm):
+    rows = [t[arm] for t in per_task if t.get(arm)]
+    if not rows:
+        return {"tasks": 0}
+    total = len(rows)
+    return {
+        "tasks": total,
+        "recall": sum(r["recall"] for r in rows) / total,
+        "precision": sum(r["precision"] for r in rows) / total,
+        "complete": sum(1 for r in rows if r["recall"] >= 1.0) / total,
+        "calls": sum(r["rounds"] for r in rows) / total,
+        "bytes": sum(r["bytes"] for r in rows) / total,
+        "ms": sum(r["ms"] for r in rows) / total,
+    }
+
+
+def render_impact_markdown(report):
+    def pct(value):
+        return f"{value * 100:.0f}%"
+
+    lines = [
+        f"# CodeGraph MCP value (impact): {report['project']}",
+        "",
+        f"Tasks: {report['tasks']} · budget={report['budget_files']} files per question",
+        "",
+        "| arm | caller recall | precision | found all | calls | bytes read | latency |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for arm in ("grep", "codegraph"):
+        s = report["arms"].get(arm) or {}
+        if not s.get("tasks"):
+            continue
+        lines.append(
+            f"| {arm} | {pct(s['recall'])} | {pct(s['precision'])} | {pct(s['complete'])} | "
+            f"{s['calls']:.1f} | {s['bytes'] / 1024:.1f} KB | {s['ms'] / 1000:.2f} s |"
+        )
+    lines += ["", "## Per task", "", "| task | target | callers | grep | codegraph |", "|---|---|---|---|---|"]
+    for task in report["per_task"]:
+        g, c = task.get("grep") or {}, task.get("codegraph") or {}
+        fmt = lambda r: f"recall {r['recall']:.0%} · {r['bytes'] / 1024:.1f} KB" if r else "skipped"
+        lines.append(f"| {task['id']} | `{task['target_name']}` | {task['caller_count']} | {fmt(g)} | {fmt(c)} |")
+    return "\n".join(lines) + "\n"
+
+
+def overlap(candidates, truth):
+    """Recall and precision of candidate files against the ground-truth caller files."""
+    found = set(candidates)
+    expected = set(truth)
+    if not expected:
+        return 0.0, 0.0
+    hits = len(found & expected)
+    return hits / len(expected), (hits / len(found) if found else 0.0)
+
+
+def generate_impact_tasks(root, count, seed, min_name_len=8, min_callers=2, max_callers=8):
+    """Sample targets whose incoming `calls` edges form a small, checkable caller set."""
+    env = load_env_layers(root)
+    project = str(Path(root).resolve())
+    counts = sql_query(
+        env,
+        "SELECT to AS target, count() AS c FROM edges "
+        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' GROUP BY target LIMIT 4000;",
+        {},
+    )
+    wanted = [
+        row["target"] for row in counts
+        if row.get("target") and min_callers <= (row.get("c") or 0) <= max_callers
+    ]
+    random.seed(seed)
+    random.shuffle(wanted)
+    if not wanted:
+        raise SystemExit("no targets with a small caller set; index a project with call edges")
+    # One pass over the node table beats an `id IN (nodes:`...`)` filter, which compares
+    # a RecordId against string literals.
+    nodes = sql_query(
+        env,
+        "SELECT id, name, file_path FROM nodes "
+        f"WHERE project_id = {json.dumps(project)} LIMIT 20000;",
+        {},
+    )
+    by_id = {str(row["id"]): row for row in nodes}
+    # Caller files per target in one pass: comparing `to` against a RecordId literal is
+    # what an `IN (nodes:`...`)` filter gets wrong.
+    edge_rows = sql_query(
+        env,
+        "SELECT to AS target, from AS caller, metadata.source_file AS site FROM edges "
+        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' LIMIT 50000;",
+        {},
+    )
+    truth_by_target = {}
+    for row in edge_rows:
+        target = str(row.get("target") or "")
+        caller = by_id.get(str(row.get("caller") or ""))
+        # Ground truth is the caller's definition file, which is what the graph reports.
+        raw = (caller or {}).get("file_path") or row.get("site") or ""
+        path = normalize_path(raw, project)
+        if target and path:
+            truth_by_target.setdefault(target, set()).add(path)
+    tasks = []
+    for target_id in wanted:
+        if len(tasks) >= count:
+            break
+        node = by_id.get(target_id)
+        if not node or len(node.get("name") or "") < min_name_len:
+            continue
+        truth = sorted(truth_by_target.get(target_id, set()))
+        if len(truth) < min_callers:
+            continue
+        tasks.append({
+            "id": f"i{len(tasks) + 1:02d}",
+            "target_id": target_id,
+            "target_name": node["name"],
+            "target_file": normalize_path(node.get("file_path") or "", project),
+            "keywords": [w for w in re.split(r"[^A-Za-z0-9_]+", node["name"]) if len(w) > 2] or [node["name"]],
+            "truth": truth,
+            "caller_count": len(truth),
+            "root": str(root),
+        })
+    return tasks
+
+
+def grep_impact_arm(task, root, rounds_budget, budget_files):
+    """Find who calls `target`: grep its name, then read the hits that look like code."""
+    grep = shutil.which("rg") or shutil.which("grep")
+    if not grep:
+        return None
+    started = time.time()
+    keyword = task["keywords"][0] if task["keywords"] else task["target_name"]
+    if Path(grep).name == "rg":
+        command = [grep, "--files-with-matches", "--no-messages", "-F", keyword, str(root)]
+    else:
+        command = [grep, "-rIl", "-F", keyword, str(root)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    hits = [line for line in result.stdout.splitlines() if line.strip()]
+    candidates = []
+    for path in hits:
+        relative = normalize_path(path, root)
+        if not relative or Path(relative).suffix.lower() not in CODE_SUFFIX:
+            continue
+        try:
+            if (root / relative).stat().st_size > MAX_READ_BYTES:
+                continue
+        except OSError:
+            continue
+        candidates.append(relative)
+    read = candidates[:budget_files]
+    # An impact answer is a list, so recall scores the whole hit list; bytes bill the
+    # files an agent actually opens to confirm each caller.
+    recall, precision = overlap(candidates, task["truth"])
+    return {
+        "recall": recall,
+        "precision": precision,
+        "rounds": 1 if hits else 0,
+        "bytes": read_bytes([str(root / path) for path in read]),
+        "candidates": candidates[:10],
+        "ms": int((time.time() - started) * 1000),
+    }
+
+
+def codegraph_impact_arm(task, client, budget_files):
+    started = time.time()
+    payload = client.call("get_reverse_dependencies", {
+        "node_id": task["target_id"],
+        "edge_type": "calls",
+        "depth": 1,
+    })
+    data = json.loads(payload)
+    rows = data.get("result", []) if isinstance(data, dict) else data
+    candidates = []
+    for row in rows:
+        location = row.get("location") or {}
+        relative = normalize_path(location.get("file_path") or "", task["root"])
+        if relative:
+            candidates.append(relative)
+    recall, precision = overlap(candidates, task["truth"])
+    return {
+        "recall": recall,
+        "precision": precision,
+        "rounds": 1,
+        "bytes": len(payload.encode()),
+        "candidates": candidates[:10],
+        "ms": int((time.time() - started) * 1000),
+    }
+
+
+def run_impact(args, root):
+    tasks = (
+        json.loads(args.tasks.read_text())
+        if args.tasks else generate_impact_tasks(root, args.generate, args.seed)
+    )
+    if not tasks:
+        raise SystemExit("no impact tasks: index the project first (codegraph index .)")
+    if args.save_tasks:
+        args.save_tasks.write_text(json.dumps(tasks, indent=2))
+
+    client = None
+    if not args.skip_codegraph:
+        client = Mcp(args.command.split(), root)
+        try:
+            client.initialize()
+        except Exception as error:
+            client.close()
+            raise SystemExit(f"cannot start MCP server ({args.command}): {error}")
+    per_task = []
+    try:
+        for task in tasks:
+            record = {
+                "id": task["id"], "target_name": task["target_name"],
+                "target_file": task["target_file"], "caller_count": task["caller_count"],
+            }
+            record["grep"] = grep_impact_arm(task, root, args.max_rounds, args.budget_files)
+            if client:
+                record["codegraph"] = codegraph_impact_arm(task, client, args.budget_files)
+            per_task.append(record)
+    finally:
+        if client:
+            client.close()
+
+    report = {
+        "project": str(root),
+        "mode": "impact",
+        "tasks": len(per_task),
+        "limit": args.limit,
+        "budget_files": args.budget_files,
+        "arms": {
+            "grep": summarize_impact(per_task, "grep"),
+            "codegraph": summarize_impact(per_task, "codegraph"),
+        },
+        "per_task": per_task,
+    }
+    output = json.dumps(report, indent=2)
+    print(output)
+    if args.json_out:
+        args.json_out.write_text(output)
+    if args.markdown:
+        args.markdown.write_text(render_impact_markdown(report))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--mode", choices=("locate", "impact"), default="locate",
+                        help="locate: where is a symbol; impact: who calls a target")
     parser.add_argument("--project", type=Path, default=Path.cwd(), help="indexed project root")
     parser.add_argument("--tasks", type=Path, help="frozen task file (JSON)")
     parser.add_argument("--generate", type=int, default=20, help="sample this many tasks from the index")
@@ -429,6 +669,8 @@ def main():
     args = parser.parse_args()
 
     root = args.project.resolve()
+    if args.mode == "impact":
+        return run_impact(args, root)
     if args.tasks:
         tasks = json.loads(args.tasks.read_text())
     else:

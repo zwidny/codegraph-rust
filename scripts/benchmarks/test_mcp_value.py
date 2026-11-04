@@ -90,6 +90,30 @@ class Rendering(unittest.TestCase):
         self.assertIn("src/a.rs", text)
 
 
+class Overlap(unittest.TestCase):
+    def test_recall_and_precision_of_caller_files(self):
+        self.assertEqual(mcp_value.overlap(["a.rs", "b.rs"], {"a.rs"}), (1.0, 0.5))
+        self.assertEqual(mcp_value.overlap(["a.rs"], {"a.rs", "b.rs"}), (0.5, 1.0))
+
+    def test_empty_inputs_report_zero(self):
+        self.assertEqual(mcp_value.overlap([], {"a.rs"}), (0.0, 0.0))
+        self.assertEqual(mcp_value.overlap(["a.rs"], set()), (0.0, 0.0))
+
+
+class ImpactSummary(unittest.TestCase):
+    def test_averages_recall_precision_and_complete_rate(self):
+        per_task = [
+            {"grep": {"recall": 1.0, "precision": 1.0, "rounds": 1, "bytes": 10, "ms": 5}},
+            {"grep": {"recall": 0.5, "precision": 0.25, "rounds": 1, "bytes": 30, "ms": 15}},
+        ]
+        summary = mcp_value.summarize_impact(per_task, "grep")
+        self.assertAlmostEqual(summary["recall"], 0.75)
+        self.assertAlmostEqual(summary["precision"], 0.625)
+        self.assertAlmostEqual(summary["complete"], 0.5)
+        self.assertEqual(summary["bytes"], 20)
+        self.assertEqual(mcp_value.summarize_impact(per_task, "codegraph"), {"tasks": 0})
+
+
 class ConceptComments(unittest.TestCase):
     def test_accepts_prose_comment_and_strips_aboutme(self):
         self.assertEqual(
