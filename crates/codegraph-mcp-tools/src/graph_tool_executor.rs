@@ -238,6 +238,31 @@ fn drop_echoed_parameters(value: &mut JsonValue) {
     }
 }
 
+/// `trace_call_chain` repeated every direct caller as a full node object.
+///
+/// The chain itself already answers "who calls this", so keep the caller names and drop the
+/// repeated `id`/`kind` payload: about two thirds of the field, which was the largest single
+/// contributor to this tool's response size.
+fn compact_called_by(value: &mut JsonValue) {
+    let Some(rows) = value.as_array_mut() else {
+        return;
+    };
+    for row in rows {
+        let Some(called_by) = row
+            .get_mut("called_by")
+            .and_then(|value| value.as_array_mut())
+        else {
+            continue;
+        };
+        let names: Vec<JsonValue> = called_by
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(|name| name.as_str()))
+            .map(|name| JsonValue::String(name.to_string()))
+            .collect();
+        *called_by = names;
+    }
+}
+
 fn shorten_content(value: &mut JsonValue, max_chars: usize) {
     if max_chars == 0 {
         return;
@@ -677,11 +702,14 @@ impl GraphToolExecutor {
 
         let max_depth = params["max_depth"].as_i64().unwrap_or(5) as i32;
 
-        let result = self
+        let chain = self
             .graph_functions
             .trace_call_chain(from_node, max_depth)
             .await
             .map_err(|e| McpError::Protocol(format!("trace_call_chain failed: {}", e)))?;
+        let mut result = serde_json::to_value(&chain)
+            .map_err(|e| McpError::Protocol(format!("trace_call_chain encode failed: {}", e)))?;
+        compact_called_by(&mut result);
 
         Ok(json!({
             "tool": "trace_call_chain",
@@ -980,6 +1008,48 @@ fn log_tool_call_finish(tool_name: &str, result: &JsonValue) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_called_by_keeps_names_and_drops_node_payload() {
+        let mut value = serde_json::json!([{
+            "name": "reached",
+            "called_by": [
+                {"id": "nodes:`a`", "kind": "Function", "name": "caller_a"},
+                {"id": "nodes:`b`", "kind": "Function", "name": "caller_b"}
+            ]
+        }]);
+        super::compact_called_by(&mut value);
+        assert_eq!(
+            value[0]["called_by"],
+            serde_json::json!(["caller_a", "caller_b"])
+        );
+        assert_eq!(value[0]["name"], "reached");
+    }
+
+    #[test]
+    fn compact_called_by_leaves_empty_and_missing_fields_alone() {
+        let mut value = serde_json::json!([
+            {"name": "a", "called_by": []},
+            {"name": "b"}
+        ]);
+        super::compact_called_by(&mut value);
+        assert_eq!(value[0]["called_by"], serde_json::json!([]));
+        assert!(value[1].get("called_by").is_none());
+    }
+
+    #[test]
+    fn compact_called_by_ignores_entries_without_a_name() {
+        let mut value = serde_json::json!([{"called_by": [{"id": "nodes:`a`"}, {"name": "kept"}]}]);
+        super::compact_called_by(&mut value);
+        assert_eq!(value[0]["called_by"], serde_json::json!(["kept"]));
+    }
+
+    #[test]
+    fn compact_called_by_is_a_no_op_for_non_arrays() {
+        let mut value = serde_json::json!({"called_by": [{"name": "x"}]});
+        super::compact_called_by(&mut value);
+        assert_eq!(value["called_by"][0]["name"], "x");
+    }
 
     #[test]
     fn trim_metadata_keeps_only_actionable_keys() {
