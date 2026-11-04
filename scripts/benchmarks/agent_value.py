@@ -364,17 +364,26 @@ def trim_messages(messages, budget_chars=90000, floor=2000):
         message["content"] = text[:keep] + "\n[truncated]"
 
 
-def execute_tool(name, args, workspace, client, arm):
+def format_hit(row, snippet):
+    """One search hit as the agent sees it: identity, location, optional code snippet."""
+    line = f"{row.get('name')} | {row.get('file_path')}:{row.get('start_line')}"
+    if row.get("node_id"):
+        line += f" | {row['node_id']}"
+    if snippet:
+        text = " ".join((row.get("content") or "").split())
+        if text:
+            line += f"\n    {text[:snippet]}"
+    return line
+
+
+def execute_tool(name, args, workspace, client, arm, snippet=300):
     """Run one tool call and return the observation text."""
     if name == "semantic_code_search" and arm == "codegraph" and client:
+        limit = int(args.get("limit") or 8)
         payload = client.call("semantic_code_search",
-                              {"query": str(args.get("query", "")),
-                               "limit": int(args.get("limit") or 8)})
+                              {"query": str(args.get("query", "")), "limit": limit})
         rows = json.loads(payload).get("result", [])
-        return "\n".join(
-            f"{row.get('name')} | {row.get('file_path')}:{row.get('start_line')} | {row.get('node_id', '')}"
-            for row in rows[:8]
-        ) or "(no results)"
+        return "\n".join(format_hit(row, snippet) for row in rows[:limit]) or "(no results)"
     if name == "get_reverse_dependencies" and arm == "codegraph" and client:
         payload = client.call("get_reverse_dependencies",
                               {"node_id": str(args.get("node_id", "")),
@@ -382,7 +391,7 @@ def execute_tool(name, args, workspace, client, arm):
                                "depth": int(args.get("depth") or 1)})
         rows = json.loads(payload).get("result", [])
         return "\n".join(
-            f"{row.get('name')} | {(row.get('location') or {}).get('file_path')}"
+            f"{row.get('name')} | {(row.get('location') or {}).get('file_path')} | {row.get('node_id', '')}"
             for row in rows[:10]
         ) or "(no callers)"
     if name in {"read_file", "grep", "list_files", "apply_patch"}:
@@ -390,7 +399,7 @@ def execute_tool(name, args, workspace, client, arm):
     return f"error: unknown tool {name}"
 
 
-def run_agent(llm, workspace, problem, arm, max_steps, client=None):
+def run_agent(llm, workspace, problem, arm, max_steps, client=None, snippet=300):
     """Drive the model with native tool calling; one tool per turn, capped at max_steps."""
     tools = tool_schemas(arm)
     system = SYSTEM.replace("{max_steps}", str(max_steps))
@@ -446,7 +455,7 @@ def run_agent(llm, workspace, problem, arm, max_steps, client=None):
                           "summary": str(args.get("summary"))[:200]})
             break
         try:
-            observation = execute_tool(name, args, workspace, client, arm)
+            observation = execute_tool(name, args, workspace, client, arm, snippet)
         except Exception as error:  # a tool failure is an observation, not a crash
             observation = f"error: {error}"
         observation = str(observation)
@@ -544,6 +553,8 @@ def main():
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--command", default=" ".join(mv.DEFAULT_COMMAND))
     parser.add_argument("--keep-worktrees", action="store_true")
+    parser.add_argument("--graph-snippet", type=int, default=300,
+                        help="characters of code shown per graph hit (0 keeps pointers only)")
     args = parser.parse_args()
 
     root = args.project.resolve()
@@ -572,7 +583,8 @@ def main():
                 before = llm.prompt_tokens + llm.completion_tokens
                 try:
                     run = run_agent(llm, workspace, task["subject"], arm,
-                                    args.max_steps, client if arm == "codegraph" else None)
+                                    args.max_steps, client if arm == "codegraph" else None,
+                                    args.graph_snippet)
                     tokens = llm.prompt_tokens + llm.completion_tokens - before
                     result = {"score": score(run["changed"], task["golden"]),
                               "run": run, "tokens": tokens}
