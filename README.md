@@ -1,5 +1,5 @@
-![CodeGraph](docs/assets/banner.png)
 # CodeGraph (with updates)
+
 ## Measured value: CodeGraph vs grep
 
 Measured on two real repositories, against the grep workflow an agent has without CodeGraph.
