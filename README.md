@@ -27,6 +27,40 @@ CodeGraph transforms your entire codebase into a semantically searchable knowled
 
 ---
 
+## Measured value: CodeGraph vs grep
+
+Measured on two real repositories, against the grep workflow an agent has without CodeGraph.
+These retrieval numbers come from [mcp_value.py](scripts/benchmarks/mcp_value.py); no LLM is
+involved, so "read" stands in for token cost — it is what an agent would have to pull into
+its context.
+
+| Scenario | Project | Metric | grep baseline | CodeGraph | Delta |
+|---|---|---|---|---|---|
+| Locate a symbol | Rust (251 files) | hit@1 · read | 79% · 67.5 KB | **93% · 18.1 KB** | +14 pt · **−73% read** |
+| Locate a symbol | Python (511 files) | hit@1 · read | **79% · 64.1 KB** | 64% · 19.4 KB | −15 pt · −70% read |
+| Who calls this | Rust | caller precision · read | 69% · 62.2 KB | **100% · 6.3 KB** | +31 pt · **−90% read** |
+| Who calls this | Python | caller precision · read | 67% · 62.9 KB | **100% · 5.7 KB** | +33 pt · **−91% read** |
+| Call chain, depth 2 | Rust | recall · latency | 26% · 21.6 s | **100% · 0.22 s** | +74 pt · **98× faster** |
+| Call chain, depth 2 | Python | recall · latency | 15% · 5.9 s | **100% · 0.22 s** | +85 pt · **27× faster** |
+
+Reading is the stable win in every scenario. Recall only separates once a question crosses
+files: at depth 2 the grep path needs ~20 searches and 6–22 seconds, while the graph answers
+in one call. Where the name is already known, grep stays competitive and on Python it wins —
+CodeGraph is not a grep replacement for that case.
+
+Full method, per-task traces and known limitations:
+[docs/evaluations/mcp-value-2026-11-04.md](docs/evaluations/mcp-value-2026-11-04.md).
+
+Reproduce:
+
+```bash
+python3 scripts/benchmarks/mcp_value.py --generate 14       # locate
+python3 scripts/benchmarks/mcp_value.py --mode impact       # who calls
+python3 scripts/benchmarks/mcp_value.py --mode chain --depth 2
+```
+
+---
+
 ## The Problem
 
 AI coding assistants are powerful, but they're flying blind. They see files one at a time, grep for patterns, and burn tokens trying to understand your architecture. Every conversation starts from zero.
@@ -597,39 +631,6 @@ Add to your MCP config:
 ```
 
 **That's it.** Your AI now understands your codebase.
-
----
-
-## Measured value: CodeGraph vs grep
-
-Same questions, same repository, same inspection budget. These retrieval numbers come from
-[mcp_value.py](scripts/benchmarks/mcp_value.py); no LLM is involved, so "read" stands in for
-token cost — it is what an agent would have to pull into its context.
-
-| Scenario | Project | Metric | grep baseline | CodeGraph | Delta |
-|---|---|---|---|---|---|
-| Locate a symbol | Rust (251 files) | hit@1 · read | 79% · 67.5 KB | **93% · 18.1 KB** | +14 pt · **−73% read** |
-| Locate a symbol | Python (511 files) | hit@1 · read | **79% · 64.1 KB** | 64% · 19.4 KB | −15 pt · −70% read |
-| Who calls this | Rust | caller precision · read | 69% · 62.2 KB | **100% · 6.3 KB** | +31 pt · **−90% read** |
-| Who calls this | Python | caller precision · read | 67% · 62.9 KB | **100% · 5.7 KB** | +33 pt · **−91% read** |
-| Call chain, depth 2 | Rust | recall · latency | 26% · 21.6 s | **100% · 0.22 s** | +74 pt · **98× faster** |
-| Call chain, depth 2 | Python | recall · latency | 15% · 5.9 s | **100% · 0.22 s** | +85 pt · **27× faster** |
-
-Reading is the stable win in every scenario. Recall only separates once a question crosses
-files: at depth 2 the grep path needs ~20 searches and 6–22 seconds, while the graph answers
-in one call. Where the name is already known, grep stays competitive and on Python it wins —
-CodeGraph is not a grep replacement for that case.
-
-Full method, per-task traces and known limitations:
-[docs/evaluations/mcp-value-2026-11-04.md](docs/evaluations/mcp-value-2026-11-04.md).
-
-Reproduce:
-
-```bash
-python3 scripts/benchmarks/mcp_value.py --generate 14       # locate
-python3 scripts/benchmarks/mcp_value.py --mode impact       # who calls
-python3 scripts/benchmarks/mcp_value.py --mode chain --depth 2
-```
 
 ---
 
