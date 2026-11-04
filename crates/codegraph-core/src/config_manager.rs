@@ -568,31 +568,35 @@ impl ConfigManager {
         })
     }
 
-    /// Load project `.env` or user `.codegraph.env` before starting workers.
+    /// Load project `.env` and user `.codegraph.env` before starting workers.
     /// `load()` itself only reads configuration and never mutates the environment.
+    ///
+    /// The project file is loaded first and the user file second. `dotenv` never
+    /// overwrites a variable that is already set, so project values win and the user
+    /// file only fills in the keys the project omitted. A machine-wide
+    /// `~/.codegraph.env` therefore stops being shadowed by a small project `.env`.
     ///
     /// # Safety
     /// Call only from a single-threaded process entry point, before other threads
     /// can access the environment (including through foreign libraries).
     pub unsafe fn initialize_environment() {
-        // Try current directory first
+        // Project overrides first.
         if Path::new(".env").exists() {
-            if let Err(e) = dotenv::from_filename(".env") {
-                warn!("Failed to load .env file: {}", e);
-            } else {
-                info!("📋 Loaded .env file from current directory");
+            match dotenv::from_filename(".env") {
+                Ok(_) => info!("📋 Loaded .env file from current directory"),
+                Err(e) => warn!("Failed to load .env file: {}", e),
             }
-            return;
         }
 
-        // Try home directory
+        // User-level defaults fill whatever the project did not define.
         if let Some(home) = dirs::home_dir() {
             let home_env = home.join(".codegraph.env");
             if home_env.exists() {
-                if let Err(e) = dotenv::from_path(&home_env) {
-                    warn!("Failed to load .codegraph.env: {}", e);
-                } else {
-                    info!("📋 Loaded .codegraph.env from home directory");
+                match dotenv::from_path(&home_env) {
+                    Ok(_) => {
+                        info!("📋 Loaded .codegraph.env from home directory (fallback)")
+                    }
+                    Err(e) => warn!("Failed to load .codegraph.env: {}", e),
                 }
             }
         }

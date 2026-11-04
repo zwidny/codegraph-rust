@@ -6,8 +6,11 @@
 - `~/.codegraph/config.toml` for all projects (`codegraph config init` creates this file with
   every default written out).
 
-A `.env` file in the working directory (then `~/.codegraph.env`) and `CODEGRAPH_*` environment
-variables override the config file. `../.env.example` lists the environment variables.
+Environment files layer together: `.env` in the working directory loads first, then
+`~/.codegraph.env` fills in the keys the project did not set (`dotenv` never overwrites an
+already-set variable). Put machine-wide defaults in `~/.codegraph.env` and only project
+differences in the project `.env`. `CODEGRAPH_*` process environment variables override both.
+`../.env.example` lists the environment variables.
 For a file named `codegraph.toml`, select it explicitly with
 `--config codegraph.toml` or `CODEGRAPH_CONFIG_PATH=codegraph.toml`.
 
