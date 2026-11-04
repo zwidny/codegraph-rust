@@ -175,6 +175,7 @@ CODE_SUFFIX = {
     ".cxx", ".c", ".h", ".hpp", ".cs", ".rb", ".php", ".kt", ".kts", ".swift", ".dart",
 }
 MAX_READ_BYTES = 1 << 20  # an experienced agent skips a 7 MB tokenizer table
+MAX_SECOND_HOP = 12  # files the second hop may add to the candidate set
 
 
 def natural_comment(content):
@@ -596,6 +597,261 @@ def codegraph_impact_arm(task, client, budget_files):
     }
 
 
+def render_chain_markdown(report):
+    def pct(value):
+        return f"{value * 100:.0f}%"
+
+    lines = [
+        f"# CodeGraph MCP value (call chain): {report['project']}",
+        "",
+        f"Tasks: {report['tasks']} · depth={report['depth']} · budget={report['budget_files']} files",
+        "",
+        "| arm | reached recall | precision | found all | calls | bytes read | latency |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for arm in ("grep", "codegraph"):
+        s = report["arms"].get(arm) or {}
+        if not s.get("tasks"):
+            continue
+        lines.append(
+            f"| {arm} | {pct(s['recall'])} | {pct(s['precision'])} | {pct(s['complete'])} | "
+            f"{s['calls']:.1f} | {s['bytes'] / 1024:.1f} KB | {s['ms'] / 1000:.2f} s |"
+        )
+    lines += ["", "## Per task", "", "| task | start | reachable | grep | codegraph |", "|---|---|---|---|---|"]
+    for task in report["per_task"]:
+        g, c = task.get("grep") or {}, task.get("codegraph") or {}
+        fmt = lambda r: f"recall {r['recall']:.0%} · {r['bytes'] / 1024:.1f} KB" if r else "skipped"
+        lines.append(f"| {task['id']} | `{task['target_name']}` | {task['reach_count']} | {fmt(g)} | {fmt(c)} |")
+    return "\n".join(lines) + "\n"
+
+
+def generate_chain_tasks(root, count, seed, depth=2, min_name_len=8, min_reach=3, max_reach=15):
+    """Sample start nodes whose outgoing `calls` closure at `depth` is small enough to check."""
+    env = load_env_layers(root)
+    project = str(Path(root).resolve())
+    nodes = sql_query(
+        env,
+        "SELECT id, name, file_path FROM nodes "
+        f"WHERE project_id = {json.dumps(project)} LIMIT 20000;",
+        {},
+    )
+    by_id = {str(row["id"]): row for row in nodes}
+    edge_rows = sql_query(
+        env,
+        "SELECT from AS src, to AS dst FROM edges "
+        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' LIMIT 50000;",
+        {},
+    )
+    adjacency = {}
+    for row in edge_rows:
+        src, dst = str(row.get("src") or ""), str(row.get("dst") or "")
+        if src and dst:
+            adjacency.setdefault(src, set()).add(dst)
+
+    roots = [node_id for node_id in adjacency if node_id in by_id]
+    random.seed(seed)
+    random.shuffle(roots)
+    tasks = []
+    for target_id in roots:
+        if len(tasks) >= count or len(tasks) >= len(roots):
+            break
+        node = by_id[target_id]
+        if len(node.get("name") or "") < min_name_len:
+            continue
+        seen = {target_id}
+        frontier = {target_id}
+        for _ in range(depth):
+            nxt = set()
+            for current in frontier:
+                nxt |= adjacency.get(current, set())
+            nxt -= seen
+            seen |= nxt
+            frontier = nxt
+            if not frontier:
+                break
+        reached = seen - {target_id}
+        files = sorted({
+            normalize_path((by_id.get(item) or {}).get("file_path") or "", project)
+            for item in reached
+        } - {""})
+        if not (min_reach <= len(reached) <= max_reach) or len(files) < min_reach:
+            continue
+        tasks.append({
+            "id": f"c{len(tasks) + 1:02d}",
+            "target_id": target_id,
+            "target_name": node["name"],
+            "target_file": normalize_path(node.get("file_path") or "", project),
+            "keywords": [w for w in re.split(r"[^A-Za-z0-9_]+", node["name"]) if len(w) > 2] or [node["name"]],
+            "truth": files,
+            "reach_count": len(files),
+            "root": str(root),
+        })
+    return tasks
+
+
+CALL_SITE = re.compile(r"([A-Za-z_][A-Za-z0-9_]{3,})\s*\(")
+CONTROL = {
+    "if", "for", "while", "match", "return", "fn", "let", "mut", "else", "loop",
+    "impl", "struct", "enum", "use", "pub", "self", "this", "new", "unwrap", "expect",
+    "Some", "None", "Ok", "Err", "map", "iter", "into", "clone", "format", "println",
+}
+
+
+def called_names(paths, limit=20):
+    """Read files and guess which symbols they call, the way a grep-only agent must."""
+    names, seen = [], set()
+    for path in paths:
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for name in CALL_SITE.findall(text):
+            if name in CONTROL or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+            if len(names) >= limit:
+                return names
+    return names
+
+
+def grep_chain_arm(task, root, budget_files):
+    """Two-hop baseline: grep the start name, read the hits, then grep what they call."""
+    grep = shutil.which("rg") or shutil.which("grep")
+    if not grep:
+        return None
+    started = time.time()
+    calls = 0
+
+    def hits_for(keyword):
+        nonlocal calls
+        calls += 1
+        if Path(grep).name == "rg":
+            command = [grep, "--files-with-matches", "--no-messages", "-F", keyword, str(root)]
+        else:
+            command = [grep, "-rIl", "-F", keyword, str(root)]
+        result = subprocess.run(command, capture_output=True, text=True)
+        return [line for line in result.stdout.splitlines() if line.strip()]
+
+    def readable(paths):
+        out = []
+        for path in paths:
+            relative = normalize_path(path, root)
+            if not relative or Path(relative).suffix.lower() not in CODE_SUFFIX:
+                continue
+            try:
+                if (root / relative).stat().st_size > MAX_READ_BYTES:
+                    continue
+            except OSError:
+                continue
+            out.append(relative)
+        return out
+
+    first = readable(hits_for(task["target_name"]))
+    read = first[:budget_files]
+    # Hop two: resolve each called symbol to its first readable hit. Dumping every hit of
+    # twenty names would make the baseline a strawman, not a careful agent.
+    second = []
+    for name in called_names([root / path for path in read]):
+        hits = readable(hits_for(name))[:1]
+        for hit in hits:
+            if hit not in second:
+                second.append(hit)
+        if len(second) >= MAX_SECOND_HOP:
+            break
+    candidates = list(dict.fromkeys(first + second))
+    recall, precision = overlap(candidates, task["truth"])
+    billed = (read + second[: max(budget_files - len(read), 0)])
+    return {
+        "recall": recall,
+        "precision": precision,
+        "rounds": calls,
+        "bytes": read_bytes([str(root / path) for path in billed]),
+        "candidates": candidates[:10],
+        "ms": int((time.time() - started) * 1000),
+    }
+
+
+def codegraph_chain_arm(task, client, depth, budget_files):
+    started = time.time()
+    payload = client.call("get_transitive_dependencies", {
+        "node_id": task["target_id"],
+        "edge_type": "calls",
+        "depth": depth,
+    })
+    data = json.loads(payload)
+    rows = data.get("result", []) if isinstance(data, dict) else data
+    candidates = []
+    for row in rows:
+        location = row.get("location") or {}
+        relative = normalize_path(location.get("file_path") or "", task["root"])
+        if relative:
+            candidates.append(relative)
+    recall, precision = overlap(candidates, task["truth"])
+    return {
+        "recall": recall,
+        "precision": precision,
+        "rounds": 1,
+        "bytes": len(payload.encode()),
+        "candidates": list(dict.fromkeys(candidates))[:10],
+        "ms": int((time.time() - started) * 1000),
+    }
+
+
+def run_chain(args, root):
+    depth = max(1, min(args.depth, 5))
+    tasks = (
+        json.loads(args.tasks.read_text())
+        if args.tasks else generate_chain_tasks(root, args.generate, args.seed, depth)
+    )
+    if not tasks:
+        raise SystemExit("no call-chain tasks: index the project first (codegraph index .)")
+    if args.save_tasks:
+        args.save_tasks.write_text(json.dumps(tasks, indent=2))
+
+    client = None
+    if not args.skip_codegraph:
+        client = Mcp(args.command.split(), root)
+        try:
+            client.initialize()
+        except Exception as error:
+            client.close()
+            raise SystemExit(f"cannot start MCP server ({args.command}): {error}")
+    per_task = []
+    try:
+        for task in tasks:
+            record = {
+                "id": task["id"], "target_name": task["target_name"],
+                "target_file": task["target_file"], "reach_count": task["reach_count"],
+            }
+            record["grep"] = grep_chain_arm(task, root, args.budget_files)
+            if client:
+                record["codegraph"] = codegraph_chain_arm(task, client, depth, args.budget_files)
+            per_task.append(record)
+    finally:
+        if client:
+            client.close()
+
+    report = {
+        "project": str(root),
+        "mode": "chain",
+        "tasks": len(per_task),
+        "depth": depth,
+        "budget_files": args.budget_files,
+        "arms": {
+            "grep": summarize_impact(per_task, "grep"),
+            "codegraph": summarize_impact(per_task, "codegraph"),
+        },
+        "per_task": per_task,
+    }
+    output = json.dumps(report, indent=2)
+    print(output)
+    if args.json_out:
+        args.json_out.write_text(output)
+    if args.markdown:
+        args.markdown.write_text(render_chain_markdown(report))
+
+
 def run_impact(args, root):
     tasks = (
         json.loads(args.tasks.read_text())
@@ -651,8 +907,9 @@ def run_impact(args, root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", choices=("locate", "impact"), default="locate",
-                        help="locate: where is a symbol; impact: who calls a target")
+    parser.add_argument("--mode", choices=("locate", "impact", "chain"), default="locate",
+                        help="locate: where is a symbol; impact: who calls a target; chain: what does it reach")
+    parser.add_argument("--depth", type=int, default=2, help="call-chain depth")
     parser.add_argument("--project", type=Path, default=Path.cwd(), help="indexed project root")
     parser.add_argument("--tasks", type=Path, help="frozen task file (JSON)")
     parser.add_argument("--generate", type=int, default=20, help="sample this many tasks from the index")
@@ -671,6 +928,8 @@ def main():
     root = args.project.resolve()
     if args.mode == "impact":
         return run_impact(args, root)
+    if args.mode == "chain":
+        return run_chain(args, root)
     if args.tasks:
         tasks = json.loads(args.tasks.read_text())
     else:

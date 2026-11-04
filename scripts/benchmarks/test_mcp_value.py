@@ -114,6 +114,26 @@ class ImpactSummary(unittest.TestCase):
         self.assertEqual(mcp_value.summarize_impact(per_task, "codegraph"), {"tasks": 0})
 
 
+class CalledNames(unittest.TestCase):
+    def test_extracts_call_sites_and_skips_control_words(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.rs"
+            path.write_text("fn main() { helper(x); if cond { other_one(); } }")
+            names = mcp_value.called_names([path], limit=10)
+            self.assertIn("helper", names)
+            self.assertIn("other_one", names)
+            self.assertNotIn("if", names)
+
+    def test_honours_the_limit_and_dedupes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.rs"
+            path.write_text("a_one(); a_one(); b_two(); c_three(); d_four();")
+            self.assertEqual(len(mcp_value.called_names([path], limit=2)), 2)
+
+    def test_missing_file_is_ignored(self):
+        self.assertEqual(mcp_value.called_names([Path("/nonexistent/x.rs")], limit=5), [])
+
+
 class ConceptComments(unittest.TestCase):
     def test_accepts_prose_comment_and_strips_aboutme(self):
         self.assertEqual(
