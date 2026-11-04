@@ -1088,6 +1088,8 @@ DEFINE FUNCTION fn::semantic_search_nodes_via_chunks(
             ['chunk'] AS match_sources,
             [] AS matched_symbols
         FROM $chunk_hits
+        -- `$threshold` filters vector hits only; BM25 candidates are appended unfiltered below.
+        WHERE (1f - distance) >= $threshold
         FETCH parent_node
     );
 

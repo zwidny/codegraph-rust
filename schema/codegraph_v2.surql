@@ -97,15 +97,15 @@ DEFINE INDEX idx_nodes_name ON nodes FIELDS name CONCURRENTLY;
 DEFINE INDEX idx_nodes_content_search ON nodes FIELDS content FULLTEXT ANALYZER code_text BM25(1.2, 0.75) HIGHLIGHTS CONCURRENTLY;
 DEFINE INDEX idx_nodes_name_search ON nodes FIELDS name FULLTEXT ANALYZER code_identifier BM25(1.2, 0.75) CONCURRENTLY;
 
-DEFINE INDEX idx_nodes_embedding_384 ON nodes FIELDS embedding_384 HNSW DIMENSION 384 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_nodes_embedding_768 ON nodes FIELDS embedding_768 HNSW DIMENSION 768 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_nodes_embedding_1024 ON nodes FIELDS embedding_1024 HNSW DIMENSION 1024 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_nodes_embedding_1536 ON nodes FIELDS embedding_1536 HNSW DIMENSION 1536 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_nodes_embedding_2048 ON nodes FIELDS embedding_2048 HNSW DIMENSION 2048 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_nodes_embedding_2560 ON nodes FIELDS embedding_2560 HNSW DIMENSION 2560 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_nodes_embedding_3072 ON nodes FIELDS embedding_3072 HNSW DIMENSION 3072 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_nodes_embedding_3584 ON nodes FIELDS embedding_3584 HNSW DIMENSION 3584 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_nodes_embedding_4096 ON nodes FIELDS embedding_4096 HNSW DIMENSION 4096 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_384 ON nodes FIELDS embedding_384 HNSW DIMENSION 384 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_768 ON nodes FIELDS embedding_768 HNSW DIMENSION 768 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_1024 ON nodes FIELDS embedding_1024 HNSW DIMENSION 1024 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_1536 ON nodes FIELDS embedding_1536 HNSW DIMENSION 1536 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_2048 ON nodes FIELDS embedding_2048 HNSW DIMENSION 2048 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_2560 ON nodes FIELDS embedding_2560 HNSW DIMENSION 2560 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_3072 ON nodes FIELDS embedding_3072 HNSW DIMENSION 3072 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_3584 ON nodes FIELDS embedding_3584 HNSW DIMENSION 3584 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_nodes_embedding_4096 ON nodes FIELDS embedding_4096 HNSW DIMENSION 4096 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
 
 -- ------------------------------
 -- TABLE: edges
@@ -154,15 +154,15 @@ DEFINE FIELD updated_at ON chunks TYPE datetime VALUE time::now() PERMISSIONS FU
 DEFINE INDEX idx_chunks_project ON chunks FIELDS project_id CONCURRENTLY;
 DEFINE INDEX idx_chunks_parent_order ON chunks FIELDS parent_node, chunk_index CONCURRENTLY;
 
-DEFINE INDEX idx_chunks_embedding_384 ON chunks FIELDS embedding_384 HNSW DIMENSION 384 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_chunks_embedding_768 ON chunks FIELDS embedding_768 HNSW DIMENSION 768 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_chunks_embedding_1024 ON chunks FIELDS embedding_1024 HNSW DIMENSION 1024 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_chunks_embedding_1536 ON chunks FIELDS embedding_1536 HNSW DIMENSION 1536 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_chunks_embedding_2048 ON chunks FIELDS embedding_2048 HNSW DIMENSION 2048 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_chunks_embedding_2560 ON chunks FIELDS embedding_2560 HNSW DIMENSION 2560 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_chunks_embedding_3072 ON chunks FIELDS embedding_3072 HNSW DIMENSION 3072 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_chunks_embedding_3584 ON chunks FIELDS embedding_3584 HNSW DIMENSION 3584 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_chunks_embedding_4096 ON chunks FIELDS embedding_4096 HNSW DIMENSION 4096 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_384 ON chunks FIELDS embedding_384 HNSW DIMENSION 384 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_768 ON chunks FIELDS embedding_768 HNSW DIMENSION 768 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_1024 ON chunks FIELDS embedding_1024 HNSW DIMENSION 1024 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_1536 ON chunks FIELDS embedding_1536 HNSW DIMENSION 1536 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_2048 ON chunks FIELDS embedding_2048 HNSW DIMENSION 2048 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_2560 ON chunks FIELDS embedding_2560 HNSW DIMENSION 2560 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_3072 ON chunks FIELDS embedding_3072 HNSW DIMENSION 3072 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_3584 ON chunks FIELDS embedding_3584 HNSW DIMENSION 3584 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_chunks_embedding_4096 ON chunks FIELDS embedding_4096 HNSW DIMENSION 4096 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
 
 -- ------------------------------
 -- TABLE: symbol_embeddings
@@ -194,15 +194,15 @@ DEFINE INDEX idx_symbol_embeddings_project ON symbol_embeddings FIELDS project_i
 DEFINE INDEX idx_symbol_embeddings_project_symbol ON symbol_embeddings FIELDS project_id, normalized_symbol CONCURRENTLY;
 DEFINE INDEX idx_symbol_embeddings_node ON symbol_embeddings FIELDS node_id CONCURRENTLY;
 
-DEFINE INDEX idx_symbol_embeddings_vector_384 ON symbol_embeddings FIELDS embedding_384 HNSW DIMENSION 384 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_symbol_embeddings_vector_768 ON symbol_embeddings FIELDS embedding_768 HNSW DIMENSION 768 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_symbol_embeddings_vector_1024 ON symbol_embeddings FIELDS embedding_1024 HNSW DIMENSION 1024 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_symbol_embeddings_vector_1536 ON symbol_embeddings FIELDS embedding_1536 HNSW DIMENSION 1536 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_symbol_embeddings_vector_2048 ON symbol_embeddings FIELDS embedding_2048 HNSW DIMENSION 2048 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_symbol_embeddings_vector_2560 ON symbol_embeddings FIELDS embedding_2560 HNSW DIMENSION 2560 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_symbol_embeddings_vector_3072 ON symbol_embeddings FIELDS embedding_3072 HNSW DIMENSION 3072 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_symbol_embeddings_vector_3584 ON symbol_embeddings FIELDS embedding_3584 HNSW DIMENSION 3584 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
-DEFINE INDEX idx_symbol_embeddings_vector_4096 ON symbol_embeddings FIELDS embedding_4096 HNSW DIMENSION 4096 DIST COSINE TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_384 ON symbol_embeddings FIELDS embedding_384 HNSW DIMENSION 384 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_768 ON symbol_embeddings FIELDS embedding_768 HNSW DIMENSION 768 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_1024 ON symbol_embeddings FIELDS embedding_1024 HNSW DIMENSION 1024 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_1536 ON symbol_embeddings FIELDS embedding_1536 HNSW DIMENSION 1536 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_2048 ON symbol_embeddings FIELDS embedding_2048 HNSW DIMENSION 2048 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_2560 ON symbol_embeddings FIELDS embedding_2560 HNSW DIMENSION 2560 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_3072 ON symbol_embeddings FIELDS embedding_3072 HNSW DIMENSION 3072 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_3584 ON symbol_embeddings FIELDS embedding_3584 HNSW DIMENSION 3584 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
+DEFINE INDEX idx_symbol_embeddings_vector_4096 ON symbol_embeddings FIELDS embedding_4096 HNSW DIMENSION 4096 DIST COSINE_NORMALIZED TYPE F32 EFC 150 M 12 CONCURRENTLY;
 
 -- ------------------------------
 -- TABLE: file_metadata
@@ -349,7 +349,7 @@ DEFINE FUNCTION OVERWRITE fn::edges_for_nodes($node_refs: array, $per_node: int)
 -- the depth range carrying { visited, frontier, reached }.
 DEFINE FUNCTION OVERWRITE fn::expand($project_id: string, $start: record<nodes>, $edge_name: string, $direction: string, $max_depth: int) {
     LET $safe_depth = IF $max_depth > 0 AND $max_depth <= 10 THEN $max_depth ELSE 3 END;
-    LET $walk = array::fold(array::range(1, $safe_depth), { visited: [$start], frontier: [$start], reached: [] }, |$acc, $depth| {
+    LET $walk = array::fold(array::range(1, $safe_depth + 1), { visited: [$start], frontier: [$start], reached: [] }, |$acc, $depth| {
         IF array::len($acc.frontier) = 0 { RETURN $acc; };
         LET $next = IF $direction = 'in' THEN
             (SELECT VALUE `from` FROM edges WHERE project_id = $project_id AND edge_type = $edge_name AND `to` INSIDE $acc.frontier)
@@ -406,7 +406,7 @@ DEFINE FUNCTION OVERWRITE fn::trace_call_chain($project_id: string, $from_node: 
     IF $rec_proj = NONE OR $rec_proj != $project_id { RETURN []; };
 
     LET $start_name = (SELECT VALUE name FROM ONLY $record);
-    LET $walk = array::fold(array::range(1, $safe_depth), { visited: [$record], frontier: [{ id: $record, path: [$start_name] }], reached: [] }, |$acc, $depth| {
+    LET $walk = array::fold(array::range(1, $safe_depth + 1), { visited: [$record], frontier: [{ id: $record, path: [$start_name] }], reached: [] }, |$acc, $depth| {
         IF array::len($acc.frontier) = 0 { RETURN $acc; };
         LET $frontier_ids = $acc.frontier.map(|$f| $f.id);
         LET $hops = (
@@ -673,7 +673,14 @@ DEFINE FUNCTION OVERWRITE fn::semantic_search_nodes_via_chunks(
         ORDER BY distance
         LIMIT $safe_limit * 3
     );
-    LET $vector_ranked = (SELECT id, 1f - distance AS vector_score FROM $vector_list ORDER BY distance);
+    -- `$threshold` filters vector hits only; BM25 hits are kept so a literal match still surfaces
+    -- when its cosine similarity is low.
+    LET $vector_ranked = (
+        SELECT id, 1f - distance AS vector_score
+        FROM $vector_list
+        WHERE (1f - distance) >= $threshold
+        ORDER BY distance
+    );
 
     -- 2) BM25 lists over content and name (indexed, project-scoped).
     LET $content_ranked = (
