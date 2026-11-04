@@ -240,9 +240,8 @@ fn drop_echoed_parameters(value: &mut JsonValue) {
 
 /// `trace_call_chain` repeated every direct caller as a full node object.
 ///
-/// The chain itself already answers "who calls this", so keep the caller names and drop the
-/// repeated `id`/`kind` payload: about two thirds of the field, which was the largest single
-/// contributor to this tool's response size.
+/// The chain already answers "who calls this", so keep the two fields a caller can act on -
+/// the name and the node id for follow-up queries - and drop the repeated `kind` and the rest.
 fn compact_called_by(value: &mut JsonValue) {
     let Some(rows) = value.as_array_mut() else {
         return;
@@ -254,12 +253,19 @@ fn compact_called_by(value: &mut JsonValue) {
         else {
             continue;
         };
-        let names: Vec<JsonValue> = called_by
+        let callers: Vec<JsonValue> = called_by
             .iter()
-            .filter_map(|entry| entry.get("name").and_then(|name| name.as_str()))
-            .map(|name| JsonValue::String(name.to_string()))
+            .filter_map(|entry| {
+                let name = entry.get("name").and_then(|name| name.as_str())?;
+                let mut caller = serde_json::Map::new();
+                caller.insert("name".to_string(), JsonValue::String(name.to_string()));
+                if let Some(id) = entry.get("id").and_then(|id| id.as_str()) {
+                    caller.insert("id".to_string(), JsonValue::String(id.to_string()));
+                }
+                Some(JsonValue::Object(caller))
+            })
             .collect();
-        *called_by = names;
+        *called_by = callers;
     }
 }
 
@@ -1010,7 +1016,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_called_by_keeps_names_and_drops_node_payload() {
+    fn compact_called_by_keeps_name_and_id_only() {
         let mut value = serde_json::json!([{
             "name": "reached",
             "called_by": [
@@ -1021,9 +1027,46 @@ mod tests {
         super::compact_called_by(&mut value);
         assert_eq!(
             value[0]["called_by"],
-            serde_json::json!(["caller_a", "caller_b"])
+            serde_json::json!([
+                {"name": "caller_a", "id": "nodes:`a`"},
+                {"name": "caller_b", "id": "nodes:`b`"}
+            ])
         );
         assert_eq!(value[0]["name"], "reached");
+    }
+
+    #[test]
+    fn compact_called_by_drops_kind_and_extra_fields() {
+        let mut value = serde_json::json!([{
+            "called_by": [{"name": "c", "id": "nodes:`c`", "kind": "Function",
+                            "language": "Rust", "qualified_name": "x::c"}]
+        }]);
+        super::compact_called_by(&mut value);
+        let caller = &value[0]["called_by"][0];
+        assert!(caller.get("kind").is_none());
+        assert!(caller.get("language").is_none());
+        assert!(caller.get("qualified_name").is_none());
+        assert_eq!(caller["id"], "nodes:`c`");
+    }
+
+    #[test]
+    fn compact_called_by_keeps_name_when_id_is_missing() {
+        let mut value = serde_json::json!([{"called_by": [{"name": "only_name"}]}]);
+        super::compact_called_by(&mut value);
+        assert_eq!(
+            value[0]["called_by"],
+            serde_json::json!([{"name": "only_name"}])
+        );
+    }
+
+    #[test]
+    fn compact_called_by_ignores_entries_without_a_name() {
+        let mut value = serde_json::json!([{"called_by": [{"id": "nodes:`a`"}, {"name": "kept", "id": "nodes:`k`"}]}]);
+        super::compact_called_by(&mut value);
+        assert_eq!(
+            value[0]["called_by"],
+            serde_json::json!([{"name": "kept", "id": "nodes:`k`"}])
+        );
     }
 
     #[test]
@@ -1038,15 +1081,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_called_by_ignores_entries_without_a_name() {
-        let mut value = serde_json::json!([{"called_by": [{"id": "nodes:`a`"}, {"name": "kept"}]}]);
-        super::compact_called_by(&mut value);
-        assert_eq!(value[0]["called_by"], serde_json::json!(["kept"]));
-    }
-
-    #[test]
     fn compact_called_by_is_a_no_op_for_non_arrays() {
-        let mut value = serde_json::json!({"called_by": [{"name": "x"}]});
+        let mut value = serde_json::json!({"called_by": [{"name": "x", "id": "nodes:`x`"}]});
         super::compact_called_by(&mut value);
         assert_eq!(value["called_by"][0]["name"], "x");
     }
