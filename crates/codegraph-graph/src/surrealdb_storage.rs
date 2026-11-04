@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -255,6 +255,165 @@ impl SurrealDbStorage {
             .bind(("chunks", chunks)).bind(("files", files)).await
             .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?
             .check().map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation statement failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Per-file catalog reconciliation, single-scan variant.
+    ///
+    /// The original `reconcile_catalog` issues project-wide `NOT IN` deletes whose
+    /// parameter lists hold every node, edge and chunk id (tens of thousands of
+    /// elements). `NOT IN` cannot use an index, so each statement scans the whole
+    /// table while probing an oversized array — measured at 24+ minutes on this
+    /// project, on every run.
+    ///
+    /// A previous per-file variant shrank each scan but still ran two queries per
+    /// indexed file (measured ~0.4s each, ~4 minutes for 295 files) and could not
+    /// see orphans whose `file_path` no longer matches what the parser emits
+    /// (e.g. absolute-path leftovers from earlier runs).
+    ///
+    /// This variant reads `(id, file_path)` for the whole project in one scan
+    /// (measured 145ms for ~26k rows), groups in memory, and reconciles by
+    /// difference: files present in the store but absent from `fresh_nodes_by_file`
+    /// are removed entirely via `delete_data_for_files`; surviving files keep only
+    /// the ids this run emitted. Chunk orphans are reconciled the same way in a
+    /// second single scan over `(id, parent_node)`.
+    pub async fn reconcile_catalog_by_file(
+        &self,
+        project: &str,
+        fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
+        fresh_chunks: &BTreeSet<String>,
+    ) -> Result<()> {
+        let decode_id = |raw: &str| {
+            raw.strip_prefix("nodes:")
+                .unwrap_or(raw)
+                .trim_matches('`')
+                .to_string()
+        };
+
+        // --- Single scan over nodes: (raw id, file_path) -------------------
+        let mut response = self
+            .db
+            .query("SELECT VALUE [<string> id, file_path] FROM nodes WHERE project_id = $project;")
+            .bind(("project", project.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?;
+        let node_rows: Vec<Vec<Option<String>>> = response.take(0).unwrap_or_default();
+
+        let mut existing_by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in &node_rows {
+            if let (Some(raw_id), Some(file)) = (
+                row.first().and_then(|v| v.as_deref()),
+                row.get(1).and_then(|v| v.as_deref()),
+            ) {
+                existing_by_file
+                    .entry(file.to_string())
+                    .or_default()
+                    .push(decode_id(raw_id));
+            }
+        }
+
+        // --- Files that disappeared entirely (including stale path formats) --
+        let deleted_files: Vec<String> = existing_by_file
+            .keys()
+            .filter(|file| !fresh_nodes_by_file.contains_key(*file))
+            .cloned()
+            .collect();
+        if !deleted_files.is_empty() {
+            self.delete_data_for_files(project, &deleted_files).await?;
+        }
+
+        // --- Surviving files: drop ids this run did not re-emit -------------
+        let mut stale_nodes: Vec<String> = Vec::new();
+        for (file, fresh_ids) in fresh_nodes_by_file {
+            let Some(existing) = existing_by_file.get(file) else {
+                continue;
+            };
+            let fresh: std::collections::HashSet<&str> =
+                fresh_ids.iter().map(String::as_str).collect();
+            stale_nodes.extend(
+                existing
+                    .iter()
+                    .filter(|id| !fresh.contains(id.as_str()))
+                    .cloned(),
+            );
+        }
+
+        // --- Single scan over chunks: (raw id, parent raw id) ----------------
+        let mut response = self
+            .db
+            .query("SELECT VALUE [<string> id, <string> parent_node] FROM chunks WHERE project_id = $project;")
+            .bind(("project", project.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?;
+        let chunk_rows: Vec<Vec<Option<String>>> = response.take(0).unwrap_or_default();
+
+        let decode_chunk = |raw: &str| {
+            raw.strip_prefix("chunks:")
+                .unwrap_or(raw)
+                .trim_matches('`')
+                .to_string()
+        };
+        let mut stale_chunks: Vec<String> = Vec::new();
+        if !chunk_rows.is_empty() {
+            let fresh_chunk_ids: std::collections::HashSet<&str> =
+                fresh_chunks.iter().map(String::as_str).collect();
+            // Nodes that this reconciliation is about to delete orphan their chunks.
+            let stale_node_ids: std::collections::HashSet<&str> =
+                stale_nodes.iter().map(String::as_str).collect();
+            let fresh_parent_ids: std::collections::HashSet<&str> = fresh_nodes_by_file
+                .values()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            for row in &chunk_rows {
+                let (Some(raw_id), Some(raw_parent)) = (
+                    row.first().and_then(|v| v.as_deref()),
+                    row.get(1).and_then(|v| v.as_deref()),
+                ) else {
+                    continue;
+                };
+                let id = decode_chunk(raw_id);
+                let parent = decode_id(raw_parent);
+                if !fresh_chunk_ids.contains(id.as_str())
+                    || stale_node_ids.contains(parent.as_str())
+                    || !fresh_parent_ids.contains(parent.as_str())
+                {
+                    stale_chunks.push(id);
+                }
+            }
+        }
+
+        if stale_nodes.is_empty() && stale_chunks.is_empty() {
+            return Ok(());
+        }
+
+        let stale_records: Vec<String> = stale_nodes.clone();
+        let stale_chunk_records: Vec<String> = stale_chunks.clone();
+        self.db
+            .query(
+                r#"
+                BEGIN TRANSACTION;
+                LET $stale_nodes = $stale.map(|$id| type::record('nodes', $id));
+                LET $stale_chunk_ids = $stale_chunks.map(|$id| type::record('chunks', $id));
+                DELETE edges WHERE project_id = $project AND $has_nodes AND (from IN $stale_nodes OR to IN $stale_nodes);
+                DELETE symbol_embeddings WHERE project_id = $project AND $has_nodes AND node_id IN $stale_nodes;
+                DELETE chunks WHERE project_id = $project AND id IN $stale_chunk_ids;
+                DELETE nodes WHERE project_id = $project AND id IN $stale_nodes;
+                COMMIT TRANSACTION;
+            "#,
+            )
+            .bind(("project", project.to_string()))
+            .bind(("stale", stale_records))
+            .bind(("stale_chunks", stale_chunk_records))
+            .bind(("has_nodes", !stale_nodes.is_empty()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation statement failed: {e}")))?;
         Ok(())
     }
 
@@ -1037,26 +1196,49 @@ impl SurrealDbStorage {
             return Ok(());
         }
 
-        self.db
-            .query(UPSERT_SYMBOL_EMBEDDINGS_QUERY)
-            .bind(("data", records.to_vec()))
-            .await
-            .map_err(|e| {
-                CodeGraphError::Database(format!(
-                    "Failed to upsert symbol embedding batch ({} items): {}",
-                    records.len(),
-                    truncate_surreal_error(&e)
-                ))
-            })?
-            .check()
-            .map_err(|e| {
-                CodeGraphError::Database(format!(
-                    "Symbol batch upsert returned error: {}",
-                    truncate_surreal_error(&e)
-                ))
-            })?;
+        // SurrealKV reports concurrent write-write conflicts on overlapping keys as
+        // "Transaction write conflict ... can be retried". Those are transient: retry
+        // with backoff instead of failing the whole indexing run. Non-retryable
+        // errors still fail fast.
+        const MAX_ATTEMPTS: u32 = 6;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
 
-        Ok(())
+            let outcome = self
+                .db
+                .query(UPSERT_SYMBOL_EMBEDDINGS_QUERY)
+                .bind(("data", records.to_vec()))
+                .await
+                .map_err(|e| {
+                    CodeGraphError::Database(format!(
+                        "Failed to upsert symbol embedding batch ({} items): {}",
+                        records.len(),
+                        truncate_surreal_error(&e)
+                    ))
+                })
+                .and_then(|resp| {
+                    resp.check().map(|_| ()).map_err(|e| {
+                        CodeGraphError::Database(format!(
+                            "Symbol batch upsert returned error: {}",
+                            truncate_surreal_error(&e)
+                        ))
+                    })
+                });
+
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let retryable = is_retryable_write_conflict(&err.to_string());
+                    if retryable && attempt < MAX_ATTEMPTS {
+                        let backoff_ms = 20u64 << (attempt - 1);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
     }
 
     pub async fn upsert_chunk_embeddings_batch(
@@ -2630,6 +2812,16 @@ fn truncate_surreal_error(e: &SurrealError) -> String {
     msg
 }
 
+/// SurrealKV reports concurrent transaction conflicts as retryable. Detect those
+/// so callers can retry instead of aborting a long indexing run.
+fn is_retryable_write_conflict(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("transaction write conflict")
+        || lower.contains("write conflict")
+        || lower.contains("transaction conflict")
+        || lower.contains("can be retried")
+}
+
 #[allow(dead_code)]
 fn parse_count(values: Vec<JsonValue>) -> Result<i64> {
     let Some(first) = values.into_iter().next() else {
@@ -2653,6 +2845,89 @@ fn parse_count(values: Vec<JsonValue>) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the indexing crash on SurrealKV write-write conflicts.
+    /// `upsert_symbol_embeddings_batch` retries only when the classifier says the
+    /// error is transient; everything else must still fail fast so real problems
+    /// are not masked by six silent retries.
+    #[test]
+    fn retryable_write_conflict_classifier_matches_surrealkv_wording() {
+        let retryable = [
+            "There was a problem with the key-value store: Transaction conflict: \
+             Transaction write conflict. This transaction can be retried",
+            "Transaction write conflict",
+            "write conflict",
+            "transaction conflict",
+            "THIS TRANSACTION CAN BE RETRIED",
+        ];
+        for message in retryable {
+            assert!(
+                is_retryable_write_conflict(message),
+                "expected retryable: {message}"
+            );
+        }
+
+        let fatal = [
+            "",
+            "Symbol batch upsert returned error: missing field project_id",
+            "excessive computation depth",
+            "connection reset by peer",
+            "Serialization error: invalid UTF-8",
+            "Failed to upsert symbol embedding batch (3 items): permission denied",
+        ];
+        for message in fatal {
+            assert!(
+                !is_retryable_write_conflict(message),
+                "expected fatal (fail fast): {message}"
+            );
+        }
+    }
+
+    /// A retried batch must converge on the same rows, never duplicate them.
+    /// The writer replays a batch after a transient conflict, so idempotency is
+    /// part of the retry contract.
+    #[tokio::test]
+    async fn symbol_embedding_batch_upsert_is_idempotent_across_retries() {
+        let storage = SurrealDbStorage::new(SurrealDbConfig {
+            connection: "mem://".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let vector: Vec<f32> = vec![0.25; 384];
+        let record = SymbolEmbeddingRecord::new(
+            "retry-project",
+            None,
+            "build_chunk_plan",
+            "build_chunk_plan",
+            &vector,
+            "fixture",
+            "embedding_384",
+            None,
+            None,
+            None,
+        );
+
+        let batch = std::slice::from_ref(&record);
+        storage.upsert_symbol_embeddings_batch(batch).await.unwrap();
+        // Simulate the retry that follows a write conflict.
+        storage.upsert_symbol_embeddings_batch(batch).await.unwrap();
+        storage.upsert_symbol_embeddings_batch(batch).await.unwrap();
+
+        let mut response = storage
+            .db()
+            .query("SELECT count() AS n FROM symbol_embeddings WHERE project_id = 'retry-project' GROUP ALL")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let row: Option<serde_json::Value> = response.take(0).unwrap();
+        let total = row
+            .and_then(|value| value.get("n").and_then(|n| n.as_u64()))
+            .unwrap_or(0);
+        assert_eq!(total, 1, "retried upsert must not duplicate symbol rows");
+    }
 
     #[tokio::test]
     async fn test_surrealdb_storage_creation() {

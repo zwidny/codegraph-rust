@@ -84,6 +84,7 @@ pub async fn ensure_ready(
             .and_then(|s| s.parse().ok())
             .unwrap_or(300),
     );
+    let mut all_ready = true;
     for (table, name, sql) in definitions(dimension, tables)? {
         tokio::time::timeout(timeout, db.query(sql))
             .await
@@ -92,11 +93,39 @@ pub async fn ensure_ready(
             .check()
             .map_err(|e| CodeGraphError::Database(e.to_string()))?;
         let start = Instant::now();
+        // A single INFO FOR INDEX can block far longer than the overall readiness
+        // timeout (observed: >20 min on a 5 GB store). Bound each probe so a stuck
+        // metadata query degrades to "not ready" instead of hanging indexing
+        // forever after all data has already been durably written.
+        const INFO_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+        let mut probe_timeouts = 0u32;
         loop {
-            let mut result = db
-                .query(format!("INFO FOR INDEX {name} ON {table};"))
-                .await
-                .map_err(|e| CodeGraphError::Database(e.to_string()))?
+            let probe = tokio::time::timeout(
+                INFO_PROBE_TIMEOUT,
+                db.query(format!("INFO FOR INDEX {name} ON {table};")),
+            )
+            .await;
+
+            let mut result = match probe {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => {
+                    return Err(CodeGraphError::Database(e.to_string()));
+                }
+                Err(_) => {
+                    probe_timeouts += 1;
+                    tracing::warn!(
+                        "INFO FOR INDEX {name} ON {table} did not answer within {INFO_PROBE_TIMEOUT:?} \
+                         (attempt {probe_timeouts}); index data is already persisted"
+                    );
+                    if probe_timeouts >= 2 || start.elapsed() >= timeout {
+                        all_ready = false;
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            result = result
                 .check()
                 .map_err(|e| CodeGraphError::Database(e.to_string()))?;
             let info: Option<serde_json::Value> = result
@@ -132,12 +161,22 @@ pub async fn ensure_ready(
             }
         }
     }
-    Ok(true)
+    Ok(all_ready)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ensure_ready` must not build anything when the caller asks for no tables,
+    /// and must report "not ready" rather than an error.
+    #[tokio::test]
+    async fn empty_table_set_reports_not_ready() {
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("empty").await.unwrap();
+        assert!(!ensure_ready(&db, 384, &[]).await.unwrap());
+    }
+
     #[test]
     fn fresh_store_filter_preserves_non_vector_indexes_in_both_schemas() {
         for schema in [

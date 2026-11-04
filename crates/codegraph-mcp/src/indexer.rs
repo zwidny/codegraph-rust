@@ -27,7 +27,7 @@ use rustc_demangle::try_demangle;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -1517,11 +1517,19 @@ impl ProjectIndexer {
                 .bind(("project", self.project_id.clone()))
                 .await?
                 .check()?;
+            // Per-file node ids, used by the per-file reconciliation below. Node ids
+            // embed the source line number, so moving a line orphans the old id even
+            // when the file still exists.
+            let mut fresh_nodes_by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for node in &nodes {
                 next_catalog.nodes.insert(
                     node.id.to_string(),
                     crate::reconciliation::node_digest(node)?,
                 );
+                fresh_nodes_by_file
+                    .entry(node.location.file_path.clone())
+                    .or_default()
+                    .push(node.id.to_string());
             }
             let store_nodes_pb = self.create_progress_bar(nodes.len() as u64, "📈 Storing nodes");
             let mut stats = IndexStats {
@@ -1565,7 +1573,12 @@ impl ProjectIndexer {
                     _ => {}
                 }
             }
-            let storage_batch = self.config.batch_size.max(1);
+            // Node persistence batch, decoupled from the inference batch size:
+            // one SurrealDB transaction per batch means one fsync, and the UPSERT
+            // uses array::map + INSERT (no per-row FOR loop), so larger batches are
+            // safe and cut the 26k-node persist phase measured at 137s down
+            // proportionally.
+            let storage_batch = node_db_batch_size(self.config.batch_size);
             for chunk in nodes.chunks(storage_batch) {
                 let dirty: Vec<_> = chunk
                     .iter()
@@ -1646,20 +1659,42 @@ impl ProjectIndexer {
                 // Inference row limits are independent of the smaller database write batches.
                 let chunk_batch_size = batch.max(1);
 
+                // `fingerprint` serialises its input and recursively sorts every object
+                // key (canonicalisation) before hashing. Called once per chunk over the
+                // whole plan, that repeated work for the constant configuration fields
+                // dominated the embedding phase on a single thread (measured: ~100% CPU
+                // on one core while the batch pipeline starved). The hash inputs are
+                // unchanged, so cache keys — and therefore stored vectors — stay valid;
+                // only the order of evaluation changes. Results are collected with their
+                // original index to keep deterministic iteration order afterwards.
+                let computed_hashes: Vec<(usize, String, String)> =
+                    self.cpu_pool.install(|| {
+                        chunk_plan
+                            .chunks
+                            .par_iter()
+                            .enumerate()
+                            .map(|(index, chunk)| {
+                                let meta = &chunk_plan.metas[index];
+                                let node = &nodes[meta.node_index];
+                                let id = ChunkEmbeddingRecord::identity(
+                                    &node.id.to_string(),
+                                    meta.chunk_index,
+                                );
+                                let hash = fingerprint(&(
+                                    &chunk.text,
+                                    &embedding_config,
+                                    &policy,
+                                    &self.embedding_model,
+                                    self.vector_dim,
+                                    mutable_model_epoch,
+                                ))?;
+                                Ok::<_, serde_json::Error>((index, id, hash))
+                            })
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })?;
+
                 let mut pending_chunks = Vec::new();
-                for (index, (chunk, meta)) in
-                    chunk_plan.chunks.iter().zip(&chunk_plan.metas).enumerate()
-                {
-                    let node = &nodes[meta.node_index];
-                    let id = ChunkEmbeddingRecord::identity(&node.id.to_string(), meta.chunk_index);
-                    let hash = fingerprint(&(
-                        &chunk.text,
-                        &embedding_config,
-                        &policy,
-                        &self.embedding_model,
-                        self.vector_dim,
-                        mutable_model_epoch,
-                    ))?;
+                for (index, id, hash) in computed_hashes {
                     if previous
                         .as_ref()
                         .and_then(|state| state.chunk_hashes.get(&id))
@@ -1836,55 +1871,73 @@ impl ProjectIndexer {
             let resolution_start = std::time::Instant::now();
             let catalog = crate::resolution::SymbolCatalog::new(&nodes);
             let symbol_map = catalog.unique_aliases();
-            let mut normalized = HashMap::new();
             let mut targets = Vec::with_capacity(edges.len());
             let mut resolution_provenance = Vec::with_capacity(edges.len());
             let mut exact_count = 0;
             let mut lexical_count = 0;
-            let mut lexical_cache = HashMap::new();
-            for edge in &edges {
-                let mut target = catalog.exact(edge, &[]);
-                let mut provenance = (
-                    if target.is_some_and(|id| {
-                        edge.metadata.get("target_node_id") == Some(&id.to_string())
-                    }) {
-                        "definition"
-                    } else {
-                        "exact"
-                    },
-                    1.0f64,
-                );
-                if target.is_none() {
-                    let variants = normalized.entry(edge.to.clone()).or_insert_with(|| {
-                        let mut variants = Self::normalize_symbol_target(&edge.to);
-                        if edge.to.starts_with("_R")
-                            || edge.to.starts_with("_ZN")
-                            || edge.to.contains('<')
-                        {
-                            variants.extend(Self::normalize_rust_symbol(&edge.to));
-                            variants.sort();
-                            variants.dedup();
+            // Resolution over 96k edges was a serial loop measured at ~200s on
+            // one core. `SymbolCatalog`'s lookup methods are `&self`, so the loop
+            // parallelises with rayon (order preserved by collect); the two
+            // memoisation maps become DashMaps, and the counters are derived from
+            // provenance afterwards so no atomics are needed.
+            {
+                let normalized: dashmap::DashMap<String, Vec<String>> = dashmap::DashMap::new();
+                let lexical_cache: dashmap::DashMap<(NodeId, String), Option<(NodeId, f64)>> =
+                    dashmap::DashMap::new();
+                let results: Vec<(Option<NodeId>, (&'static str, f64))> = edges
+                    .par_iter()
+                    .map(|edge| {
+                        let mut target = catalog.exact(edge, &[]);
+                        let mut provenance = (
+                            if target.is_some_and(|id| {
+                                edge.metadata.get("target_node_id") == Some(&id.to_string())
+                            }) {
+                                "definition"
+                            } else {
+                                "exact"
+                            },
+                            1.0f64,
+                        );
+                        if target.is_none() {
+                            let variants = normalized.entry(edge.to.clone()).or_insert_with(|| {
+                                let mut variants = Self::normalize_symbol_target(&edge.to);
+                                if edge.to.starts_with("_R")
+                                    || edge.to.starts_with("_ZN")
+                                    || edge.to.contains('<')
+                                {
+                                    variants.extend(Self::normalize_rust_symbol(&edge.to));
+                                    variants.sort();
+                                    variants.dedup();
+                                }
+                                variants
+                            });
+                            target = catalog.exact(edge, &variants);
+                            provenance.0 = "normalized";
                         }
-                        variants
-                    });
-                    target = catalog.exact(edge, variants);
-                    provenance.0 = "normalized";
-                }
-                if target.is_some() {
-                    exact_count += 1;
-                }
-                if target.is_none() && !catalog.ambiguous(&edge.to) {
-                    let lexical = *lexical_cache
-                        .entry((edge.from, edge.to.clone()))
-                        .or_insert_with(|| catalog.fuzzy(edge));
-                    if let Some((id, score)) = lexical {
-                        target = Some(id);
-                        provenance = ("lexical", score);
-                        lexical_count += 1;
+                        if target.is_some() {
+                            provenance.0 = provenance.0;
+                        }
+                        if target.is_none() && !catalog.ambiguous(&edge.to) {
+                            let lexical = *lexical_cache
+                                .entry((edge.from, edge.to.clone()))
+                                .or_insert_with(|| catalog.fuzzy(edge));
+                            if let Some((id, score)) = lexical {
+                                target = Some(id);
+                                provenance = ("lexical", score);
+                            }
+                        }
+                        (target, provenance)
+                    })
+                    .collect();
+                for (target, provenance) in results {
+                    match provenance.0 {
+                        "lexical" => lexical_count += 1,
+                        "definition" | "exact" | "normalized" => exact_count += 1,
+                        _ => {}
                     }
+                    targets.push(target);
+                    resolution_provenance.push(provenance);
                 }
-                targets.push(target);
-                resolution_provenance.push(provenance);
             }
             phase_ms.insert(
                 "resolution_exact_lexical".into(),
@@ -2130,18 +2183,16 @@ impl ProjectIndexer {
             stats.resolution_rate = resolution_rate;
 
             self.flush_surreal_writer().await?;
+            // Per-file reconciliation: the project-wide variant issues `NOT IN`
+            // deletes over every node/edge/chunk id and cannot use an index, which
+            // measured at 10+ minutes per run on this project.
             self.surreal
                 .lock()
                 .await
-                .reconcile_catalog(
+                .reconcile_catalog_by_file(
                     &self.project_id,
-                    next_catalog.nodes.keys().cloned().collect(),
-                    next_catalog.edges.iter().cloned().collect(),
-                    next_catalog.chunks.iter().cloned().collect(),
-                    file_paths_only
-                        .iter()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect(),
+                    &fresh_nodes_by_file,
+                    &next_catalog.chunks,
                 )
                 .await?;
             source_snapshots.validate_current().await?;
@@ -3594,6 +3645,15 @@ fn parse_symbol_embedding_db_batch_size(value: Option<&str>) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .map(|parsed| parsed.clamp(1, MAX))
         .unwrap_or(SYMBOL_EMBEDDING_DB_BATCH_LIMIT)
+}
+
+fn node_db_batch_size(fallback: usize) -> usize {
+    const MAX: usize = 512;
+    std::env::var("CODEGRAPH_NODE_DB_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|parsed| parsed.clamp(1, MAX))
+        .unwrap_or(fallback.clamp(1, MAX))
 }
 
 fn chunk_embedding_db_batch_size(fallback: usize) -> usize {
