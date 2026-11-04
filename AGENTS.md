@@ -1,5 +1,165 @@
 # Repository Guidelines
 
+## 探索协议（强制，先读这一节）
+
+**只要问题涉及本项目源码的结构 / 位置 / 关系 / 调用，第一个工具调用必须是 codegraph（MCP 优先，CLI 兜底）。**
+在任何 `ls` / `find` / `glob` / `cat` / `grep` / `read` **之前**执行。
+
+适用范围是**整个任务**，不限于第一轮：探索、验证、调试、修改前定位、排查行为，都算。
+「我只是确认一下」「这个我大概知道在哪」**不构成豁免**。
+
+| 问题类型 | 首个调用 |
+|---|---|
+| 这项目 / 仓库是干什么的 | `agentic_architecture` 或 `agentic_context` |
+| 入口在哪 / `main` 在哪 | `semantic_code_search` |
+| 架构如何 / 有哪些模块 / 怎么分层 | `get_hub_nodes` + `agentic_architecture` |
+| 某功能 / 概念在哪实现 | `semantic_code_search` |
+| 谁调用 X / 改 X 影响什么 | `get_reverse_dependencies` |
+| 从 X 出发的调用链 | `trace_call_chain` |
+| 复杂度 / 耦合 / 风险 | `find_complexity_hotspots` / `agentic_quality` |
+
+**违规示例**（出现即视为违反本节）：
+
+- 用 `ls -la` 或 `ls crates/` 回答「项目结构」
+- 用 `glob **/bin/*.rs` 找「入口」
+- 用 `cat Cargo.toml` 回答「项目是做什么的」
+- 用 `grep -rn "handle_index"` 找函数定义 / 调用点
+- 用 `grep` 找 `struct X` / `enum Y` / `impl Z` / `pub fn f` 回答「它在哪、谁用它」
+
+**一条判据：搜符号用 codegraph，搜文本才 grep。**
+
+| 你手里的是 | 用什么 |
+|---|---|
+| 函数名 / 类型名 / 模块名 / trait 名 / 字段名 / 命令枚举变体 | `semantic_code_search` |
+| 字符串字面量 / 日志文案 / 错误信息 / 配置键值 / 文件路径 / 注释原话 | `grep` |
+
+边界例子：
+
+- `grep -rn "CODEGRAPH_SURREALDB_URL"` → 配置键，**合法**
+- `grep -rn "analyze_cargo_workspace"` → 函数名，**违规**，应走 `semantic_code_search`
+- `grep -rn "exclude_patterns"` → 字段名，**违规**
+
+**「我知道它叫什么」恰恰是应该用 codegraph 的理由，不是用 grep 的理由。**
+知道名字只省了「怎么问」，并不改变「这是符号定位」的性质。
+
+**降级到 read / grep 的唯一合法路径**（按顺序核验，不得凭印象判断）：
+
+1. `test -d .codegraph/db` 不存在 → 才算「未索引」
+2. 或 codegraph 调用返回空 / 报错 / 与源码明显不符
+3. 或确实是**文本**（上表右侧一列）、或**已知精确文件路径**的内容确认
+
+**每条豁免都要申报。** 用 `read` / `grep` / `ls` / `glob` 定位源码时，
+同一轮回答里必须写一句 `降级理由: <命中第几条>`。允许把一批合并申报一次，
+**不得静默降级**。没有申报的定位调用视为违规，即使结果正确。
+
+`ls` 输出中出现 `.codegraph/` 本身就是「已索引」的证据，不得据此降级。索引滞后只影响刚编辑的文件，
+不影响入口 / 架构类问题。
+
+**每轮自检**：本轮有没有 `read` / `grep` / `ls` / `glob` 命中源码位置？
+如果有，本轮的 codegraph 调用是哪一次？答不上来即为违规。
+
+### 工具选择（12 个）
+
+**直连图工具（0.3–1.3 秒，无 LLM）** —— 优先用这一层：
+
+| 问题 | 工具 | 必填参数 |
+|---|---|---|
+| 这个符号 / 概念在哪 | `semantic_code_search` | — |
+| 谁调用 / 依赖它 | `get_reverse_dependencies` | `node_id`, `edge_type` |
+| 它传递依赖了什么 | `get_transitive_dependencies` | `node_id`, `edge_type` |
+| 从它出发的调用链 | `trace_call_chain` | `node_id` |
+| 耦合度 | `calculate_coupling_metrics` | `node_id` |
+| 循环依赖 | `detect_circular_dependencies` | `edge_type` |
+| 复杂度热点 | `find_complexity_hotspots` | — |
+| 中心模块 | `get_hub_nodes` | — |
+
+**两条硬规则**：
+
+1. `node_id` 必须原样使用 `semantic_code_search` 返回的 ``nodes:`uuid` ``——保留反引号和前缀，不要自己拼
+2. `edge_type` 只能是：`calls` `defines` `uses` `imports` `extends` `implements` `contains` `references`
+
+**`agentic_*`（55 秒–2.5 分钟）** —— 只在需要「跨证据综合解释」时用，不要拿它做单符号查找：
+`agentic_context` · `agentic_impact` · `agentic_architecture` · `agentic_quality`
+
+**CLI 等价物（MCP 不可用时）**：
+
+```bash
+codegraph query <symbol> --callers              # 对应直连工具，3–5s
+codegraph agent context "..." --focus search    # 对应 agentic，22s+
+codegraph index . -r --index-tier balanced --languages rust
+```
+
+索引稳态 1.3 秒（无变化）至 2.7 分钟（全量 / 换模型）；用共享 SurrealDB server 后，
+**索引运行时可以同时查询**，不需要停 MCP。
+
+---
+
+## 环境状态核查（强制）
+
+适用于任何关于「当前配置 / 运行模式 / 进程 / 存储 / 端口 / 生效参数」的回答。
+上一节讲「怎么找代码」，本节讲「怎么断言状态」——**两者互不替代**。
+
+### 三条铁律
+
+**1. 缺失 ≠ 不存在。**
+
+从空输出 / 找不到 / `No such file` / 无匹配推出任何结论前，先问：
+「采集渠道本身会不会漏？」然后换一条独立路径复核。
+
+典型陷阱：`env | grep CODEGRAPH` 为空，但配置写在 `.env` 里——
+`codegraph-core` 自己会加载它（`config_manager.rs` 的 `load_dotenv`），
+它**从不进入 shell 环境**。渠道为空不等于事实为空。
+
+**2. 条件句必须验证条件。**
+
+引用注释 / README / `config/example.toml` 作依据时，若原句含
+`unless` / `if` / `when` / `except` / `除非` / `如果`，
+必须**显式写出该条件成立与否**，不得只引前半句。
+
+典型陷阱：`config/example.toml` 写的是
+「each project uses an embedded store at `<project>/.codegraph/db`
+**unless** `CODEGRAPH_SURREALDB_URL` points at a SurrealDB server」。
+引用了这句却没回答那个 `unless`，等同于没验证。
+
+**3. 副作用指令前先看运行态。**
+
+输出 `pkill` / `kill` / `rm` / `dd` / `codegraph index --force` /
+`codegraph stop` / 任何写库或改配置的指令前，必须先有**运行态证据**：
+`ps aux | grep` / `codegraph status --detailed` / `docker ps`。
+配置推断不足以支撑破坏性操作。
+
+本协议自身已有现成依据：见上文「用共享 SurrealDB server 后，
+索引运行时可以同时查询，不需要停 MCP」——**下停机指令前先读这一句**。
+
+### 强制输出格式
+
+涉及环境状态的回答，首段必须把三层分离：
+
+```text
+观察: <实际执行的命令 + 真实输出>
+推断: <由观察推出、但未验证的结论，逐条标 [未验证]>
+动作: <指令；仅在观察充分时给出>
+```
+
+**推断不得写成指令的形态。** 把未验证假设直接写成 `pkill ...`，即违规。
+
+### 停点
+
+- **矛盾信号**：同一轮内两个源互相打架（例如 `.gitignore` 里列了 `.env`，
+  而回答里说「没有本地配置」）时，**停下报告矛盾**，不许静默择一。
+- **结论依赖开关**（embedded / server、`index-tier`、feature flag、env 覆盖顺序）时，
+  把开关值列为**待验证项**，不许默认取一侧就往下推。
+
+### 本仓库存储模式三连（缺一条不算结论）
+
+```bash
+grep -E '^CODEGRAPH_SURREALDB_URL' .env                      # 配置源（回答 example.toml 的 unless）
+codegraph status --detailed                                  # 运行态
+docker ps --filter name=codegraph-db --format '{{.Status}}'   # 服务态
+```
+
+---
+
 ## Project Structure & Module Organization
 
 CodeGraph is a Rust 2024 workspace (Rust 1.95 or newer) that indexes code into a SurrealDB knowledge graph and exposes MCP and CLI agent tools. Source lives in `crates/codegraph-*/src/`: `core` holds shared types/configuration and artifact caching, `parser` captures sources and extracts syntax, `mcp` reconciles indexing and runs analyzers, `graph` handles storage, and `vector` provides embeddings/search. The CLI is `crates/codegraph-mcp-server/src/bin/codegraph.rs`; the agent backend lives in `codegraph-mcp-rig`.
@@ -89,6 +249,10 @@ and each candidate loop, rather than the whole tree's model-call count. Verify
 with `cargo test -p codegraph-mcp-rig --all-features --lib` and the full-feature
 `agent_cli_integration` mock tests before making runtime accuracy claims.
 
+> **以下 `codegraph:begin/end` 块由 `codegraph init` 自动维护**，只讲 CLI 用法。
+> 它与上文「探索协议」重复，**冲突时以本节上方的探索协议为准**（那里是 MCP 工具，更快）。
+> 该提示刻意放在块**外**：块内内容每次 `init` 都会被模板整块替换掉。
+
 <!-- codegraph:begin -->
 # codegraph
 
@@ -118,10 +282,31 @@ questions rather than repeating broad queries. After changes, verify against
 current source and run relevant tests; the index may lag uncommitted work.
 
 If CodeGraph is unavailable, the project is not indexed, a command fails or returns
-insufficient evidence, fall back to targeted source reads and rg/grep. Known file
-locations and exact-string verification also warrant direct reads/searches.
+insufficient evidence, fall back to targeted source reads and rg/grep.
+
+**Trigger.** If the question touches this repository's source — structure, location,
+relationship, call flow, or behavior — the first tool call must be CodeGraph, and it
+applies to the whole task (exploration, verification, debugging, locating code before
+an edit). "I just want to confirm" or "I roughly know where it is" is not an exemption.
+
+Decide by what you hold, not by how fast grep feels:
+
+- Symbol - a function, type, module, trait, field or command name -> use codegraph.
+  `grep "analyze_cargo_workspace"` is a symbol lookup, so it is not a fallback.
+- Text - a string literal, log line, error message, config key, file path or a
+  verbatim quote from a comment -> grep is correct. `grep "SURREALDB_URL"` is text.
+- Knowing the name already is the reason to use codegraph, not the reason to grep.
+- Every fallback used to locate source must state why in the same reply; an unstated
+  fallback is a violation even when the result is correct.
+- Fallback is allowed only when the project has no `.codegraph/db`, or the command
+  fails / returns empty / visibly disagrees with the source, or what you hold is text
+  or a known exact file path.
+- Per-turn self-check: if this turn's reads, greps or listings landed on a source
+  location, name the CodeGraph call that preceded them.
+
 Do not install CodeGraph, download models or reindex solely to satisfy these
 instructions. Agent queries use the configured model and may incur provider costs.
 Use the four public agent commands; internal graph tools belong to CodeGraph's
 built-in agents. Reload usage details with `codegraph agent instructions`.
 <!-- codegraph:end -->
+

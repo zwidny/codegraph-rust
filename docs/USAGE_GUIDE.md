@@ -4,6 +4,48 @@ How to get the most out of CodeGraph when working with AI coding assistants.
 
 ---
 
+## Current tool set
+
+The MCP server exposes **12 tools**. Use these names — the older `agentic_*` names in the
+sections below are kept only as a mental model for *when* to use each capability.
+
+**8 direct graph tools (no LLM, ~0.3–1.3s)**
+
+| Tool | Answers |
+|---|---|
+| `semantic_code_search` | Where is this concept? Returns the `node_id` every other tool needs |
+| `get_reverse_dependencies` | Who calls/depends on this |
+| `get_transitive_dependencies` | Transitive dependency closure |
+| `trace_call_chain` | Call path from a node |
+| `calculate_coupling_metrics` | Coupling for a node/module |
+| `detect_circular_dependencies` | Dependency cycles |
+| `find_complexity_hotspots` | Complexity hotspots |
+| `get_hub_nodes` | High-degree hubs |
+
+**4 agentic tools (LLM workflow, ~55s–2.5min)**
+
+`agentic_context` · `agentic_impact` · `agentic_architecture` · `agentic_quality`
+
+Old → new mapping:
+
+| Was | Now |
+|---|---|
+| `agentic_code_search` | `semantic_code_search` |
+| `agentic_dependency_analysis` | `get_reverse_dependencies` / `get_transitive_dependencies` |
+| `agentic_call_chain_analysis` | `trace_call_chain` |
+| `agentic_architecture_analysis` | `agentic_architecture` |
+| `agentic_api_surface_analysis` | `agentic_architecture` (`focus: "api_surface"`) |
+| `agentic_context_builder` | `agentic_context` (`focus: "builder"`) |
+| `agentic_semantic_question` | `agentic_context` (`focus: "question"`) |
+
+`node_id` must be used verbatim from a prior search result (`nodes:<uuid>`). Filtering is by
+`threshold` on `vector_score`; the default is 0.4, lower it to 0.2–0.3 for natural-language
+recall.
+
+For new-machine setup and OpenCode MCP wiring, see [OPENCODE_QUICKSTART](OPENCODE_QUICKSTART.md).
+
+---
+
 ## CLI access for code agents
 
 Run the four public tools directly with `codegraph agent context|impact|architecture|quality`.

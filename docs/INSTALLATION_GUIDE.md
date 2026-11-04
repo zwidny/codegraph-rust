@@ -50,7 +50,7 @@ allowlist, for example `CODEGRAPH_HTTP_ALLOWED_HOSTS=localhost,codegraph.example
 - **A model provider** for embeddings and for the agentic tools: [Ollama](https://ollama.com) or LM Studio locally, or an API key for Anthropic, OpenAI, xAI or Jina. See `docs/AI_PROVIDERS.md`.
 - **macOS** for the installer scripts (Linux users can run the `cargo install` command directly). The scripts use Homebrew.
 
-No database is required. SurrealDB is embedded in the binary and each project gets its own store. A separate SurrealDB server is optional; see [Optional: Using a SurrealDB Server](#optional-using-a-surrealdb-server).
+No separate database installation is required. CodeGraph runs against a shared SurrealDB server (recommended), or against an embedded per-project store when `CODEGRAPH_SURREALDB_URL` is unset. The embedded store is a compatibility fallback: it is substantially slower and allows one process per project. See [Using a SurrealDB Server](#optional-using-a-surrealdb-server).
 
 Balanced and full indexing tiers additionally need the language servers for the languages you index (for example `rust-analyzer`); the default fast tier does not.
 
@@ -102,7 +102,7 @@ Init does the per-project setup in one pass:
 
 1. Offers project-local guidance hooks for **Claude Code, Codex, both, or none**, and skips the prompt when CodeGraph hooks are already installed.
 2. Adds or refreshes a managed `# codegraph` section in the project's `AGENTS.md` and `CLAUDE.md`, leaving the rest of those files alone.
-3. Loads the project's `.env` and configuration and indexes the project recursively. On first use this creates the embedded store at `<project>/.codegraph/db` with the bundled schema and a `.gitignore` that keeps it out of version control.
+3. Loads the project's `.env` and configuration and indexes the project recursively. When `CODEGRAPH_SURREALDB_URL` is unset, first use creates the embedded fallback store at `<project>/.codegraph/db` with the bundled schema and a `.gitignore` that keeps it out of version control; with a shared server the schema must already be applied.
 
 For scripts and CI, pass the choices explicitly:
 
@@ -123,7 +123,8 @@ Settings are resolved in this order, later sources overriding earlier ones:
 
 1. `./.codegraph.toml` in the directory you run from (project-level)
 2. `~/.codegraph/config.toml` (user-level; create it with `codegraph config init`)
-3. `.env` in the working directory, then `~/.codegraph.env`
+3. `.env` in the working directory, then `~/.codegraph.env` as a fallback for keys the
+   project did not set (put shared defaults in `~/.codegraph.env`, project differences in `.env`)
 4. `CODEGRAPH_*` environment variables
 
 For provider-specific examples (Ollama, LM Studio, Jina, OpenAI, xAI, Anthropic, OpenAI-compatible), see `docs/AI_PROVIDERS.md`.
@@ -161,7 +162,7 @@ exclude_patterns = ["**/node_modules/**", "**/target/**", "**/.git/**"]
 level = "info"
 ```
 
-Storage has no config-file section: the embedded per-project store is used unless `CODEGRAPH_SURREALDB_URL` is set.
+Storage has no config-file section: set `CODEGRAPH_SURREALDB_URL` (plus the `CODEGRAPH_SURREALDB_*` variables) to use a shared server, which is the recommended setup. Without it, the embedded per-project store is used as a compatibility fallback; it is substantially slower and single-writer.
 
 The built-in agent resolves each LLM setting in three steps: the environment variable (a project `.env` counts), then the key in the config file's `[llm]` section, then a default. `enabled = false` in `[llm]` makes the agent ignore the section, and API keys are read from the environment only. `codegraph config agent-status` shows the provider, model and tier in effect; [AI_PROVIDERS.md](AI_PROVIDERS.md) lists every variable and key.
 
@@ -260,11 +261,36 @@ codegraph db-check                                             # prints the stor
 codegraph agent context "Where is the main entry point?" --focus search
 ```
 
-Only one process can hold a project's embedded store at a time. If a `codegraph start` server for the same project has already answered a tool call, stop it before running `codegraph index`; otherwise the index command reports that the database is open in another process.
+With the recommended shared server (`CODEGRAPH_SURREALDB_URL`), reads and indexing run concurrently, so this restriction does not apply. The **embedded** fallback takes an exclusive file lock, so only one process can hold it at a time: if a `codegraph start` server for the same project has already answered a tool call, stop it before running `codegraph index`, otherwise the index command reports that the database is open in another process.
 
 ---
 
 ## Running the MCP Server
+
+### With OpenCode
+
+Use a **project-level** `<project>/.opencode/opencode.json` with the `mcp.servers` structure.
+Do not also register it in the global config: two registrations start two stdio instances.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "codegraph": {
+        "type": "local",
+        "command": ["/full/path/to/codegraph", "start", "stdio"],
+        "cwd": "/path/to/project",
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+Verify with `opencode mcp list` (expect `codegraph  connected`), then restart OpenCode so the
+MCP `initialize` handshake picks up the binary and its instructions.
+See [OPENCODE_QUICKSTART](OPENCODE_QUICKSTART.md) for the full new-machine and new-project flow.
 
 ### With Claude Code
 
@@ -470,7 +496,7 @@ python tools/view_debug_logs.py --follow
 
 ## Optional: Using a SurrealDB Server
 
-Skip this section unless you want several machines or processes to share one database, or you use Surreal Cloud. With a server, set these in `.env` and CodeGraph connects to it instead of the embedded store:
+Point CodeGraph at a shared SurrealDB server in `.env`. This is the recommended setup: indexing and queries are substantially faster than the embedded fallback, and a read-only MCP client can run alongside `codegraph index`. Keep the embedded fallback only when you need a fully self-contained, offline machine.
 
 ```bash
 CODEGRAPH_SURREALDB_URL=ws://localhost:3004
@@ -585,8 +611,8 @@ You should see tables like `nodes`, `edges`, `chunks`, `symbol_embeddings`, and 
 ### Common Issues
 
 **"The embedded database ... is open in another process"**
-- Another `codegraph` process holds this project's store. Stop the running `codegraph start` (or the other client's server) and retry.
-- One MCP client per project at a time; use server mode if several must share a database.
+- Another `codegraph` process holds this project's embedded store. Stop the running `codegraph start` (or the other client's server) and retry.
+- Embedded mode allows one MCP client per project at a time. If several clients, or a client plus `codegraph index`, must share a database, set `CODEGRAPH_SURREALDB_URL` to a shared server: server mode has no per-client file lock and allows concurrent reads and indexing.
 
 **"Embedded database was created from the ... schema at a different revision"**
 - The store keeps the schema it was created with. To move to the current schema, stop all `codegraph` processes, delete `<project>/.codegraph/db` and run `codegraph index` again.

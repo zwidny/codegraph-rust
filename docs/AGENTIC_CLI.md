@@ -143,8 +143,10 @@ selects another executable. `--project-id` and `--config` match the CLI's overri
 Each CLI process loads the selected project's environment; the Python script does
 not load this repository's `.env` or start an MCP server. Use your existing model
 configuration; agent queries can incur provider costs. The embedded database accepts
-one process at a time, so finish indexing and stop an MCP server holding that store
-before running the tests. Cases run sequentially.
+one process at a time, so in embedded mode finish indexing and stop an MCP server
+holding that store before running the tests. With `CODEGRAPH_SURREALDB_URL` set, the
+shared server allows concurrent reads and indexing, so those tests can run alongside a
+live MCP server. Cases run sequentially.
 
 Questions, focuses and 600-second deadlines are shared in `agentic_test_cases.py`
 so HTTP and CLI inputs stay identical. `--tool` and `--case` can be repeated;

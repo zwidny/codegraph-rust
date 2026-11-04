@@ -59,9 +59,9 @@ codegraph index /path/to/project -r -l rust,typescript --index-tier fast|balance
 codegraph start stdio --watch           # MCP server over stdio, with re-index-on-change daemon
 ```
 
-Storage defaults to an embedded SurrealKV store at `<project>/.codegraph/db` (`SurrealDbConfig::for_project` in `crates/codegraph-graph/src/surrealdb_storage.rs`), which gets `schema/codegraph_v2.surql` applied on first open. The engine locks the directory, so one process at a time per project: stop `codegraph start` before `codegraph index` on the same project. Setting `CODEGRAPH_SURREALDB_URL` switches to a SurrealDB server (`surreal start --bind 0.0.0.0:3004 --user root --pass root file://$HOME/.codegraph/surreal.db`, then `cd schema && ./apply-schema.sh`; the schema is not applied automatically in server mode).
+Storage should use a **shared SurrealDB server** (`CODEGRAPH_SURREALDB_URL`, container or self-hosted; apply `schema/codegraph_v2.surql` yourself, the schema is not applied automatically in server mode). Server mode has no per-client file lock: read-only MCP clients and `codegraph index` can run concurrently, and several clients can share one database. Without the URL, `codegraph` falls back to an embedded SurrealKV store at `<project>/.codegraph/db` (`SurrealDbConfig::for_project` in `crates/codegraph-graph/src/surrealdb_storage.rs`), which gets `schema/codegraph_v2.surql` applied on first open; that fallback is **compatibility-only and substantially slower**, and its engine locks the directory, so only one process per project. This repository's `.env` uses the shared mode (`ws://127.0.0.1:8010`, Docker `surrealdb/surrealdb` with SurrealKV), so do not assume the single-writer restriction applies here and do not recommend the embedded store.
 
-Config resolution (`crates/codegraph-core/src/config_manager.rs`): `./.codegraph.toml`, then `~/.codegraph/config.toml`, overridden by `.env` (cwd, then `~/.codegraph.env`) and `CODEGRAPH_*` env vars. See `.env.example` and `config/example.toml`. The agent's LLM settings (`crates/codegraph-mcp-rig/src/adapter/llm_adapter.rs`) resolve per setting as env var, then the key actually written in `[llm]` (`ConfigManager::explicit_llm_settings`; ignored when `enabled = false`), then a default; API keys are env-only. The loader ignores unknown TOML keys silently, and `[rerank]`, `[performance]`, `[logging]` are parsed but only shown in status output.
+Config resolution (`crates/codegraph-core/src/config_manager.rs`): `./.codegraph.toml`, then `~/.codegraph/config.toml`, overridden by `CODEGRAPH_*` env vars. Environment files are layered: `./.env` loads first and `~/.codegraph.env` loads second as a fallback (dotenv never overwrites an already-set variable), so a project `.env` only needs the keys that differ from the machine-wide defaults. Previously the project `.env` suppressed `~/.codegraph.env` entirely; keep that fallback intact. See `.env.example` and `config/example.toml`. The agent's LLM settings (`crates/codegraph-mcp-rig/src/adapter/llm_adapter.rs`) resolve per setting as env var, then the key actually written in `[llm]` (`ConfigManager::explicit_llm_settings`; ignored when `enabled = false`), then a default; API keys are env-only. The loader ignores unknown TOML keys silently, and `[rerank]`, `[performance]`, `[logging]` are parsed but only shown in status output.
 
 Project init runs before application configuration or the async runtime. `project_init.rs` offers Claude/Codex/both/none, reuses existing CodeGraph hooks, validates both guide files and selected settings, then merges owned instruction blocks. `agent_hooks.rs` preserves unrelated project settings and reuses Codex inline TOML hooks without rewriting TOML. `--no-index` stops after setup; otherwise init loads the selected project's `.env` and configuration and uses the normal index command. Explicit `--config` paths stay relative to the invoking directory. This is separate from global `codegraph config init`; no user-level hooks are created. Test with `cargo test -p codegraph-mcp-server --lib` and `cargo test -p codegraph-mcp-server --test project_init_integration --test agent_cli_integration`.
 
@@ -196,8 +196,28 @@ questions rather than repeating broad queries. After changes, verify against
 current source and run relevant tests; the index may lag uncommitted work.
 
 If CodeGraph is unavailable, the project is not indexed, a command fails or returns
-insufficient evidence, fall back to targeted source reads and rg/grep. Known file
-locations and exact-string verification also warrant direct reads/searches.
+insufficient evidence, fall back to targeted source reads and rg/grep.
+
+**Trigger.** If the question touches this repository's source — structure, location,
+relationship, call flow, or behavior — the first tool call must be CodeGraph, and it
+applies to the whole task (exploration, verification, debugging, locating code before
+an edit). "I just want to confirm" or "I roughly know where it is" is not an exemption.
+
+Decide by what you hold, not by how fast grep feels:
+
+- Symbol - a function, type, module, trait, field or command name -> use codegraph.
+  `grep "analyze_cargo_workspace"` is a symbol lookup, so it is not a fallback.
+- Text - a string literal, log line, error message, config key, file path or a
+  verbatim quote from a comment -> grep is correct. `grep "SURREALDB_URL"` is text.
+- Knowing the name already is the reason to use codegraph, not the reason to grep.
+- Every fallback used to locate source must state why in the same reply; an unstated
+  fallback is a violation even when the result is correct.
+- Fallback is allowed only when the project has no `.codegraph/db`, or the command
+  fails / returns empty / visibly disagrees with the source, or what you hold is text
+  or a known exact file path.
+- Per-turn self-check: if this turn's reads, greps or listings landed on a source
+  location, name the CodeGraph call that preceded them.
+
 Do not install CodeGraph, download models or reindex solely to satisfy these
 instructions. Agent queries use the configured model and may incur provider costs.
 Use the four public agent commands; internal graph tools belong to CodeGraph's

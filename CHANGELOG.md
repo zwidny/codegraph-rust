@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Environment file layering
+
+- `ConfigManager::initialize_environment` now loads `./.env` first and `~/.codegraph.env`
+  second instead of stopping at the first file it finds. `dotenv` never overwrites an
+  already-set variable, so project values win and the user file only fills the keys the
+  project omitted. Previously any project `.env` suppressed `~/.codegraph.env` entirely,
+  which forced every project to repeat the same machine-wide settings.
+- Docs (`README_DEV_GUIDE`, `config/README`, `INSTALLATION_GUIDE`, `AI_PROVIDERS`,
+  `.env.example`, `CLAUDE.md`) describe the layered behavior and recommend keeping shared
+  defaults in `~/.codegraph.env` with only project differences in the project `.env`.
+- Covered by `crates/codegraph-core/tests/env_precedence.rs`.
+
+### Added - Tool result interpretability
+
+- `semantic_code_search` now returns a `score_semantics` object naming each score:
+  `vector_score` (cosine similarity, the one `threshold` filters on), `text_score`
+  (BM25), and `combined_score` (RRF rank, `1/(60+rank)`, ordering only). Tool
+  descriptions state the same, so an RRF rank is no longer mistaken for confidence.
+- An empty `get_reverse_dependencies` result now carries a `diagnostics` object:
+  whether the node exists, its kind, the incoming/outgoing edge types that do exist,
+  and a `suggested_call` that retries with one of them. Type/container nodes with no
+  edges are called out explicitly instead of returning a bare `[]`.
+- `GraphFunctions::get_node_edge_summary` backs those diagnostics with one
+  project-scoped query; failures never turn an empty result into an error.
+
+### Changed - Storage documentation
+
+- README, INSTALLATION_GUIDE, AI_PROVIDERS, AGENTIC_CLI, CLAUDE.md and `.env.example` now
+  present a **shared SurrealDB server** (`CODEGRAPH_SURREALDB_URL`, e.g. the Docker
+  container) as the recommended setup. The embedded SurrealKV store is documented as a
+  compatibility fallback: substantially slower, single writer per project, no per-client
+  concurrency. The fallback itself is unchanged and still applies when the URL is unset.
+
 ### Changed - Project agent guidance
 
 - `codegraph init` now explicitly describes CodeGraph as a CLI tool available

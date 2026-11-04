@@ -74,6 +74,15 @@ fn all_hook_choices_install_only_selected_harnesses_and_merge_both_guides() {
                 assert!(text.contains("using your Bash or shell execution tool"));
                 assert!(text.contains("`command -v codegraph`"));
                 assert!(!text.contains("Old guidance."));
+                // The shipped rule must stay decidable: a symbol/text split plus a
+                // stated reason for any fallback. Vague wording such as
+                // "exact-string verification" let grep pass as legitimate for symbols.
+                assert!(text.contains("Decide by what you hold"));
+                assert!(text.contains("is a symbol lookup, so it is not a fallback"));
+                assert!(text.contains("must state why in the same reply"));
+                assert!(!text.contains("exact-string verification"));
+                // An unclosed fence would make visible_lines bail on the next init.
+                assert_eq!(text.matches("```").count() % 2, 0);
                 for tool in ["context", "impact", "architecture", "quality"] {
                     assert!(text.contains(&format!("codegraph agent {tool}")));
                 }

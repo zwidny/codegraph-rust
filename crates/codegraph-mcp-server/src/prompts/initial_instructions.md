@@ -1,5 +1,135 @@
 # CodeGraph Usage Guide
 
+## Mandatory usage policy — read this first
+
+These rules apply to **every** agent session that has this MCP server connected,
+regardless of which client or model drives it. They are not optional guidance.
+
+**Trigger.** If the question touches this repository's source — structure, location,
+relationship, call flow, or "what does X do" — the **first** tool call must be a
+CodeGraph tool (direct graph tools first; `agentic_*` only for synthesis). This holds
+for the whole task, not just the first turn: exploration, verification, debugging,
+locating code before an edit. "I just want to confirm", "I roughly know where it is"
+and "grep feels faster" are **not** exemptions.
+
+**One criterion: symbols go to CodeGraph, text goes to grep.**
+
+| In your hand | Use |
+|---|---|
+| function / type / module / trait / field / command variant name | `semantic_code_search` |
+| string literal, log line, error message, config key, file path, verbatim comment | `grep` |
+
+Answering "what is this project / where is the entry point / how is it structured"
+with `ls`, `glob`, `cat Cargo.toml` or a hand-written grep is a violation — use
+`get_hub_nodes`, `agentic_architecture` or `semantic_code_search` instead.
+
+Knowing the name already is the reason to use CodeGraph, not the reason to grep.
+
+**Fallback is allowed only when** (verify in this order, never decide from memory):
+
+1. the project has no `.codegraph/db` — only then is it "not indexed";
+2. or a CodeGraph call returns empty, errors, or visibly disagrees with the sources;
+3. or what you hold is **text** (right column above), or you are confirming the
+   contents of a **known exact file path**.
+
+**Declare every fallback.** When `read` / `grep` / `ls` / `glob` is used to locate
+source, the same reply must contain `fallback: <which rule above>`; batch them into
+one line when possible. An unstated fallback is a violation even when the result is
+correct. The presence of `.codegraph/` in an `ls` listing is itself evidence that the
+project is indexed, and must not be used to justify a fallback.
+
+**Per-turn self-check.** Did this turn's `read` / `grep` / `ls` / `glob` land on a
+source location? If yes, which CodeGraph call in this turn preceded it? No answer
+means the policy was violated.
+
+---
+
+## Direct graph tools (no LLM, 0.3–3s) — start here
+
+Eight tools query the code graph directly. They are **20–100× faster** than the
+`agentic_*` tools (which run a full LLM workflow, 55s–2.5min) and they return
+raw structured data you can compose yourself. **Prefer these for concrete
+questions; reach for `agentic_*` only when you need a synthesized explanation.**
+
+| Question | Tool | Required params |
+|---|---|---|
+| Where is this concept / find related code | `semantic_code_search` | — (`query`, `limit`, `threshold`) |
+| Who calls / depends on this node | `get_reverse_dependencies` | `node_id`, `edge_type` |
+| What does this node depend on (transitive) | `get_transitive_dependencies` | `node_id`, `edge_type` |
+| Trace the call chain starting here | `trace_call_chain` | `node_id` |
+| Coupling metrics for a node/module | `calculate_coupling_metrics` | `node_id` |
+| Detect circular dependency cycles | `detect_circular_dependencies` | `edge_type` |
+| Complexity hotspots | `find_complexity_hotspots` | — (`min_complexity`, `limit`) |
+| High-degree hub nodes | `get_hub_nodes` | — (`min_degree`) |
+
+### Getting a `node_id`
+
+You almost always start with a name, not an id:
+
+```json
+{"query": "chunk overlap tokens", "limit": 5}
+```
+
+`semantic_code_search` returns `result[i].node_id` shaped like
+``nodes:`0f0f013b-df13-d632-1366-59ce8ed1c0b5` ``. Pass that **verbatim** to the
+node tools — do not strip the backticks or the `nodes:` prefix, and do not
+construct ids yourself.
+
+### `edge_type` values
+
+`calls` · `defines` · `uses` · `imports` · `extends` · `implements` ·
+`contains` · `references`
+
+For "who invokes this function" use `calls`. For "what pulls this module in"
+use `imports`.
+
+---
+
+## Recommended workflows
+
+### 1. Change safety check (before editing)
+
+```
+1. semantic_code_search("the symbol or concept")     → node_id, file:line
+2. get_reverse_dependencies(node_id, "calls", 1)     → who breaks if I change it
+3. Read the files listed above                       → confirm current code
+4. Edit
+```
+
+### 2. Understand a flow (debugging)
+
+```
+1. semantic_code_search("symptom or module")         → entry node_id
+2. trace_call_chain(node_id, 3)                      → the call path
+3. get_transitive_dependencies(node_id, "calls", 2)  → what it reaches
+4. Read the specific files identified
+```
+
+### 3. Architecture survey
+
+```
+1. get_hub_nodes(30)                                 → central modules
+2. detect_circular_dependencies("imports")           → layering problems
+3. find_complexity_hotspots(10, 20)                  → risky areas
+4. Only now, if you need a narrative: agentic_architecture({"query": "..."})
+```
+
+### 4. When to use `agentic_*` instead
+
+Use the agentic tools when the question needs **synthesis across evidence** and
+you would otherwise chain 4+ graph calls yourself:
+
+- "How does provider selection work end to end?"
+- "What are the architectural risks in the indexing pipeline?"
+- "Gather everything I need to implement feature X"
+
+Cost: 55s–2.5min per call. Never use them for a single symbol lookup — that is
+what the direct tools are for.
+
+---
+
+## Tool Selection (agentic, slower)
+
 ## When to Use CodeGraph Tools
 
 Use CodeGraph tools as your **first choice** for understanding code. They return synthesized, relevant information instead of raw file contents, saving context for actual work.

@@ -12,7 +12,8 @@ It is based on the runtime configuration loader in `crates/codegraph-core/src/co
 When CodeGraph starts, it loads configuration in this order:
 
 1. `.env` in the current directory (if present)
-2. `~/.codegraph.env` (if present)
+2. `~/.codegraph.env` as a fallback for keys the project `.env` did not set (shared defaults
+   belong here; both files layer, they do not replace each other)
 3. A TOML config file:
    - `./.codegraph.toml` (project-local), else
    - `~/.codegraph/config.toml` (user-global)
@@ -33,7 +34,7 @@ If you use `.env`, it’s loaded automatically at startup (you do not need `dire
 ### Local (Ollama embeddings + Ollama LLM)
 
 ```bash
-# SurrealDB server (optional; omit to use the embedded per-project store)
+# SurrealDB shared server (recommended; without it, an embedded per-project store is used as a slower fallback)
 CODEGRAPH_SURREALDB_URL=ws://localhost:3004
 CODEGRAPH_SURREALDB_NAMESPACE=ouroboros
 CODEGRAPH_SURREALDB_DATABASE=codegraph
