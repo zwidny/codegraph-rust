@@ -598,8 +598,6 @@ Same questions, same repository, same inspection budget. These retrieval numbers
 [mcp_value.py](scripts/benchmarks/mcp_value.py); no LLM is involved, so "read" stands in for
 token cost — it is what an agent would have to pull into its context.
 
-### Retrieval: where / who calls / what it reaches
-
 | Scenario | Project | Metric | grep baseline | CodeGraph | Delta |
 |---|---|---|---|---|---|
 | Locate a symbol | Rust (251 files) | hit@1 · read | 79% · 67.5 KB | **93% · 18.1 KB** | +14 pt · **−73% read** |
@@ -614,25 +612,6 @@ files: at depth 2 the grep path needs ~20 searches and 6–22 seconds, while the
 in one call. Where the name is already known, grep stays competitive and on Python it wins —
 CodeGraph is not a grep replacement for that case.
 
-### Agent: real merged commits, real edits
-
-One task = one merged fix; ground truth = the files that commit touched. Same model
-(`deepseek-flash`), same prompt, same 18-step budget; only the tool list differs. LLM tokens
-are measured from the API response, not estimated.
-
-| Metric | Without CodeGraph | With CodeGraph | Delta |
-|---|---|---|---|
-| Solved | 17% (1/6) | 33% (2/6) | +1 task |
-| **LLM tokens / task** | 111,855 | 113,835 | +2% |
-| **Seconds / task** | 22 | 26 | +18% |
-| Tool calls / task | 16.5 | 17.2 | +4% |
-| Runs that never edited | 5/6 | 4/6 | −1 |
-
-`n=6` cannot support a rate claim, and 9 of 12 runs emitted no edit at all — this layer
-measures whether the model commits to writing, not which tools it has. The one clean
-separation (t01) shows the shape of the benefit: two `semantic_code_search` calls, then
-three patches, versus 18 steps of reading without an edit.
-
 Full method, per-task traces and known limitations:
 [docs/evaluations/mcp-value-2026-11-04.md](docs/evaluations/mcp-value-2026-11-04.md).
 
@@ -642,7 +621,6 @@ Reproduce:
 python3 scripts/benchmarks/mcp_value.py --generate 14       # locate
 python3 scripts/benchmarks/mcp_value.py --mode impact       # who calls
 python3 scripts/benchmarks/mcp_value.py --mode chain --depth 2
-python3 scripts/benchmarks/agent_value.py --tasks 6 --max-steps 18
 ```
 
 ---
