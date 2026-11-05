@@ -15,6 +15,10 @@ graph arm does embed the query, which is why its latency is higher on the locate
 | What does X reach? (depth 2) | Rust | 26% recall · 12% precision · 101 KB · 0.13 s | **100%** · 94% · **10.8 KB** · 0.24 s | graph gives the only usable answer |
 | What does X reach? (depth 2) | Python | 15% · 7% · 78 KB · 0.15 s | **100%** · 100% · **18.2 KB** · 0.17 s | same |
 
+`grep`'s caller **recall is not comparable evidence**: it counts every textual mention of the
+name (definition, comments, strings), so a true caller file is almost always hit even when
+grep misattributes the hit. Read the caller rows by **precision** — 70% vs 100% — not recall.
+
 The honest read: for *"where is this symbol"*, grep is better — it reads less and answers in
 milliseconds, and on Python it is also more accurate. The graph earns its cost on
 **relationships**: caller lists become precise instead of a pile of textual matches, and a
