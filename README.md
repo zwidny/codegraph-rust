@@ -9,7 +9,7 @@ graph arm does embed the query, which is why its latency is higher on the locate
 | Question | Repo | grep | CodeGraph | Result |
 |---|---|---|---|---|
 | Where is X defined? | Rust | 79% hit@1 · 10.2 KB · 8 ms | **93%** · 15.6 KB · 0.75 s | graph is more accurate; grep is cheaper and far faster |
-| Where is X defined? | Python | **86%** · 3.9 KB · 8 ms | 64% · 19.4 KB · 0.8 s | grep wins outright |
+| Where is X defined? | Python | **86%** · 3.9 KB · 8 ms | 64% · 17.3 KB · 0.96 s | grep wins outright |
 | Who calls X? | Rust | 94% recall · 70% precision · 8.5 KB · 6 ms | 93% · **100%** · 6.3 KB · 0.12 s | graph trades latency for precision |
 | Who calls X? | Python | 100% · 69% · 9.2 KB · 8 ms | 100% · **100%** · 5.7 KB · 0.12 s | same trade-off |
 | What does X reach? (depth 2) | Rust | 26% recall · 12% precision · 101 KB · 0.13 s | **100%** · 94% · **10.8 KB** · 0.24 s | graph gives the only usable answer |
@@ -26,9 +26,8 @@ two-hop question that grep answers at 15–26% recall becomes answerable at all.
 per query stays between 6 and 18 KB in every case.
 
 CodeGraph bytes are measured with the default `content_chars` cap (code snippets truncated to
-2000 chars). The earlier full-payload figure for the Rust locate row (18.1 KB / 19.2 KB
-median) is superseded by 15.6 KB / 16.3 KB; the Python row still reflects the older, uncapped
-measurement and is kept only for comparison.
+2000 chars). Both locate rows are re-measured under that cap: Rust 15.6 KB / 16.3 KB median
+(was 18.1 / 19.2 full), Python 17.3 KB / 17.8 KB median (was 19.4 / 19.9 full).
 
 ### On a real agent (opencode + SWE-bench)
 
