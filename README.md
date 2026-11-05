@@ -21,6 +21,21 @@ milliseconds, and on Python it is also more accurate. The graph earns its cost o
 two-hop question that grep answers at 15–26% recall becomes answerable at all. Reading cost
 per query stays between 6 and 18 KB in every case.
 
+### On a real agent (opencode + SWE-bench)
+
+The rows above are deterministic retrieval. To check the agent layer, a real SWE-bench
+Multilingual Rust instance was run by **opencode itself** (`opencode run --standalone`, its
+own agent loop and MCP calls, `deepseek-flash`) — not a purpose-built harness.
+
+- **Graph tools are used without extra prompting**, and dropping them made the agent slower,
+  not cheaper: **58 steps / 5.0M prompt tokens** without CodeGraph vs **42 / 3.6M** with it.
+  Without it the agent fell back to shell/grep trial-and-error and hung on `bat` stdin.
+- **The patch shape was set by process rules, not the tool.** The same agent over-engineered
+  the `-pp` fix (a 63-line restructure) with no TDD/minimal-change instruction, and matched
+  the one-line upstream fix when TDD + minimal change were required.
+- **The upstream fix only covered `-P`**; `-pp` stayed broken, and completing both takes a
+  21-line `match` guard — not a reimplementation.
+
 Full method, per-task traces and limitations:
 [docs/evaluations/mcp-value-2026-11-04.md](docs/evaluations/mcp-value-2026-11-04.md).
 
