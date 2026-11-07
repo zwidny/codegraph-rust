@@ -4,6 +4,7 @@ Welcome to the comprehensive documentation for the CodeGraph project.
 
 ## Guides
 
+- [How CodeGraph works (overview)](OVERVIEW.md)
 - [Installation & setup](INSTALLATION_GUIDE.md)
 - [Usage guide (for AI assistants)](USAGE_GUIDE.md)
 - [Agentic CLI commands and Claude Code/Codex hooks](AGENTIC_CLI.md)
