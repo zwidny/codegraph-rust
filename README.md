@@ -454,130 +454,64 @@ With CodeGraph, the agent gets *pinpointed locations and relationships* (plus bo
 
 ---
 
-## Quick Start
+## Quick Start: add CodeGraph to a project
 
-### 1. Install
+CodeGraph indexes a project once and then serves that graph to coding agents over MCP. The
+walkthrough uses a real local project, `~/repos/github.com/paperclip` (TypeScript); substitute
+your own path.
 
 ```bash
-# Clone and build with all features
+PROJECT=~/repos/github.com/paperclip
+```
+
+### 0. What you need (once)
+
+- `codegraph` on your `PATH` (install in step 1).
+- A **shared SurrealDB server** — the examples use `ws://127.0.0.1:8010`.
+- An **embedding provider** for indexing. An **LLM** is only needed for the agentic tools
+  (`codegraph agent ...`), not for indexing or the graph MCP tools.
+
+### 1. Install (build once)
+
+```bash
 git clone https://github.com/Jakedismo/codegraph-rust
 cd codegraph-rust
 ./install-codegraph-full-features.sh
 ```
 
-#### macOS faster builds (LLVM lld)
-
-If you develop on macOS, you can opt into LLVM's `lld` linker for faster linking:
+macOS faster builds (LLVM lld):
 
 ```bash
-# Install LLVM so ld64.lld is on PATH (Homebrew)
 brew install llvm
-
-# Use the repo-provided Makefile targets
 make build-llvm
-make test-llvm
 ```
 
-### 2. Configure Your Providers
+### 2. Configure providers
 
-CodeGraph needs an embedding model for indexing and an LLM for the agentic tools. Put the
-settings in a `.env` file in your project (or export them); `codegraph init` loads it.
+Put these in a `.env` in the project, or in `~/.codegraph.env` (read for every project).
+`codegraph init` loads the project `.env`.
 
 ```bash
-# Embeddings
+# Embeddings (required to index)
 CODEGRAPH_EMBEDDING_PROVIDER=ollama          # ollama | lmstudio | jina | openai | onnx
 CODEGRAPH_EMBEDDING_MODEL=qwen3-embedding:0.6b
 CODEGRAPH_EMBEDDING_DIMENSION=1024
 
-# Agent LLM
-CODEGRAPH_LLM_PROVIDER=anthropic             # ollama | lmstudio | anthropic | openai | xai | openai-compatible
+# Agent LLM (only for `codegraph agent`, not for the MCP graph tools)
+CODEGRAPH_LLM_PROVIDER=anthropic
 CODEGRAPH_LLM_MODEL=claude-sonnet-4
-CODEGRAPH_CONTEXT_WINDOW=200000              # your model's real limit; selects the prompt tier
+CODEGRAPH_CONTEXT_WINDOW=200000
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Set the model explicitly: without one the agent requests its provider's built-in default.
-The same settings can live in the `[llm]` section of a config file instead (see
-[Configuration](#configuration)); environment variables win. `.env.example` lists every
-supported variable, and [AI_PROVIDERS.md](docs/AI_PROVIDERS.md) has per-provider examples.
+Every variable is listed in `.env.example`; per-provider examples are in
+[AI_PROVIDERS.md](docs/AI_PROVIDERS.md). Environment variables override any config file, and
+the same settings can live in a `[llm]` / `[embedding]` config section (see
+[Configuration](https://github.com/Jakedismo/codegraph-rust#configuration)).
 
-For Jina v5 embeddings, use the supported retrieval tasks:
+### 3. Database (shared server, the default)
 
-```bash
-CODEGRAPH_EMBEDDING_PROVIDER=jina
-CODEGRAPH_EMBEDDING_MODEL=jina-embeddings-v5-text-small
-CODEGRAPH_EMBEDDING_DIMENSION=1024
-JINA_API_KEY=...
-JINA_API_TASK=retrieval.passage
-JINA_TRUNCATE=true
-JINA_NORMALIZED=true
-```
-
-An explicit `JINA_API_TASK=retrieval.query` is honored too. `JINA_API_TASK` takes
-precedence over legacy `JINA_TASK` and TOML `[embedding] jina_task`. Unset tasks
-default to `retrieval.passage` for v3/v5 and `code.passage` for v4; searches use the
-matching query task. V5 supports retrieval, text-matching, classification and
-clustering tasks, as described in [Jina's API schemas](https://github.com/jina-ai/meta-prompt/blob/main/v12.txt).
-Permanent embedding API errors such as HTTP 422 fail immediately with their details;
-transient failures retain retries. Reindex after changing task or request options
-to replace vectors generated with the previous policy.
-
-Optional reranking refines semantic-search results at query time and can use a
-different provider from your embeddings. For Jina, put this in `.env`:
-
-```bash
-CODEGRAPH_RERANK_PROVIDER=jina
-JINA_API_KEY=...
-# JINA_RERANKING_MODEL=jina-reranker-v3  # default; no model setting required
-# JINA_RERANKING_TOP_N=10
-```
-
-Or select the provider in `.codegraph.toml`; its nested configuration is optional:
-
-```toml
-[rerank]
-provider = "jina"  # jina | ollama | none
-top_n = 10
-
-# [rerank.jina]
-# model = "jina-reranker-v3"
-# api_key_env = "JINA_API_KEY"
-# api_base = "https://api.jina.ai/v1"
-```
-
-For Ollama, use `CODEGRAPH_RERANK_PROVIDER=ollama` and optionally
-`CODEGRAPH_OLLAMA_RERANK_MODEL` and `CODEGRAPH_OLLAMA_URL`. Jina's `JINA_API_BASE`
-also overrides its reranking endpoint. Environment settings override TOML;
-`CODEGRAPH_RERANK_PROVIDER` overrides the legacy `JINA_ENABLE_RERANKING` toggle,
-and `CODEGRAPH_ENABLE_RERANKING=false` disables all reranking. The legacy
-`CODEGRAPH_RERANKING_CANDIDATES` overrides `top_n`, which controls results retained
-after reranking. Check the resolved provider/model with `codegraph config show --json`.
-Use `--config codegraph.toml` or `CODEGRAPH_CONFIG_PATH=codegraph.toml` for a file
-without the leading dot. Reranker changes take effect after restarting the CLI or
-server and do not require reindexing.
-
-### 3. Database
-
-Use a **shared SurrealDB server**. That is the supported path **and the default**: with no
-`CODEGRAPH_SURREALDB_URL` set, `codegraph` connects to `ws://127.0.0.1:8000`. The embedded
-SurrealKV store is opt-in, kept only for local compatibility, substantially slower for
-indexing and concurrent reads, so it is no longer the recommended setup.
-
-**Shared server (default).** Point the client at a running SurrealDB server — or just start
-one on the default port and skip the `.env`. There is no per-client file lock, so a read-only
-MCP server and `codegraph index` can run at the same time against the same project, and
-several clients can share it:
-
-```bash
-# .env — one database shared by the MCP server and index runs
-CODEGRAPH_SURREALDB_URL=ws://127.0.0.1:8010
-CODEGRAPH_SURREALDB_NAMESPACE=codegraph
-CODEGRAPH_SURREALDB_DATABASE=codegraph
-CODEGRAPH_SURREALDB_USERNAME=root
-CODEGRAPH_SURREALDB_PASSWORD=root
-```
-
-Containerized server:
+Run one SurrealDB server and point the client at it:
 
 ```bash
 docker run -d --name cg-server -p 8010:8000 \
@@ -585,61 +519,61 @@ docker run -d --name cg-server -p 8010:8000 \
   start --user root --pass root --bind 0.0.0.0:8000 surrealkv:/data
 ```
 
-The schema is not created per project directory in this mode: apply
-`schema/codegraph_v2.surql` yourself (see
-[Setting Up SurrealDB](docs/INSTALLATION_GUIDE.md#setting-up-surrealdb)).
-
-**Embedded (opt-in, compatibility only, slower).** The embedded store is no longer the
-default. To use it, point the URL at a `surrealkv://` path; `codegraph` then runs SurrealDB
-in-process with a per-project SurrealKV store at `<project>/.codegraph/db`. Keep it for
-offline or single-shot use: indexing and queries are much slower than the shared server, and
-SurrealKV takes an exclusive file lock, so **only one process can hold a project's store open
-at a time** (stop `codegraph start` before `codegraph index`). Removing a project's index is
-`rm -rf <project>/.codegraph/db`.
-
 ```bash
-# .env — opt into the embedded store instead of a server
-CODEGRAPH_SURREALDB_URL=surrealkv:///absolute/path/to/project/.codegraph/db
+# .env (or ~/.codegraph.env)
+CODEGRAPH_SURREALDB_URL=ws://127.0.0.1:8010
+CODEGRAPH_SURREALDB_NAMESPACE=codegraph
+CODEGRAPH_SURREALDB_DATABASE=codegraph
+CODEGRAPH_SURREALDB_USERNAME=root
+CODEGRAPH_SURREALDB_PASSWORD=root
 ```
 
-### 4. Initialize and Index Your Project
+Apply `schema/codegraph_v2.surql` once per database (see
+[Setting Up SurrealDB](docs/INSTALLATION_GUIDE.md#setting-up-surrealdb)). One server serves
+many projects; a read-only MCP server and `codegraph index` can run at the same time.
+
+### 4. Index the new project
 
 ```bash
-codegraph init /path/to/project
+cd "$PROJECT"
+codegraph init . --hooks both        # choose claude | codex | both | none
 ```
 
-Init first offers **Claude Code, Codex, both, or none** for project-local hooks.
-It preserves existing settings and skips the prompt when CodeGraph hooks are already
-configured. Next it adds a managed `# codegraph` section to both `AGENTS.md` and
-`CLAUDE.md`, preserving other instructions, then recursively indexes the project.
-The guidance directs agents to start exploration with CodeGraph's context, impact,
-architecture and quality CLI tools and verify findings against current source.
-
-For scripts, pass the hook choice explicitly; setup can also run without indexing:
+`init` adds a managed `# codegraph` section to `AGENTS.md` and `CLAUDE.md` (preserving other
+content), then recursively indexes the project. Non-interactive forms:
 
 ```bash
-codegraph init /path/to/project --hooks both --index-tier balanced
-codegraph init /path/to/project --hooks none --no-index
-# Existing index-only workflow, with explicit language filters:
-codegraph index /path/to/project -r -l rust,typescript,python
+codegraph init . --hooks none                    # instructions only
+codegraph init . --hooks both --index-tier balanced
+codegraph index . -r -l typescript,javascript    # index only, no hooks
 ```
 
-`--hooks none` leaves existing hooks in place and still updates both instruction
-files. Setup never modifies user-level harness configuration. Ensure `codegraph`
-is on the harness's PATH and reload/review the project hooks after setup; see
-[init and hook details](docs/AGENTIC_CLI.md#project-initialization).
+Verify the index:
 
-After indexing, `python3 test_cli_agentic.py` tests all four CLI agent tools with
-the same eight questions as `test_http_mcp.py`, printing full answers and saving
-responses/timings under `test_output_cli/`. Replay saved answers without new queries
-with `python3 test_cli_agentic.py --replay test_output_cli`. See
-[CLI testing options](docs/AGENTIC_CLI.md#testing-the-cli).
+```bash
+codegraph status --detailed
+codegraph query "RequestRouter" --callers        # fast, no LLM
+```
 
-> **🔒 Security Note:** Indexing automatically respects `.gitignore` and filters out common secrets patterns (`.env`, `credentials.json`, `*.pem`, API keys, etc.). Your secrets won't be embedded or exposed to the agent.
+### 5. Connect your agent (MCP)
 
-### 5. Connect to Claude Code
+For **opencode** (`~/.config/opencode/opencode.json`):
 
-Add to your MCP config:
+```json
+{
+  "mcp": {
+    "servers": {
+      "codegraph": {
+        "type": "local",
+        "command": ["/full/path/to/codegraph", "start", "stdio"]
+      }
+    }
+  }
+}
+```
+
+For **Claude Code** (MCP config):
+
 ```json
 {
   "mcpServers": {
@@ -651,7 +585,25 @@ Add to your MCP config:
 }
 ```
 
-**That's it.** Your AI now understands your codebase.
+`--watch` keeps the index fresh as files change. The MCP server exposes the graph tools
+(`semantic_code_search`, `get_reverse_dependencies`, `trace_call_chain`, …); they do not use
+an LLM.
+
+### 6. Use it
+
+- **From an agent**: ask a code question; the agent calls the graph tools. Caller lists and
+  two-hop chains ("who calls X", "what reaches X") are where the graph beats grep.
+- **From the shell** (agentic tools need the LLM):
+
+```bash
+codegraph agent context "how does the request router dispatch"
+codegraph agent impact  "if I change RequestRouter, what breaks?"
+```
+
+- **Keep it fresh**: `codegraph daemon start .` re-indexes on file changes, or run
+  `codegraph index .` after large edits.
+
+That's it — `~/repos/github.com/paperclip` is indexed and your agent can reason over its graph.
 
 ---
 
