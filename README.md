@@ -548,6 +548,15 @@ codegraph init . --hooks both --index-tier balanced
 codegraph index . -r -l typescript,javascript    # index only, no hooks
 ```
 
+**Index tiers.** `balanced` and `full` run language servers (`typescript-language-server`,
+`clangd`, `gopls`, …) and **fail if those tools are missing**. On a machine without them — or
+for a very large monorepo — use `--index-tier fast` and scope what you index:
+
+```bash
+codegraph init . --hooks both --index-tier fast
+codegraph index server --index-tier fast -l typescript   # one subtree
+```
+
 Verify the index:
 
 ```bash
