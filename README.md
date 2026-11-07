@@ -474,7 +474,7 @@ PROJECT=~/repos/github.com/paperclip
 ### 1. Install (build once)
 
 ```bash
-git clone https://github.com/Jakedismo/codegraph-rust
+git clone https://github.com/zwidny/codegraph-rust
 cd codegraph-rust
 ./install-codegraph-full-features.sh
 ```
@@ -507,7 +507,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 Every variable is listed in `.env.example`; per-provider examples are in
 [AI_PROVIDERS.md](docs/AI_PROVIDERS.md). Environment variables override any config file, and
 the same settings can live in a `[llm]` / `[embedding]` config section (see
-[Configuration](https://github.com/Jakedismo/codegraph-rust#configuration)).
+[Configuration](https://github.com/zwidny/codegraph-rust#configuration)).
 
 ### 3. Database (shared server, the default)
 
