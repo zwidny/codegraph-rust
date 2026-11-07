@@ -5,9 +5,9 @@
 set -euo pipefail
 
 # Build with all available features on the server crate
-FEATURE_FLAGS="--all-features"
-SURR_URL="${CODEGRAPH_SURREALDB_URL:-ws://localhost:3004}"
-SURR_NAMESPACE="${CODEGRAPH_SURREALDB_NAMESPACE:-ouroboros}"
+FEATURE_FLAGS="--features full"
+SURR_URL="${CODEGRAPH_SURREALDB_URL:-ws://127.0.0.1:8010}"
+SURR_NAMESPACE="${CODEGRAPH_SURREALDB_NAMESPACE:-codegraph}"
 SURR_DATABASE="${CODEGRAPH_SURREALDB_DATABASE:-codegraph}"
 HTTP_PORT="${CODEGRAPH_HTTP_PORT:-3000}"
 INSTALL_PATH="${CARGO_HOME:-$HOME/.cargo}/bin"
@@ -19,15 +19,23 @@ fail() { printf '[ERROR] %s\n' "$1"; exit 1; }
 info "Preparing to install CodeGraph (FULL FEATURES)"
 info "This build includes ALL embedding providers, LLMs, and experimental features"
 
-[[ "${OSTYPE:-}" == darwin* ]] || fail "This installer targets macOS."
-command -v brew >/dev/null 2>&1 || fail "Homebrew is required (https://brew.sh)."
+case "${OSTYPE:-}" in
+    darwin*) PLATFORM=macos ;;
+    linux*)  PLATFORM=linux ;;
+    *) fail "Unsupported OS: ${OSTYPE:-unknown} (macOS and Linux are supported)." ;;
+esac
 command -v cargo >/dev/null 2>&1 || fail "Rust is required (https://rustup.rs)."
 
 # Check for SurrealDB
 if ! command -v surreal >/dev/null 2>&1; then
-    warn "SurrealDB CLI not found; installing via Homebrew..."
-    brew install surrealdb/tap/surreal >/dev/null
-    info "SurrealDB CLI installed"
+    if [[ "$PLATFORM" == macos ]] && command -v brew >/dev/null 2>&1; then
+        warn "SurrealDB CLI not found; installing via Homebrew..."
+        brew install surrealdb/tap/surreal >/dev/null
+        info "SurrealDB CLI installed"
+    else
+        warn "SurrealDB CLI not found. Install it from https://surrealdb.com/install,"
+        warn "or point CODEGRAPH_SURREALDB_URL at an existing server."
+    fi
 else
     info "SurrealDB CLI detected"
 fi
@@ -40,7 +48,9 @@ else
     info "Ollama detected"
 fi
 
-export MACOSX_DEPLOYMENT_TARGET=11.0
+if [[ "$PLATFORM" == macos ]]; then
+    export MACOSX_DEPLOYMENT_TARGET=11.0
+fi
 info "Compiling CodeGraph with ALL features..."
 info "Features: ${FEATURE_FLAGS}"
 info ""
@@ -79,7 +89,7 @@ Enabled Features:
 Next Steps
 ----------
 1. (Optional) Use a SurrealDB server instead of the embedded per-project store:
-     surreal start --bind 0.0.0.0:3004 --user root --pass root file://\$HOME/.codegraph/surreal.db
+     surreal start --bind 0.0.0.0:8010 --user root --pass root file://\$HOME/.codegraph/surreal.db
    and set CODEGRAPH_SURREALDB_URL.
 
 2. Configure your preferred providers in ~/.codegraph/config.toml:
@@ -120,5 +130,5 @@ Next Steps
 
 Ensure ${INSTALL_PATH} is on your PATH so editors can find the binary.
 
-For more info: https://github.com/yourusername/codegraph-rust
+For more info: https://github.com/zwidny/codegraph-rust
 EOF
