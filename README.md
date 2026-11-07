@@ -251,8 +251,15 @@ codegraph agent context "how does the request router dispatch"
 codegraph agent impact  "if I change RequestRouter, what breaks?"
 ```
 
-- **Keep it fresh**: `codegraph daemon start .` re-indexes on file changes, or run
-  `codegraph index .` after large edits.
+- **Keep it fresh.** The MCP tools are read-only, so code changes reach the graph only after a
+  re-index. Pick one:
+  - `codegraph start stdio --watch` — the MCP server watches files and re-indexes
+    incrementally (scope it with `--watch-path <dir>`; `--no-watch` disables it).
+  - `codegraph daemon start .` — a separate background watcher (`daemon status` / `daemon stop`).
+  - `codegraph index .` — manual **incremental** re-index (detects changed files, reuses the
+    cache); add `--force` for a full rebuild, or `--complete-deferred` to finish deferred
+    semantic inference.
+  - Set `[daemon] auto_start_with_mcp = true` to make plain `codegraph start` watch by default.
 
 That's it — `~/repos/github.com/paperclip` is indexed and your agent can reason over its graph.
 
