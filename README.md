@@ -216,7 +216,7 @@ For **opencode** (`~/.config/opencode/opencode.json`):
     "servers": {
       "codegraph": {
         "type": "local",
-        "command": ["/full/path/to/codegraph", "start", "stdio"]
+        "command": ["/full/path/to/codegraph", "start", "stdio", "--watch"]
       }
     }
   }
