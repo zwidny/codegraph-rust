@@ -26,6 +26,13 @@ case "${OSTYPE:-}" in
 esac
 command -v cargo >/dev/null 2>&1 || fail "Rust is required (https://rustup.rs)."
 
+# The workspace MSRV is Rust 1.95; prefer that toolchain when rustup has it.
+CARGO_CMD=(cargo)
+if command -v rustup >/dev/null 2>&1 && rustup run 1.95 rustc --version >/dev/null 2>&1; then
+    CARGO_CMD=(cargo +1.95)
+    info "Using Rust toolchain 1.95 (workspace MSRV)"
+fi
+
 # Check for SurrealDB
 if ! command -v surreal >/dev/null 2>&1; then
     if [[ "$PLATFORM" == macos ]] && command -v brew >/dev/null 2>&1; then
@@ -57,7 +64,7 @@ info ""
 info "This may take 5-10 minutes depending on your machine..."
 
 # Binary now lives in the server crate after the MCP split
-cargo install --path crates/codegraph-mcp-server --bin codegraph ${FEATURE_FLAGS} --force
+"${CARGO_CMD[@]}" install --path crates/codegraph-mcp-server --bin codegraph ${FEATURE_FLAGS} --force
 
 info "CodeGraph (full features) installed to ${INSTALL_PATH}"
 cat <<EOF
