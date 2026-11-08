@@ -31,7 +31,7 @@ jobs:
             os: ubuntu-latest
             name: codegraph-linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             name: codegraph-linux-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -53,7 +53,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-latest' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev
@@ -64,16 +64,7 @@ jobs:
           key: ${{ matrix.target }}
           cache-on-failure: true
 
-      - name: Install cross (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: taiki-e/install-action@cross
-
-      - name: Build codegraph (Linux aarch64 via cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --target ${{ matrix.target }} -p codegraph-mcp-server --bin codegraph --features full
-
-      - name: Build codegraph (native)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+      - name: Build codegraph
         run: cargo build --release --target ${{ matrix.target }} -p codegraph-mcp-server --bin codegraph --features full
 
       - name: Package archive and checksum
