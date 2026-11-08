@@ -34,7 +34,11 @@ const DEFAULT_LOCAL_EMBEDDINGS_PER_WORKER_PER_MINUTE: f64 = 3600.0;
     version,
     author,
     about = "CodeGraph CLI - agentic tools, MCP server management, and project indexing",
-    long_about = "Run CodeGraph's four agentic tools directly, configure harness hooks, manage MCP servers, and index projects."
+    long_about = "Run CodeGraph's four agentic tools directly, configure harness hooks, manage MCP servers, and index projects.\n\
+                  \n\
+                  Agents/LLMs: run `codegraph <command> --help` before invoking a command. Each subcommand\n\
+                  documents real-world pitfalls (indexing tiers, required tools, scoping large repos) that\n\
+                  are easy to get wrong."
 )]
 #[command(propagate_version = true)]
 struct Cli {
@@ -143,7 +147,17 @@ enum Commands {
                       Set CODEGRAPH_EMBEDDING_PROVIDER to a compiled local or remote provider.\n\
                       CODEGRAPH_EMBEDDING_POLICY and CODEGRAPH_SEMANTIC_RESOLUTION accept sync, deferred or off independently.\n\
                       Use --complete-deferred to finish a persisted inference job.\n\
-                      Some flags are provider-specific (see individual flag help for details)."
+                      Some flags are provider-specific (see individual flag help for details).\n\
+                      \n\
+                      Practical notes from indexing a large TypeScript monorepo:\n\
+                      - balanced/full run language servers (typescript-language-server, clangd, gopls, rust-analyzer)\n\
+                        and fail if they are missing; use --index-tier fast (AST + embeddings, no LSP) when unavailable.\n\
+                      - Very large repos (over ~1M lines) are impractical to index whole: scope to a subdirectory or\n\
+                        --include, filter with --languages, and exclude node_modules/dist/generated/*.d.ts.\n\
+                      - A single non-UTF-8 source file aborts the whole run; exclude it with --exclude.\n\
+                      - Indexing is incremental by default (changed files + cache); --force rebuilds from scratch.\n\
+                      - An embedding provider is required; without one the run fails before writing the graph.\n\
+                      - Re-run after code changes, or start the MCP server with --watch to keep it fresh."
     )]
     Index {
         #[arg(help = "Path to project directory")]
