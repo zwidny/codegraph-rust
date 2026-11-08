@@ -64,6 +64,12 @@ jobs:
           key: ${{ matrix.target }}
           cache-on-failure: true
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Enable sccache GitHub Actions backend
+        run: echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+
       - name: Build codegraph
         run: cargo build --profile release-dist --target ${{ matrix.target }} -p codegraph-mcp-server --bin codegraph --features full
 
