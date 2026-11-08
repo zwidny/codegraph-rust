@@ -270,6 +270,13 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# CI release artifacts: much faster to build than [profile.release] (thin LTO and
+# parallel codegen) at a small runtime cost. Use with `cargo build --profile release-dist`.
+[profile.release-dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 [profile.bench]
 inherits = "release"
 debug = true

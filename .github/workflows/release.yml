@@ -65,12 +65,12 @@ jobs:
           cache-on-failure: true
 
       - name: Build codegraph
-        run: cargo build --release --target ${{ matrix.target }} -p codegraph-mcp-server --bin codegraph --features full
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p codegraph-mcp-server --bin codegraph --features full
 
       - name: Package archive and checksum
         shell: bash
         run: |
-          BIN="target/${{ matrix.target }}/release/codegraph"
+          BIN="target/${{ matrix.target }}/release-dist/codegraph"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             cp "${BIN}.exe" "${{ matrix.name }}.exe"
             7z a "${{ matrix.name }}.zip" "${{ matrix.name }}.exe"
