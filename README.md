@@ -113,7 +113,27 @@ PROJECT=~/repos/github.com/paperclip
 - An **embedding provider** for indexing. An **LLM** is only needed for the agentic tools
   (`codegraph agent ...`), not for indexing or the graph MCP tools.
 
-### 1. Install (build once)
+### 1. Install
+
+**Prebuilt binary (recommended).** Download the archive for your platform from the
+[latest release](https://github.com/zwidny/codegraph-rust/releases/latest), verify it, and
+put `codegraph` on your `PATH`:
+
+```bash
+PLATFORM=linux-x86_64    # linux-aarch64 | macos-x86_64 | macos-aarch64
+ASSET=codegraph-$PLATFORM.tar.gz
+BASE=https://github.com/zwidny/codegraph-rust/releases/latest/download
+curl -fLO "$BASE/$ASSET" "$BASE/$ASSET.sha256"
+(shasum -a 256 -c "$ASSET.sha256") || (sha256sum -c "$ASSET.sha256")
+tar xzf "$ASSET"
+sudo install -m 0755 codegraph /usr/local/bin/codegraph
+codegraph --version
+```
+
+Windows: download `codegraph-windows-x86_64.zip`, extract `codegraph.exe`, and add its folder
+to `PATH`.
+
+**From source (optional).** Requires Rust 1.95+; builds with all features:
 
 ```bash
 git clone https://github.com/zwidny/codegraph-rust
