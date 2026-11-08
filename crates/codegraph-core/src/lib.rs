@@ -46,6 +46,6 @@ pub use versioning::*;
 pub use watch::*;
 
 // Use jemalloc as the global allocator when the feature is enabled
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", unix))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
