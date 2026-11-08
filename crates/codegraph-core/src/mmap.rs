@@ -170,8 +170,7 @@ fn prefetch_range_impl(m: &MappedFile, offset: usize, len: usize) {
 
 #[cfg(windows)]
 fn prefetch_range_impl(m: &MappedFile, offset: usize, len: usize) {
-    use core::mem::size_of;
-    use windows_sys::Win32::System::Memory::{_WIN32_MEMORY_RANGE_ENTRY, PrefetchVirtualMemory};
+    use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
 
     let end = offset.saturating_add(len).min(m.len);
     if end <= offset {
@@ -180,13 +179,18 @@ fn prefetch_range_impl(m: &MappedFile, offset: usize, len: usize) {
     let ptr = unsafe { m.mmap.as_ptr().add(offset) } as *mut core::ffi::c_void;
     let bytes = end - offset;
 
-    let mut range = _WIN32_MEMORY_RANGE_ENTRY {
+    let range = WIN32_MEMORY_RANGE_ENTRY {
         VirtualAddress: ptr,
         NumberOfBytes: bytes,
     };
     unsafe {
-        // Best-effort; ignore failure.
-        let _ = PrefetchVirtualMemory(0, 1, &mut range as *mut _ as *mut _, 0);
+        // Best-effort; ignore failure. HANDLE is *mut c_void, so null_mut() = current process.
+        let _ = PrefetchVirtualMemory(
+            core::ptr::null_mut(),
+            1,
+            &range as *const WIN32_MEMORY_RANGE_ENTRY,
+            0,
+        );
     }
 }
 
