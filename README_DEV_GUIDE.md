@@ -374,7 +374,7 @@ opencode mcp list            # 期望 codegraph  connected
 
 > 注意：`opencode mcp add --global` 写入的是 `mcp.servers`（正确结构），但写到全局会触发多实例问题。用项目级文件手写最稳。
 
-### 6.2 12 个工具
+### 6.2 13 个工具
 
 **8 个直连图工具（无 LLM，0.3–1.3s）**
 
@@ -388,6 +388,12 @@ opencode mcp list            # 期望 codegraph  connected
 | `detect_circular_dependencies` | `edge_type` | 循环依赖 |
 | `find_complexity_hotspots` | — | 复杂度热点 |
 | `get_hub_nodes` | — | 高中心度节点 |
+
+**1 个计划校验工具（无 LLM、无 DB）**
+
+| 工具 | 必填参数 | 用途 |
+|---|---|---|
+| `plan_check` | `plan`（含 `nodes`/`edges`/`constraints` 的对象） | 校验尚未落地的草稿逻辑图：环、覆盖、分层、悬空引用、扇入/扇出 |
 
 **4 个 agentic 工具（LLM 工作流，55s–2.5min）**
 

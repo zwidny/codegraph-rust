@@ -110,6 +110,17 @@ last hop is `implements`, so the expectation "every entry point reaches the trai
 not hold for that edge kind. That is exactly the kind of gap worth finding before
 implementation: either the relation is mis-modelled, or the constraint is too narrow.
 
+## MCP
+
+The same validation is available to coding agents as the `plan_check` MCP tool:
+
+```json
+{ "plan": { "nodes": [ ... ], "edges": [ ... ], "constraints": [ ... ] } }
+```
+
+It returns the identical report (`ok`, `checks`, `violations`, `warnings`) and needs
+no database. Persistence (`plan store` / `show` / `drop`) stays on the CLI.
+
 ## Bootstrap checklist
 
 1. Write the planned nodes, edges and invariants as a plan file.

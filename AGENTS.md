@@ -58,7 +58,7 @@
 **每轮自检**：本轮有没有 `read` / `grep` / `ls` / `glob` 命中源码位置？
 如果有，本轮的 codegraph 调用是哪一次？答不上来即为违规。
 
-### 工具选择（12 个）
+### 工具选择（13 个）
 
 **直连图工具（0.3–1.3 秒，无 LLM）** —— 优先用这一层：
 
@@ -72,6 +72,7 @@
 | 循环依赖 | `detect_circular_dependencies` | `edge_type` |
 | 复杂度热点 | `find_complexity_hotspots` | — |
 | 中心模块 | `get_hub_nodes` | — |
+| 校验草稿逻辑图 | `plan_check` | — (`plan` 对象) |
 
 **两条硬规则**：
 

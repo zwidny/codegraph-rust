@@ -58,6 +58,12 @@ struct SearchRequest {
     limit: usize,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct PlanCheckRequest {
+    /// Draft plan object with `nodes`, `edges` and `constraints`
+    plan: Value,
+}
+
 /// Request for consolidated agentic tools with optional focus parameter
 #[derive(Deserialize, JsonSchema)]
 struct ConsolidatedSearchRequest {
@@ -541,6 +547,23 @@ impl CodeGraphMCPServer {
         params: Parameters<GraphToolParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("get_hub_nodes", params.0.0).await
+    }
+
+    #[tool(
+        description = "Validate a draft logic graph before code exists (no LLM, no DB). Params: plan (object with nodes, edges, constraints). Returns ok, checks, violations and warnings, using the same rules as `codegraph plan check`: known_nodes, acyclic, layering, coverage, no_path, max_fan_in, max_fan_out."
+    )]
+    async fn plan_check(
+        &self,
+        params: Parameters<PlanCheckRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let report = crate::plan_cli::analyze_value(params.0.plan).map_err(|error| McpError {
+            code: rmcp::model::ErrorCode(-32602),
+            message: format!("plan_check failed: {error}").into(),
+            data: None,
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string()),
+        )]))
     }
 }
 

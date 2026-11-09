@@ -476,6 +476,13 @@ fn load(file: &str) -> Result<(PlanDoc, String)> {
     Ok((doc, source))
 }
 
+/// Deserialize a JSON plan object and evaluate it. Shared by the CLI and the
+/// MCP `plan_check` tool so both report identically.
+pub fn analyze_value(plan: Value) -> Result<PlanReport> {
+    let doc: PlanDoc = serde_json::from_value(plan).context("parse plan object")?;
+    Ok(analyze(&doc))
+}
+
 /// Evaluate every declared constraint plus the always-on structural checks.
 pub fn analyze(doc: &PlanDoc) -> PlanReport {
     let node_ids: HashSet<&str> = doc.nodes.iter().map(|node| node.id.as_str()).collect();

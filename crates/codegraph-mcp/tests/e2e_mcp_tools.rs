@@ -173,6 +173,8 @@ async fn test_tool_discovery() -> Result<()> {
         "detect_circular_dependencies",
         "find_complexity_hotspots",
         "get_hub_nodes",
+        // Draft logic graphs: validate reasoning before code exists (no DB).
+        "plan_check",
     ];
 
     println!("📋 Discovered {} tools", tools.tools.len());
@@ -197,6 +199,46 @@ async fn test_tool_discovery() -> Result<()> {
 
     service.cancel().await?;
     println!("🎉 Tool discovery test passed!");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_check_tool_validates_draft_graph() -> Result<()> {
+    let service = start_mcp_server().await?;
+
+    let plan = json!({
+        "nodes": [{ "id": "a" }, { "id": "b" }],
+        "edges": [
+            { "from": "a", "to": "b" },
+            { "from": "b", "to": "a" }
+        ],
+        "constraints": [{ "kind": "acyclic" }]
+    });
+
+    let arguments = json!({ "plan": plan })
+        .as_object()
+        .expect("object arguments")
+        .clone();
+    let result = service
+        .call_tool(CallToolRequestParams::new("plan_check").with_arguments(arguments))
+        .await?;
+
+    let raw = serde_json::to_value(&result)?;
+    let text = raw["content"][0]["text"]
+        .as_str()
+        .expect("plan_check returns text content");
+    let report: Value = serde_json::from_str(text)?;
+
+    assert_eq!(report["ok"], false, "cycle must fail the check");
+    assert_eq!(report["violations"][0]["rule"], "acyclic");
+    assert!(
+        report["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| check["rule"] == "known_nodes")),
+        "always-on known_nodes check must be present"
+    );
+
+    service.cancel().await?;
     Ok(())
 }
 

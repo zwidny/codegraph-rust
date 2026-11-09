@@ -51,6 +51,10 @@ Eight tools query the code graph directly. They are **20–100× faster** than t
 raw structured data you can compose yourself. **Prefer these for concrete
 questions; reach for `agentic_*` only when you need a synthesized explanation.**
 
+A ninth direct tool, `plan_check`, validates a **draft** graph you are planning
+(nodes/edges/constraints) before any code exists. Use it to externalise reasoning
+and catch cycles, uncovered paths, layering violations and dangling references.
+
 | Question | Tool | Required params |
 |---|---|---|
 | Where is this concept / find related code | `semantic_code_search` | — (`query`, `limit`, `threshold`) |
@@ -61,6 +65,7 @@ questions; reach for `agentic_*` only when you need a synthesized explanation.**
 | Detect circular dependency cycles | `detect_circular_dependencies` | `edge_type` |
 | Complexity hotspots | `find_complexity_hotspots` | — (`min_complexity`, `limit`) |
 | High-degree hub nodes | `get_hub_nodes` | — (`min_degree`) |
+| Validate a planned logic graph | `plan_check` | `plan` (object with `nodes`, `edges`, `constraints`) |
 
 ### Getting a `node_id`
 

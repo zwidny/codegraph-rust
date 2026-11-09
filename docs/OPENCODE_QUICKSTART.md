@@ -1,7 +1,7 @@
 # CodeGraph × OpenCode 快速接入指南
 
 面向「新电脑 / 新项目」的端到端流程：装好 CodeGraph，索引一个项目，并让 OpenCode
-通过 MCP 用上 12 个图工具。
+通过 MCP 用上 13 个图工具。
 
 > 本文只讲接入与验证。性能调优见 [README_DEV_GUIDE](../README_DEV_GUIDE.md)，
 > 完整参数见 [INSTALLATION_GUIDE](INSTALLATION_GUIDE.md)。
@@ -157,7 +157,7 @@ codegraph agent context "Where is configuration loaded?" --focus search
 # 4) OpenCode 的 MCP 连接
 opencode mcp list        # 期望 codegraph  connected
 #    然后在 OpenCode 里让 agent 调一次 semantic_code_search，能返回 node_id 即通
-#    可用工具应为 12 个：8 个直连图工具 + 4 个 agentic_*
+#    可用工具应为 13 个：8 个直连图工具 + 4 个 agentic_* + plan_check（校验草稿逻辑图）
 ```
 
 `semantic_code_search` 返回的 `node_id` 要原样使用（`nodes:<uuid>`，含反引号与前缀）。
