@@ -12,15 +12,39 @@ exactly as they work on indexed code.
 ## Usage
 
 ```bash
-codegraph plan plan.json
-codegraph plan plan.yaml --format json
-cat plan.json | codegraph plan -
+# Offline validation: no database, no provider.
+codegraph plan check plan.json
+codegraph plan check plan.yaml --format json
+cat plan.json | codegraph plan check -
+
+# Persist the draft graph under project_id `plan:<id>`.
+codegraph plan store plan.json --plan-id feature-x
+codegraph plan show feature-x            # read it back
+codegraph plan drop feature-x            # delete it
+
+# Query the draft graph like any other project.
+codegraph query new_provider --project-id plan:feature-x
 ```
 
-Exit code is `0` when there are no violations and `1` when at least one rule fails, so
-it can gate a workflow before any code is written.
+`plan check` exits `0` when there are no violations and `1` when at least one rule
+fails, so it can gate a workflow before any code is written. It runs before
+configuration and provider loading, like `codegraph query`.
 
-`codegraph plan` runs before configuration and provider loading, like `codegraph query`.
+`plan store`, `show` and `drop` need a reachable database and load configuration.
+
+## Persistence and isolation
+
+Draft nodes and edges reuse the existing `nodes` / `edges` tables, but every row is
+scoped to `project_id = plan:<id>`:
+
+- A real project query scopes by the project path, so it never sees drafts.
+- Drafts share no index entries with code rows beyond the normal `project_id` index.
+- `plan drop <id>` removes exactly one plan and cannot touch a real project.
+- No schema change is required.
+
+Constraints are **not** persisted; they stay in the plan file. `plan show` returns the
+nodes and edges so you can re-check reasoning after the file or code changes:
+`codegraph plan show <id> --format json > plan.json` then re-add the constraints.
 
 ## Input
 
@@ -70,7 +94,7 @@ Each rule is evaluated independently; the output lists every check with `ok` plu
 ## Example
 
 ```
-$ codegraph plan provider.json
+$ codegraph plan check provider.json
 Plan check: provider.json
 Nodes: 5  Edges: 4
   [PASS] known_nodes
@@ -89,7 +113,9 @@ implementation: either the relation is mis-modelled, or the constraint is too na
 ## Bootstrap checklist
 
 1. Write the planned nodes, edges and invariants as a plan file.
-2. Run `codegraph plan` and fix violations until it exits `0`.
-3. Map draft nodes to real anchors with `codegraph query` / `codegraph agent`.
-4. Implement, re-index, then verify the real graph (`--callers`, `trace_call_chain`)
-   before deleting the draft.
+2. Run `codegraph plan check` and fix violations until it exits `0`.
+3. `codegraph plan store <file> --plan-id <id>` to keep the draft in the graph, then
+   `codegraph query <node> --project-id plan:<id>` to inspect it.
+4. Map draft nodes to real anchors with `codegraph query` / `codegraph agent`.
+5. Implement, re-index, then verify the real graph (`--callers`, `trace_call_chain`)
+   before `codegraph plan drop <id>`.

@@ -95,11 +95,11 @@ enum Commands {
     },
 
     #[command(
-        about = "Check an LLM's draft plan graph (nodes/edges/constraints) offline; no DB or provider needed"
+        about = "Validate an LLM's draft plan graph offline, or persist it under project_id plan:<id>"
     )]
     Plan {
-        #[command(flatten)]
-        args: plan_cli::PlanArgs,
+        #[command(subcommand)]
+        action: plan_cli::PlanAction,
     },
 
     #[command(about = "Emit agent guidance or install project-local harness hooks")]
@@ -581,8 +581,10 @@ fn main() -> Result<()> {
     if let Commands::Query { args } = cli.command {
         return query_cli::run(args);
     }
-    if let Commands::Plan { args } = cli.command {
-        return plan_cli::run(args);
+    if let Commands::Plan { ref action } = cli.command {
+        if action.is_offline() {
+            return plan_cli::run_offline(action);
+        }
     }
     if let Commands::Agent { ref action } = cli.command {
         // SAFETY: No async runtime or application threads have been started yet.
@@ -663,9 +665,11 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Commands::Init { .. }
         | Commands::Agent { .. }
         | Commands::Hooks { .. }
-        | Commands::Query { .. }
-        | Commands::Plan { .. } => {
+        | Commands::Query { .. } => {
             unreachable!("handled before configuration")
+        }
+        Commands::Plan { action } => {
+            plan_cli::run_async(action).await?;
         }
         Commands::Start {
             transport,

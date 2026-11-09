@@ -6,18 +6,53 @@
 // is planning, then the same structural operators used against a real code graph
 // (reachability, cycles, layering, degree) check that reasoning for consistency.
 use anyhow::{Context, Result, bail};
+use codegraph_core::{CodeNode, EdgeType, Location, NodeId, NodeType};
+use codegraph_graph::{CodeEdge, SurrealDbConfig, SurrealDbStorage};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 
-#[derive(clap::Args, Debug)]
-pub struct PlanArgs {
-    /// Plan file (JSON or YAML); `-` reads JSON from stdin.
-    pub file: String,
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum PlanAction {
+    /// Validate a plan file offline (no database, no provider).
+    Check {
+        /// Plan file (JSON or YAML); `-` reads JSON from stdin.
+        file: String,
+        #[arg(short, long, value_enum, default_value_t = PlanFormat::Human)]
+        format: PlanFormat,
+    },
+    /// Persist a plan's nodes/edges under `project_id = plan:<id>`.
+    Store {
+        /// Plan file (JSON or YAML).
+        file: String,
+        #[arg(long, help = "Plan id (defaults to the file stem)")]
+        plan_id: Option<String>,
+        #[arg(long, help = "Replace an existing stored plan")]
+        force: bool,
+    },
+    /// Read a stored plan back as JSON/YAML-shaped nodes and edges.
+    Show {
+        plan_id: String,
+        #[arg(short, long, value_enum, default_value_t = PlanFormat::Human)]
+        format: PlanFormat,
+    },
+    /// Delete a stored plan and its nodes/edges.
+    Drop { plan_id: String },
+}
 
-    #[arg(short, long, value_enum, default_value_t = PlanFormat::Human)]
-    pub format: PlanFormat,
+impl PlanAction {
+    /// `check` must run before configuration/provider loading.
+    pub fn is_offline(&self) -> bool {
+        matches!(self, PlanAction::Check { .. })
+    }
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct PlanArgs {
+    #[command(subcommand)]
+    pub action: PlanAction,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,11 +150,33 @@ pub struct PlanReport {
     pub warnings: Vec<String>,
 }
 
-pub fn run(args: PlanArgs) -> Result<()> {
-    let (doc, source) = load(&args.file)?;
+/// Offline entry point (used before configuration is loaded).
+pub fn run_offline(action: &PlanAction) -> Result<()> {
+    match action {
+        PlanAction::Check { file, format } => check(file, *format),
+        _ => bail!("this plan action needs configuration; only `check` runs offline"),
+    }
+}
+
+/// Persistent entry point (runs after configuration is loaded).
+pub async fn run_async(action: PlanAction) -> Result<()> {
+    match action {
+        PlanAction::Check { file, format } => check(&file, format),
+        PlanAction::Store {
+            file,
+            plan_id,
+            force,
+        } => store(&file, plan_id, force).await,
+        PlanAction::Show { plan_id, format } => show(&plan_id, format).await,
+        PlanAction::Drop { plan_id } => drop_plan(&plan_id).await,
+    }
+}
+
+fn check(file: &str, format: PlanFormat) -> Result<()> {
+    let (doc, source) = load(file)?;
     let report = analyze(&doc);
 
-    match args.format {
+    match format {
         PlanFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
         PlanFormat::Human => print_human(&source, &report),
     }
@@ -130,6 +187,268 @@ pub fn run(args: PlanArgs) -> Result<()> {
             report.violations.len()
         );
     }
+    Ok(())
+}
+
+fn draft_project_id(plan_id: &str) -> String {
+    format!("plan:{plan_id}")
+}
+
+fn default_plan_id(file: &str) -> String {
+    if file == "-" {
+        return "stdin".to_string();
+    }
+    PathBuf::from(file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "plan".to_string())
+}
+
+async fn connect_storage() -> Result<SurrealDbStorage> {
+    let project_root = std::env::current_dir()?;
+    let config = SurrealDbConfig::for_project(&project_root);
+    let connection = config.connection.clone();
+    SurrealDbStorage::new(config)
+        .await
+        .map_err(|error| anyhow::anyhow!("connect to SurrealDB at {connection}: {error}"))
+}
+
+async fn count_plan_nodes(storage: &SurrealDbStorage, project: &str) -> Result<usize> {
+    let mut response = storage
+        .db()
+        .query("SELECT count() AS count FROM nodes WHERE project_id = $project GROUP ALL")
+        .bind(("project", project.to_string()))
+        .await
+        .context("count plan nodes")?
+        .check()
+        .context("count plan nodes")?;
+    let rows: Vec<Value> = response.take(0).unwrap_or_default();
+    Ok(rows
+        .first()
+        .and_then(|row| row.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize)
+}
+
+async fn store(file: &str, plan_id: Option<String>, force: bool) -> Result<()> {
+    let (doc, source) = load(file)?;
+    let plan_id = plan_id.unwrap_or_else(|| default_plan_id(file));
+    let project = draft_project_id(&plan_id);
+
+    let mut storage = connect_storage().await?;
+    let existing = count_plan_nodes(&storage, &project).await?;
+    if existing > 0 {
+        if !force {
+            bail!("plan '{plan_id}' already stored ({existing} nodes); pass --force to replace it");
+        }
+        storage
+            .clean_project_data(&project)
+            .await
+            .map_err(|error| anyhow::anyhow!("clear existing plan '{plan_id}': {error}"))?;
+    }
+
+    // Draft nodes reuse the `nodes` table but are scoped to `plan:<id>`, so a real
+    // project query never sees them and they share no indexes with code.
+    let mut id_by_name: HashMap<String, NodeId> = HashMap::new();
+    let mut nodes = Vec::with_capacity(doc.nodes.len());
+    for planned in &doc.nodes {
+        let mut node = CodeNode::new(
+            planned.id.clone(),
+            Some(NodeType::Other("Draft".to_string())),
+            None,
+            Location {
+                file_path: source.clone(),
+                line: 0,
+                column: 0,
+                end_line: None,
+                end_column: None,
+            },
+        );
+        node.metadata
+            .attributes
+            .insert("project_id".to_string(), project.clone());
+        node.metadata
+            .attributes
+            .insert("draft".to_string(), "true".to_string());
+        if let Some(layer) = &planned.layer {
+            node.metadata
+                .attributes
+                .insert("layer".to_string(), layer.clone());
+        }
+        if let Some(kind) = &planned.kind {
+            node.metadata
+                .attributes
+                .insert("draft_kind".to_string(), kind.clone());
+        }
+        id_by_name.insert(planned.id.clone(), node.id.clone());
+        nodes.push(node);
+    }
+    storage
+        .upsert_nodes_batch(&nodes)
+        .await
+        .map_err(|error| anyhow::anyhow!("write plan nodes: {error}"))?;
+
+    let mut edges = Vec::with_capacity(doc.edges.len());
+    for planned in &doc.edges {
+        let (Some(from), Some(to)) = (
+            id_by_name.get(&planned.from).cloned(),
+            id_by_name.get(&planned.to).cloned(),
+        ) else {
+            continue;
+        };
+        let edge_type: EdgeType = planned.kind.parse().unwrap_or(EdgeType::References);
+        edges.push(CodeEdge::new(from, to, edge_type).with_project_id(project.clone()));
+    }
+    storage
+        .upsert_edges_batch(&edges)
+        .await
+        .map_err(|error| anyhow::anyhow!("write plan edges: {error}"))?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "stored": true,
+            "plan_id": plan_id,
+            "project_id": project,
+            "nodes": nodes.len(),
+            "edges": edges.len(),
+            "next": format!("codegraph plan show {plan_id}"),
+        }))?
+    );
+    Ok(())
+}
+
+async fn show(plan_id: &str, format: PlanFormat) -> Result<()> {
+    let project = draft_project_id(plan_id);
+    let storage = connect_storage().await?;
+    if count_plan_nodes(&storage, &project).await? == 0 {
+        bail!(
+            "plan '{plan_id}' is not stored; run `codegraph plan store <file> --plan-id {plan_id}` first"
+        );
+    }
+
+    let mut node_response = storage
+        .db()
+        .query("SELECT <string>id AS rid, name, metadata FROM nodes WHERE project_id = $project")
+        .bind(("project", project.clone()))
+        .await
+        .context("read plan nodes")?
+        .check()
+        .context("read plan nodes")?;
+    let node_rows: Vec<Value> = node_response.take(0).unwrap_or_default();
+
+    let mut name_by_record = HashMap::new();
+    let mut nodes = Vec::with_capacity(node_rows.len());
+    for row in node_rows {
+        let record = row.get("rid").and_then(Value::as_str).unwrap_or_default();
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let layer = row
+            .get("metadata")
+            .and_then(Value::as_str)
+            .and_then(|encoded| codegraph_core::decompress_json(encoded).ok())
+            .and_then(|metadata| {
+                metadata
+                    .get("layer")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        name_by_record.insert(record.to_string(), name.clone());
+        nodes.push(PlanNode {
+            id: name,
+            layer,
+            kind: None,
+        });
+    }
+
+    let mut edge_response = storage
+        .db()
+        .query(
+            "SELECT <string>from AS from_id, <string>to AS to_id, edge_type FROM edges WHERE project_id = $project",
+        )
+        .bind(("project", project))
+        .await
+        .context("read plan edges")?
+        .check()
+        .context("read plan edges")?;
+    let edge_rows: Vec<Value> = edge_response.take(0).unwrap_or_default();
+
+    let mut edges = Vec::new();
+    for row in edge_rows {
+        let from_id = row
+            .get("from_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let to_id = row.get("to_id").and_then(Value::as_str).unwrap_or_default();
+        let (Some(from), Some(to)) = (name_by_record.get(from_id), name_by_record.get(to_id))
+        else {
+            continue;
+        };
+        edges.push(PlanEdge {
+            from: from.clone(),
+            to: to.clone(),
+            kind: row
+                .get("edge_type")
+                .and_then(Value::as_str)
+                .unwrap_or("references")
+                .to_string(),
+        });
+    }
+
+    // Constraints live in the plan file, not the graph; keep them there.
+    let doc = PlanDoc {
+        nodes,
+        edges,
+        constraints: Vec::new(),
+    };
+
+    match format {
+        PlanFormat::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
+        PlanFormat::Human => {
+            println!(
+                "Plan '{plan_id}' (project_id={})",
+                draft_project_id(plan_id)
+            );
+            for node in &doc.nodes {
+                match &node.layer {
+                    Some(layer) => println!("  node {} [layer={layer}]", node.id),
+                    None => println!("  node {}", node.id),
+                }
+            }
+            for edge in &doc.edges {
+                println!("  edge {} -[{}]-> {}", edge.from, edge.kind, edge.to);
+            }
+            println!("Nodes: {}  Edges: {}", doc.nodes.len(), doc.edges.len());
+            println!("Constraints are not persisted; keep them in the plan file.");
+        }
+    }
+    Ok(())
+}
+
+async fn drop_plan(plan_id: &str) -> Result<()> {
+    let project = draft_project_id(plan_id);
+    let storage = connect_storage().await?;
+    let nodes = count_plan_nodes(&storage, &project).await?;
+    if nodes == 0 {
+        bail!("plan '{plan_id}' is not stored");
+    }
+    storage
+        .clean_project_data(&project)
+        .await
+        .map_err(|error| anyhow::anyhow!("delete plan '{plan_id}': {error}"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "dropped": true,
+            "plan_id": plan_id,
+            "project_id": project,
+            "nodes": nodes,
+        }))?
+    );
     Ok(())
 }
 

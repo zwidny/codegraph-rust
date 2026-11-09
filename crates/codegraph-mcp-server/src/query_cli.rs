@@ -35,6 +35,10 @@ pub struct QueryArgs {
     /// Project directory (defaults to the current directory)
     #[arg(long)]
     pub project: Option<std::path::PathBuf>,
+
+    /// Override the project id used to scope the query (for example `plan:<id>`)
+    #[arg(long)]
+    pub project_id: Option<String>,
 }
 
 pub fn run(args: QueryArgs) -> Result<()> {
@@ -53,8 +57,11 @@ async fn run_async(args: QueryArgs) -> Result<()> {
             .with_context(|| path.display().to_string())?,
         None => std::env::current_dir()?.canonicalize()?,
     };
-    let project_id = std::env::var("CODEGRAPH_PROJECT_ID")
-        .unwrap_or_else(|_| project_root.display().to_string());
+    let project_id = args
+        .project_id
+        .clone()
+        .or_else(|| std::env::var("CODEGRAPH_PROJECT_ID").ok())
+        .unwrap_or_else(|| project_root.display().to_string());
 
     // Resolve the store exactly like `index`, `agent`, and the MCP server do:
     // `CODEGRAPH_SURREALDB_URL` when set (shared server), otherwise the default
