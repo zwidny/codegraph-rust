@@ -92,6 +92,7 @@ it to coding agents over MCP, so they can ask relationship questions instead of 
 - **Tier-aware prompts and context protection** — fit the agent's real context window.
 - **Tiered indexing** — fast / balanced / full, with incremental re-indexing.
 - **Hybrid search** — vector + BM25 fused for retrieval.
+- **Draft plan checks** — `codegraph plan` validates a planned graph (entities, relations, constraints) before the code exists; see [docs/PLAN_CHECK.md](docs/PLAN_CHECK.md).
 
 For the problem, how it works, and why it matters, see
 [docs/OVERVIEW.md](docs/OVERVIEW.md).

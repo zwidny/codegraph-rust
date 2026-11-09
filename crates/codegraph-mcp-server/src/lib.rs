@@ -10,6 +10,7 @@ pub mod http_config;
 #[cfg(feature = "server-http")]
 pub mod http_server;
 pub mod official_server;
+pub mod plan_cli;
 pub mod project_init;
 pub mod prompts;
 pub mod query_cli;

@@ -10,7 +10,7 @@ use codegraph_mcp_core::debug_logger::DebugLogger;
 #[cfg(feature = "daemon")]
 use codegraph_mcp_daemon::{DaemonManager, PidFile, WatchConfig, WatchDaemon};
 use codegraph_mcp_server::CodeGraphMCPServer;
-use codegraph_mcp_server::{agent_cli, agent_hooks, project_init, query_cli};
+use codegraph_mcp_server::{agent_cli, agent_hooks, plan_cli, project_init, query_cli};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rmcp::ServiceExt;
@@ -92,6 +92,14 @@ enum Commands {
     Query {
         #[command(flatten)]
         args: query_cli::QueryArgs,
+    },
+
+    #[command(
+        about = "Check an LLM's draft plan graph (nodes/edges/constraints) offline; no DB or provider needed"
+    )]
+    Plan {
+        #[command(flatten)]
+        args: plan_cli::PlanArgs,
     },
 
     #[command(about = "Emit agent guidance or install project-local harness hooks")]
@@ -573,6 +581,9 @@ fn main() -> Result<()> {
     if let Commands::Query { args } = cli.command {
         return query_cli::run(args);
     }
+    if let Commands::Plan { args } = cli.command {
+        return plan_cli::run(args);
+    }
     if let Commands::Agent { ref action } = cli.command {
         // SAFETY: No async runtime or application threads have been started yet.
         return unsafe { agent_cli::run(action, cli.verbose, cli.config.as_deref()) };
@@ -652,7 +663,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Commands::Init { .. }
         | Commands::Agent { .. }
         | Commands::Hooks { .. }
-        | Commands::Query { .. } => {
+        | Commands::Query { .. }
+        | Commands::Plan { .. } => {
             unreachable!("handled before configuration")
         }
         Commands::Start {
