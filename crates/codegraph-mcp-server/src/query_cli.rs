@@ -53,25 +53,32 @@ async fn run_async(args: QueryArgs) -> Result<()> {
             .with_context(|| path.display().to_string())?,
         None => std::env::current_dir()?.canonicalize()?,
     };
-    let db_path = project_root.join(".codegraph/db");
-    if !db_path.exists() {
-        bail!(
-            "project not indexed: {} does not exist. Run `codegraph index {}` first.",
-            db_path.display(),
-            project_root.display()
-        );
-    }
     let project_id = std::env::var("CODEGRAPH_PROJECT_ID")
         .unwrap_or_else(|_| project_root.display().to_string());
 
-    let db = surrealdb::engine::any::connect(format!("surrealkv://{}", db_path.display()))
+    // Resolve the store exactly like `index`, `agent`, and the MCP server do:
+    // `CODEGRAPH_SURREALDB_URL` when set (shared server), otherwise the default
+    // shared server. The embedded per-project store is opt-in via a `surrealkv://`
+    // URL and must not be assumed just because the project directory exists.
+    let config = codegraph_graph::SurrealDbConfig::for_project(&project_root);
+
+    // Only the embedded store needs an on-disk existence check; a server can hold
+    // the project even when there is no local `.codegraph` directory.
+    if let Some(embedded_path) = config.connection.strip_prefix("surrealkv://") {
+        if !std::path::Path::new(embedded_path).exists() {
+            bail!(
+                "project not indexed: embedded store {} does not exist. Run `codegraph index {}` first, or set CODEGRAPH_SURREALDB_URL to the server that holds this project.",
+                embedded_path,
+                project_root.display()
+            );
+        }
+    }
+
+    let connection = config.connection.clone();
+    let storage = codegraph_graph::SurrealDbStorage::new(config)
         .await
-        .context("connect to embedded store")?;
-    let namespace =
-        std::env::var("CODEGRAPH_SURREALDB_NAMESPACE").unwrap_or_else(|_| "codegraph".to_string());
-    let database =
-        std::env::var("CODEGRAPH_SURREALDB_DATABASE").unwrap_or_else(|_| "codegraph".to_string());
-    db.use_ns(namespace).use_db(database).await?;
+        .map_err(|e| anyhow::anyhow!("connect to SurrealDB at {connection}: {e}"))?;
+    let db = storage.db();
 
     // --- Symbol lookup -------------------------------------------------
     let mut response = db

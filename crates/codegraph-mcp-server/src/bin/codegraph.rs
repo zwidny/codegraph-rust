@@ -248,7 +248,7 @@ enum Commands {
     },
 
     #[command(
-        about = "Estimate indexing cost (node/edge counts + embedding ETA) without writing to SurrealDB"
+        about = "Estimate indexing cost (node/edge counts + embedding ETA) without writing to SurrealDB; reports both remote and local scenarios and marks your configured provider"
     )]
     Estimate {
         #[arg(help = "Path to project directory")]
@@ -291,19 +291,19 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Override Jina batch size (defaults to 2000 based on current limits)"
+            help = "Remote-API throughput assumption: nodes per Jina-sized batch (default 2000). Does NOT switch providers."
         )]
         jina_batch_size: Option<usize>,
 
         #[arg(
             long,
-            help = "Override minutes per Jina batch (defaults to 9 based on observed throughput)"
+            help = "Remote-API throughput assumption: minutes per Jina-sized batch (default 9). Does NOT switch providers."
         )]
         jina_batch_minutes: Option<f64>,
 
         #[arg(
             long,
-            help = "Override local embedding throughput (embeddings per minute)"
+            help = "Local-model throughput assumption: embeddings per minute. Does NOT switch providers."
         )]
         local_throughput: Option<f64>,
 
@@ -1542,7 +1542,7 @@ async fn handle_estimate(
         workers,
     );
 
-    println!(
+    eprintln!(
         "{} {}",
         "🔍 Estimating repository:".cyan().bold(),
         project_root.to_string_lossy()
@@ -1583,6 +1583,17 @@ fn present_estimate_output(
         .local_minutes
         .map(|local| parsing_minutes + local);
 
+    // The estimate always computes both throughput scenarios. Which one is the
+    // user's ETA depends on the *configured* provider, so classify it explicitly
+    // instead of presenting the remote/Jina figure as the primary result.
+    let provider_kind = classify_embedding_provider(provider);
+    let provider_class = provider_kind.as_str();
+    let estimated_total_minutes = match provider_kind {
+        ProviderKind::Remote => Some(total_jina_minutes),
+        ProviderKind::Local => total_local_minutes,
+        ProviderKind::Unknown => None,
+    };
+
     let payload = serde_json::json!({
         "path": project_root.to_string_lossy(),
         "languages": if languages.is_empty() { serde_json::Value::Null } else { serde_json::Value::from(languages.to_vec()) },
@@ -1603,6 +1614,7 @@ fn present_estimate_output(
         },
         "timings": {
             "jina": {
+                "note": "Remote-API throughput assumption modeled on Jina limits; this is your ETA only when the configured provider is Jina or another remote API.",
                 "batches": report.timings.jina_batches,
                 "batch_size": report.timings.jina_batch_size,
                 "batch_minutes": report.timings.jina_batch_minutes,
@@ -1610,6 +1622,7 @@ fn present_estimate_output(
                 "total_minutes_with_parsing": total_jina_minutes,
             },
             "local": {
+                "note": "Local-model throughput assumption; this is your ETA only when the configured provider is local (onnx/ollama/lmstudio).",
                 "rate_per_minute": report.timings.local_rate_per_minute,
                 "minutes": report.timings.local_minutes,
                 "total_minutes_with_parsing": total_local_minutes,
@@ -1618,6 +1631,9 @@ fn present_estimate_output(
         "workers": workers,
         "batch_size": batch_size,
         "embedding_provider": provider,
+        "embedding_provider_class": provider_class,
+        "estimate_basis": provider_class,
+        "estimated_total_minutes": estimated_total_minutes,
         "assumptions": {
             "jina_batch_size": throughput.jina_batch_size,
             "jina_batch_minutes": throughput.jina_batch_minutes,
@@ -1646,7 +1662,11 @@ fn present_estimate_output(
                     languages.join(", ")
                 }
             );
-            println!("Embedding provider (config): {}", provider);
+            println!(
+                "Embedding provider (config): {} [{}]",
+                provider,
+                provider_kind.describe()
+            );
             println!();
             println!(
                 "Files parsed: {} / {} (failed: {})",
@@ -1659,15 +1679,17 @@ fn present_estimate_output(
                 "Parsing time (measured): {}",
                 format_duration_minutes(parsing_minutes)
             );
+            println!();
             println!(
-                "Jina embeddings: {} ({} batches × {} nodes)",
-                format_duration_minutes(report.timings.jina_minutes),
-                report.timings.jina_batches,
-                report.timings.jina_batch_size
+                "{}",
+                "Embedding ETA — both throughput scenarios are shown; the provider is NOT selected here:"
             );
             println!(
-                "Total time (parsing + Jina): {}",
-                format_duration_minutes(total_jina_minutes)
+                "  Remote API ({} nodes/batch @ {:.1} min): {}{}",
+                report.timings.jina_batch_size,
+                report.timings.jina_batch_minutes,
+                format_duration_minutes(report.timings.jina_minutes),
+                scenario_marker(provider_kind == ProviderKind::Remote)
             );
             if let Some(local_minutes) = report.timings.local_minutes {
                 let rate = report
@@ -1675,24 +1697,45 @@ fn present_estimate_output(
                     .local_rate_per_minute
                     .unwrap_or(default_local_rate(workers));
                 println!(
-                    "Local embeddings: {} ({:.0} embeddings/min)",
+                    "  Local model ({:.0} embeddings/min): {}{}",
+                    rate,
                     format_duration_minutes(local_minutes),
-                    rate
+                    scenario_marker(provider_kind == ProviderKind::Local)
                 );
-                if let Some(total_local) = total_local_minutes {
-                    println!(
-                        "Total time (parsing + local): {}",
-                        format_duration_minutes(total_local)
-                    );
-                }
             } else {
-                println!(
-                    "{}",
-                    "Local embeddings: set --local-throughput to compare speed.".dimmed()
-                );
+                println!("  Local model: pass --local-throughput to estimate this scenario.");
+            }
+            match provider_kind {
+                ProviderKind::Remote => println!(
+                    "Estimated total for configured provider '{}' (remote, parsing + embeddings): {}",
+                    provider,
+                    format_duration_minutes(total_jina_minutes)
+                ),
+                ProviderKind::Local => {
+                    if let Some(total_local) = total_local_minutes {
+                        println!(
+                            "Estimated total for configured provider '{}' (local, parsing + embeddings): {}",
+                            provider,
+                            format_duration_minutes(total_local)
+                        );
+                    } else {
+                        println!(
+                            "Estimated total for configured provider '{}' (local): unavailable until --local-throughput is set.",
+                            provider
+                        );
+                    }
+                }
+                ProviderKind::Unknown => println!(
+                    "Estimated total: n/a — configured provider '{}' is auto/unknown; compare the scenarios above.",
+                    provider
+                ),
             }
             println!(
-                "Assumptions: {} nodes/batch @ {:.1} min, local {:.0} embeddings/min baseline.",
+                "{}",
+                "Note: these are throughput heuristics, not a claim that embeddings run remotely."
+            );
+            println!(
+                "Throughput assumptions: remote {} nodes/batch @ {:.1} min, local {:.0} embeddings/min.",
                 throughput.jina_batch_size,
                 throughput.jina_batch_minutes,
                 throughput
@@ -1707,6 +1750,53 @@ fn present_estimate_output(
     }
 
     Ok(())
+}
+
+/// How the configured embedding provider is expected to run, so the estimate can
+/// label which throughput scenario actually applies to the user's setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    Local,
+    Remote,
+    Unknown,
+}
+
+impl ProviderKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProviderKind::Local => "local",
+            ProviderKind::Remote => "remote",
+            ProviderKind::Unknown => "unknown",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            ProviderKind::Local => "local model",
+            ProviderKind::Remote => "remote API",
+            ProviderKind::Unknown => "auto/unknown",
+        }
+    }
+}
+
+/// Classify the `[embedding].provider` string. Anything unrecognized (including
+/// `auto`) is `Unknown`; we must not guess and present a remote ETA as the answer.
+fn classify_embedding_provider(provider: &str) -> ProviderKind {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "onnx" | "ollama" | "lmstudio" | "local" => ProviderKind::Local,
+        "openai" | "jina" | "cohere" | "huggingface" | "voyage" | "mistral" | "together" => {
+            ProviderKind::Remote
+        }
+        _ => ProviderKind::Unknown,
+    }
+}
+
+fn scenario_marker(is_configured: bool) -> &'static str {
+    if is_configured {
+        "   <- your configured provider"
+    } else {
+        "   (reference only)"
+    }
 }
 
 fn resolve_throughput_config(
