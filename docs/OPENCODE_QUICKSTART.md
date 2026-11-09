@@ -83,6 +83,12 @@ codegraph init . --hooks none --index-tier balanced
 
 ```bash
 codegraph estimate . -r --languages rust --index-tier balanced
+```
+
+`estimate` 同时给出 remote / local 两种吞吐场景，并按 `CODEGRAPH_EMBEDDING_PROVIDER`
+标注哪条对应你的配置；它只做预估，不会切换或选择 provider。
+
+```bash
 codegraph index . -r --index-tier balanced --languages rust \
   > /tmp/cg-index.log 2>&1 &
 tail -f /tmp/cg-index.log
@@ -138,10 +144,11 @@ opencode mcp list        # 期望 codegraph  connected
 ## 5. 验证清单
 
 ```bash
-# 1) 索引存在
-ls -d .codegraph/db
+# 1) 确认存储目标：server 模式（推荐）写在 CODEGRAPH_SURREALDB_URL，
+#    本地 .codegraph/db 只在显式 surrealkv:// 的 embedded 模式下才存在
+echo "${CODEGRAPH_SURREALDB_URL:-ws://127.0.0.1:8000 (default)}"
 
-# 2) 直连查询（无 LLM，秒级）
+# 2) 直连查询（无 LLM，秒级）；与 index/agent 读同一套存储，不会私自退回本地 .codegraph/db
 codegraph query <真实符号> --callers
 
 # 3) agent 查询（20–60 秒，需 LLM 配置）

@@ -512,6 +512,13 @@ CODEGRAPH_SURREALDB_PASSWORD=root
 
 In server mode the schema is not applied automatically and all projects share the database (rows are scoped by project id).
 
+Every command resolves storage the same way: `index`, `query`, `agent`, `status`, and
+`codegraph start` all connect to `CODEGRAPH_SURREALDB_URL` when it is set, otherwise to the
+default shared server. They never fall back to a local `.codegraph/db` on their own — the
+embedded store is used only when `CODEGRAPH_SURREALDB_URL` is itself a `surrealkv://` path.
+So if indexing wrote to a server, `codegraph query` reads from that same server even when the
+project directory has no `.codegraph` folder.
+
 ### Setting Up SurrealDB
 
 Use SurrealDB 3.x (the embedded SDK is 3.3). Follow SurrealDB's upgrade guide before opening an existing 2.x database with a 3.x server. After the server is up, apply the schema (see [Creating the Database Schema](#creating-the-database-schema)).

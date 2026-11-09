@@ -223,7 +223,7 @@ Verify the index:
 
 ```bash
 codegraph status --detailed
-codegraph query "RequestRouter" --callers        # fast, no LLM
+codegraph query "RequestRouter" --callers        # fast, no LLM; reads the same store as `index` (CODEGRAPH_SURREALDB_URL or the default server)
 ```
 
 ### 5. Connect your agent (MCP)
