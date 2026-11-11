@@ -1972,6 +1972,7 @@ impl ProjectIndexer {
                 embedding_start.elapsed().as_millis() as u64,
             );
             let resolution_start = std::time::Instant::now();
+            let catalog_build_start = std::time::Instant::now();
             // A partial re-index only sees the scanned files. Load the rest of the
             // project's symbols so edges emitted by the scanned files still resolve.
             let catalog = if reconcile_scope.is_some() {
@@ -1999,7 +2000,16 @@ impl ProjectIndexer {
             } else {
                 crate::resolution::SymbolCatalog::new(&nodes)
             };
+            phase_ms.insert(
+                "resolution_catalog_build".into(),
+                catalog_build_start.elapsed().as_millis() as u64,
+            );
+            let unique_aliases_start = std::time::Instant::now();
             let symbol_map = catalog.unique_aliases();
+            phase_ms.insert(
+                "resolution_unique_aliases".into(),
+                unique_aliases_start.elapsed().as_millis() as u64,
+            );
             let mut targets = Vec::with_capacity(edges.len());
             let mut resolution_provenance = Vec::with_capacity(edges.len());
             let mut exact_count = 0;
@@ -2009,6 +2019,7 @@ impl ProjectIndexer {
             // parallelises with rayon (order preserved by collect); the two
             // memoisation maps become DashMaps, and the counters are derived from
             // provenance afterwards so no atomics are needed.
+            let exact_loop_start = std::time::Instant::now();
             {
                 let normalized: dashmap::DashMap<String, Vec<String>> = dashmap::DashMap::new();
                 let lexical_cache: dashmap::DashMap<(NodeId, String), Option<(NodeId, f64)>> =
@@ -2065,6 +2076,38 @@ impl ProjectIndexer {
                     resolution_provenance.push(provenance);
                 }
             }
+            phase_ms.insert(
+                "resolution_exact_loop".into(),
+                exact_loop_start.elapsed().as_millis() as u64,
+            );
+            info!(
+                "⏱️ Resolution exact loop: {} ms on {} workers",
+                exact_loop_start.elapsed().as_millis(),
+                rayon::current_num_threads()
+            );
+            // Fuzzy fallback diagnostics: calls and summed CPU time across rayon
+            // workers. `resolution_fuzzy_ms` is a sum, not wall-clock time.
+            let fuzzy = catalog.fuzzy_stats();
+            phase_ms.insert("resolution_fuzzy_calls".into(), fuzzy.calls);
+            phase_ms.insert("resolution_fuzzy_ms".into(), fuzzy.nanos / 1_000_000);
+            phase_ms.insert("resolution_fuzzy_candidates".into(), fuzzy.candidates);
+            info!(
+                "🔤 Fuzzy resolution: {} calls, {} candidates, {} ms summed across workers",
+                fuzzy.calls,
+                fuzzy.candidates,
+                fuzzy.nanos / 1_000_000
+            );
+            // Diagnostic only: the rayon pool size actually used by the loop above.
+            // Recorded as a raw number (not a duration) so it is never summed.
+            phase_ms.insert(
+                "resolution_threads".into(),
+                rayon::current_num_threads() as u64,
+            );
+            let resolution_tail_start = std::time::Instant::now();
+            phase_ms.insert(
+                "resolution_tail".into(),
+                resolution_tail_start.elapsed().as_millis() as u64,
+            );
             phase_ms.insert(
                 "resolution_exact_lexical".into(),
                 resolution_start.elapsed().as_millis() as u64,
