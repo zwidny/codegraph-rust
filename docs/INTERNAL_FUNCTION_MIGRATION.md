@@ -47,7 +47,7 @@ scoring, dedupe, context assembly and every graph algorithm.
 | 2 | `expand`, `get_transitive_dependencies`, `get_reverse_dependencies`, `trace_call_chain` | medium | done |
 | 3 | `get_complexity_hotspots`, `find_nodes_by_name`, `get_top_directories`, `count_nodes_for_project` | low | hotspots done; the other three pending |
 | 4 | `knn_chunks`, `knn_nodes`, `semantic_search_*`, `search_snippets` | medium-high (keeps HNSW SQL) | not started |
-| 5 | `kmeans` | medium | not started |
+| 5 | `kmeans` | medium | done |
 | 6 | helpers: `edge_types`, `parse_record_id`, `resolve_node`, `node_info`, `edge_context` | low | not started |
 
 ### Known differences for batch 2 (deliberate, do not "fix" silently)
@@ -118,6 +118,20 @@ has no reference to compare against.
 | `DEFINE ACCESS` least-privilege user | yes | replaces `root/root`; per-database user, read/write on its own database |
 | `DEFINE EVENT` | no | the project deliberately avoids cascades (`edges survive a node delete on purpose`) |
 | Live query | no | `--watch` is in-process; no consumer needs DB push today |
+
+## Switching callers over (the step that actually pays off)
+
+Every `*_native` method written so far has **no caller**: MCP tools still go through the
+SurrealQL functions. Until callers switch, the Rust code is dead weight and the differences
+above stay theoretical. Switching is its own batch and needs a different test technique than
+the fixtures:
+
+1. Pick one method, switch its one caller behind `CODEGRAPH_NATIVE_ANALYSIS=1`.
+2. Run both paths against a real project database (EasyTier: 38057 nodes / 72940 edges /
+   8317 self-loops) and diff the outputs, not just counts.
+3. Only then flip the default and delete the SurrealQL function.
+
+Real-data comparison matters because fixture tests missed a live 11.4% self-loop rate.
 
 ## Non-goals
 
