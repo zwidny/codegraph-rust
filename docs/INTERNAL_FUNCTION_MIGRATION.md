@@ -60,6 +60,7 @@ scoring, dedupe, context assembly and every graph algorithm.
 | same-depth ordering | `ORDER BY depth` has no tie-break; the native path emits BFS discovery order. | Tests compare after sorting by `(id, depth)`, so ordering is not part of the contract. |
 | `trace_bfs` path elements | Path stores node ids, not names: `TraceStep` only receives `EdgeRow`, which has no callee name. | Unobservable: `CallChainNode` has no `call_path` field, so the native path never emits it. |
 | `called_by` truncation | SurrealQL slices to 10 before hydrating; the native path does the same. Group order is undefined in SurrealQL. | Tests assert the count is 10, not which ten, to stay non-flaky. |
+| cycle multiplicity | `fn::detect_circular_dependencies` emits one row per matching **edge record**, so a pair backed by three edges appears three times (real EasyTier data: 187 rows for 75 unique pairs on `calls`). The native path emits each pair once. | Intentional: edges are occurrence-aware, and showing the same cycle three times adds nothing. The unique-pair **set** is identical (verified on real data: 75 = 75). Callers must not rely on row counts. |
 
 ### Degree counting and self-loops
 

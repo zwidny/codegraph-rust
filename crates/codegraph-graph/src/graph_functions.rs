@@ -225,6 +225,10 @@ impl GraphFunctions {
         &self,
         edge_type: &str,
     ) -> Result<Vec<CircularDependency>> {
+        if native_analysis_enabled() {
+            return self.detect_circular_dependencies_native(edge_type).await;
+        }
+
         debug!(
             "Calling fn::detect_circular_dependencies({}, project={})",
             edge_type, self.project_id
@@ -544,6 +548,19 @@ impl GraphFunctions {
     /// # Returns
     /// Coupling metrics including afferent, efferent, and instability
     pub async fn calculate_coupling_metrics(&self, node_id: &str) -> Result<CouplingMetricsResult> {
+        if native_analysis_enabled() {
+            // The native path reports a missing node as `None`; keep the SurrealQL path's
+            // contract of surfacing that case as an error with the same message.
+            return match self.calculate_coupling_metrics_native(node_id).await? {
+                Some(result) => Ok(result),
+                None => Err(CodeGraphError::Database(format!(
+                    "Node not found or project_id mismatch: node_id='{}', expected project_id='{}'. \
+                        Ensure the node exists and was indexed with the same project_id.",
+                    node_id, self.project_id
+                ))),
+            };
+        }
+
         debug!(
             "Calling fn::calculate_coupling_metrics({}, project={})",
             node_id, self.project_id
