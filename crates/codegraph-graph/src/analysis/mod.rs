@@ -17,7 +17,32 @@
 //! The SurrealQL functions stay in the schema until each Rust replacement is verified
 //! against it by a differential test, so the two can be compared directly.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+
+/// Edge types that count as dependencies, mirroring
+/// `DEFINE PARAM $dependency_edge_types` in `schema/codegraph_v2.surql`.
+///
+/// This is the single source of truth; `GraphFunctions::DEPENDENCY_EDGE_TYPES`
+/// re-exports it so both the SQL bind list and the pure scoring agree.
+pub const DEPENDENCY_EDGE_TYPES: &[&str] = &[
+    "calls",
+    "defines",
+    "imports",
+    "uses",
+    "extends",
+    "implements",
+    "references",
+    "depends_on",
+    "exports",
+    "reexports",
+    "enables",
+    "generates",
+    "flows_to",
+    "returns",
+    "captures",
+    "mutates",
+];
 
 /// One edge as loaded from storage, with record ids kept as strings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -99,15 +124,15 @@ pub fn mutual_pairs(edges: &[EdgeRow], edge_type: &str) -> Vec<(String, String)>
 ///
 /// Unlike the SurrealQL implementation there is no output-size limit, so this is exact
 /// for the whole project rather than a bounded candidate set.
+///
+/// Self-loops are counted in both directions, matching the stored procedures: a
+/// `x -> x` edge contributes one afferent and one efferent degree to `x`.
 pub fn degrees(edges: &[EdgeRow], edge_types: &[&str]) -> HashMap<String, Degrees> {
     let wanted: HashSet<String> = edge_types.iter().map(|t| t.to_ascii_lowercase()).collect();
 
     let mut out: HashMap<String, Degrees> = HashMap::new();
     for edge in edges {
         if !wanted.is_empty() && !wanted.contains(&edge.edge_type.to_ascii_lowercase()) {
-            continue;
-        }
-        if edge.from == edge.to {
             continue;
         }
         out.entry(edge.to.clone()).or_default().afferent += 1;
@@ -126,6 +151,72 @@ pub fn hubs(edges: &[EdgeRow], edge_types: &[&str], min_degree: usize) -> Vec<(S
         .collect();
     ranked.sort_by(|a, b| b.1.total().cmp(&a.1.total()).then_with(|| a.0.cmp(&b.0)));
     ranked
+}
+
+/// Coupling and risk for one complexity candidate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComplexityScore {
+    /// Dependency edges pointing at the node.
+    pub afferent: usize,
+    /// Dependency edges leaving the node.
+    pub efferent: usize,
+    /// `efferent / (afferent + efferent)` rounded to four decimals; 0 when isolated.
+    pub instability: f32,
+    /// `complexity * (afferent + 1)`.
+    pub risk_score: f32,
+}
+
+/// Score complexity candidates exactly like the tail of `fn::get_complexity_hotspots`.
+///
+/// `complexities` must already be the SQL-side candidate set (`node_type` matched and
+/// `complexity >= threshold`, ordered by complexity and bounded to `limit * 2`): this
+/// function only adds coupling, instability and risk, then sorts by risk and truncates.
+///
+/// Scoring reads coupling from [`degrees`], so a self-loop counts once as afferent and
+/// once as efferent, matching the stored procedure's `GROUP BY` + `count()`.
+pub fn score_hotspots(
+    complexities: &[(String, f32)],
+    edges: &[EdgeRow],
+    limit: usize,
+) -> Vec<(String, ComplexityScore)> {
+    if complexities.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    let degrees = degrees(edges, DEPENDENCY_EDGE_TYPES);
+    let mut scored: Vec<(String, ComplexityScore)> = complexities
+        .iter()
+        .map(|(id, complexity)| {
+            let coupled = degrees.get(id).copied().unwrap_or_default();
+            let total = coupled.total();
+            // `math::round(x * 10000f) / 10000f`.
+            let instability = if total > 0 {
+                ((coupled.efferent as f32 / total as f32) * 10_000.0).round() / 10_000.0
+            } else {
+                0.0
+            };
+            let risk_score = *complexity * (coupled.afferent as f32 + 1.0);
+            (
+                id.clone(),
+                ComplexityScore {
+                    afferent: coupled.afferent,
+                    efferent: coupled.efferent,
+                    instability,
+                    risk_score,
+                },
+            )
+        })
+        .collect();
+
+    // `ORDER BY risk_score DESC`; ties fall back to the id so the output is deterministic.
+    scored.sort_by(|a, b| {
+        b.1.risk_score
+            .partial_cmp(&a.1.risk_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored.truncate(limit);
+    scored
 }
 
 /// Traversal direction for [`expand_bfs`].
@@ -552,9 +643,17 @@ mod tests {
     }
 
     #[test]
-    fn degrees_ignores_self_loops() {
+    fn degrees_counts_self_loops() {
         let edges = vec![edge("nodes:a", "nodes:a", "calls")];
-        assert!(degrees(&edges, &[]).is_empty());
+        let counted = degrees(&edges, &[]);
+        assert_eq!(
+            counted["nodes:a"],
+            Degrees {
+                afferent: 1,
+                efferent: 1,
+            }
+        );
+        assert_eq!(counted["nodes:a"].total(), 2);
     }
 
     #[test]
@@ -722,5 +821,120 @@ mod tests {
             depths(&trace_bfs(&edges, "nodes:a", "a", 5)),
             vec![("nodes:c".to_string(), 1)]
         );
+    }
+
+    fn candidates(rows: &[(&str, f32)]) -> Vec<(String, f32)> {
+        rows.iter()
+            .map(|(id, complexity)| ((*id).to_string(), *complexity))
+            .collect()
+    }
+
+    #[test]
+    fn score_hotspots_counts_coupling_and_rounds_instability() {
+        let edges = vec![
+            edge("nodes:x", "nodes:a", "calls"),
+            edge("nodes:y", "nodes:a", "imports"),
+            edge("nodes:a", "nodes:z", "uses"),
+        ];
+        let scored = score_hotspots(&candidates(&[("nodes:a", 10.0)]), &edges, 10);
+        assert_eq!(
+            scored,
+            vec![(
+                "nodes:a".to_string(),
+                ComplexityScore {
+                    afferent: 2,
+                    efferent: 1,
+                    instability: 0.3333,
+                    risk_score: 30.0,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn score_hotspots_counts_self_loops_and_isolated_nodes_report_zero() {
+        let edges = vec![
+            edge("nodes:a", "nodes:a", "calls"),
+            edge("nodes:b", "nodes:b", "imports"),
+        ];
+        let scored = score_hotspots(
+            &candidates(&[("nodes:a", 8.0), ("nodes:c", 2.0)]),
+            &edges,
+            10,
+        );
+        let scores: HashMap<&str, ComplexityScore> = scored
+            .iter()
+            .map(|(id, score)| (id.as_str(), *score))
+            .collect();
+        assert_eq!(
+            scores["nodes:a"],
+            ComplexityScore {
+                afferent: 1,
+                efferent: 1,
+                instability: 0.5,
+                risk_score: 16.0,
+            }
+        );
+        assert_eq!(scores["nodes:c"].risk_score, 2.0);
+        assert_eq!(scores["nodes:c"].afferent, 0);
+        assert_eq!(scores["nodes:c"].efferent, 0);
+        assert_eq!(scores["nodes:c"].instability, 0.0);
+    }
+
+    #[test]
+    fn score_hotspots_only_counts_dependency_edges() {
+        let edges = vec![
+            edge("nodes:x", "nodes:a", "contains"),
+            edge("nodes:y", "nodes:a", "calls"),
+        ];
+        let scored = score_hotspots(&candidates(&[("nodes:a", 6.0)]), &edges, 10);
+        assert_eq!(scored[0].1.afferent, 1);
+        assert_eq!(scored[0].1.risk_score, 12.0);
+    }
+
+    #[test]
+    fn score_hotspots_orders_by_risk_and_truncates_to_limit() {
+        // a: 10 * (1 + 1) = 20; d: 9 * (1 + 1) = 18; b: 4 * (3 + 1) = 16; c: 1 * (0 + 1) = 1.
+        let edges = vec![
+            edge("nodes:x", "nodes:a", "calls"),
+            edge("nodes:w", "nodes:b", "calls"),
+            edge("nodes:v", "nodes:b", "calls"),
+            edge("nodes:u", "nodes:b", "calls"),
+            edge("nodes:t", "nodes:d", "calls"),
+            // u/v/w/x/t are not candidates; edges to non-candidates must not leak in.
+            edge("nodes:b", "nodes:y", "calls"),
+        ];
+        let all = score_hotspots(
+            &candidates(&[
+                ("nodes:a", 10.0),
+                ("nodes:b", 4.0),
+                ("nodes:c", 1.0),
+                ("nodes:d", 9.0),
+            ]),
+            &edges,
+            10,
+        );
+        let ids: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["nodes:a", "nodes:d", "nodes:b", "nodes:c"]);
+
+        let top2 = score_hotspots(
+            &candidates(&[("nodes:c", 1.0), ("nodes:d", 9.0), ("nodes:a", 10.0)]),
+            &edges,
+            2,
+        );
+        assert_eq!(top2.len(), 2);
+        assert_eq!(top2[0].0, "nodes:a");
+        assert_eq!(top2[1].0, "nodes:d");
+    }
+
+    #[test]
+    fn score_hotspots_ties_break_by_id_and_limit_zero_returns_nothing() {
+        // Equal complexity and no coupling -> equal risk; ids must order the tie.
+        let scored = score_hotspots(&candidates(&[("nodes:z", 3.0), ("nodes:a", 3.0)]), &[], 10);
+        let ids: Vec<&str> = scored.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["nodes:a", "nodes:z"]);
+
+        assert!(score_hotspots(&candidates(&[("nodes:a", 3.0)]), &[], 0).is_empty());
+        assert!(score_hotspots(&[], &[], 10).is_empty());
     }
 }

@@ -776,24 +776,8 @@ impl GraphFunctions {
     /// Vector of nodes that depend on the target node
     /// Edge types that count as dependencies, mirroring
     /// `DEFINE PARAM $dependency_edge_types` in `schema/codegraph_v2.surql`.
-    pub const DEPENDENCY_EDGE_TYPES: &'static [&'static str] = &[
-        "calls",
-        "defines",
-        "imports",
-        "uses",
-        "extends",
-        "implements",
-        "references",
-        "depends_on",
-        "exports",
-        "reexports",
-        "enables",
-        "generates",
-        "flows_to",
-        "returns",
-        "captures",
-        "mutates",
-    ];
+    pub const DEPENDENCY_EDGE_TYPES: &'static [&'static str] =
+        crate::analysis::DEPENDENCY_EDGE_TYPES;
 
     /// Rust implementation of `fn::get_hub_nodes`.
     ///
@@ -838,9 +822,6 @@ impl GraphFunctions {
         let mut incoming: HashMap<(String, String), i32> = HashMap::new();
         let mut outgoing: HashMap<(String, String), i32> = HashMap::new();
         for edge in &edges {
-            if edge.from == edge.to {
-                continue;
-            }
             if keep.contains(edge.to.as_str()) {
                 *incoming
                     .entry((edge.to.clone(), edge.edge_type.to_ascii_lowercase()))
@@ -1185,6 +1166,126 @@ impl GraphFunctions {
             })?;
 
         Ok(result)
+    }
+
+    /// Rust implementation of `fn::get_complexity_hotspots`.
+    ///
+    /// Reads the same bounded candidate set (`complexity DESC`, at most `limit * 2` rows),
+    /// loads the dependency edges touching those candidates, then scores them with
+    /// [`crate::analysis::score_hotspots`].
+    pub async fn get_complexity_hotspots_native(
+        &self,
+        min_complexity: f32,
+        limit: i32,
+    ) -> Result<Vec<ComplexityHotspot>> {
+        use std::collections::HashMap;
+
+        // `IF $limit > 0 AND $limit <= 100 THEN $limit ELSE 20 END`.
+        let safe_limit = if limit > 0 && limit <= 100 {
+            limit as usize
+        } else {
+            20
+        };
+        // `IF $min_complexity > 0f THEN $min_complexity ELSE 5f END`.
+        let threshold = if min_complexity > 0.0 {
+            min_complexity
+        } else {
+            5.0
+        };
+
+        #[derive(Deserialize, Serialize)]
+        struct Candidate {
+            id: String,
+            name: String,
+            kind: Option<String>,
+            language: Option<String>,
+            file_path: Option<String>,
+            start_line: Option<i32>,
+            end_line: Option<i32>,
+            complexity: f32,
+        }
+
+        crate::impl_surreal_serde!(Candidate);
+
+        let candidates: Vec<Candidate> = self
+            .db
+            .query(
+                "SELECT <string>id AS id, name, node_type AS kind, language, file_path, \
+                 start_line, end_line, complexity \
+                 FROM nodes WHERE project_id = $project_id \
+                 AND string::lowercase(node_type) INSIDE ['function', 'method'] \
+                 AND complexity >= $threshold \
+                 ORDER BY complexity DESC LIMIT $candidate_limit",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .bind(("threshold", threshold))
+            .bind(("candidate_limit", (safe_limit * 2) as i64))
+            .await
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native complexity candidate load failed: {e}"))
+            })?
+            .take(0)
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native complexity candidate decode failed: {e}"))
+            })?;
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+        let types: Vec<String> = Self::DEPENDENCY_EDGE_TYPES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        let edges: Vec<crate::analysis::EdgeRow> = self
+            .db
+            .query(
+                "SELECT <string>`from` AS `from`, <string>`to` AS `to`, edge_type \
+                 FROM edges WHERE project_id = $project_id AND edge_type INSIDE $types \
+                 AND (<string>`to` IN $ids OR <string>`from` IN $ids)",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .bind(("types", types))
+            .bind(("ids", ids))
+            .await
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native complexity edge load failed: {e}"))
+            })?
+            .take(0)
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native complexity edge decode failed: {e}"))
+            })?;
+
+        let pairs: Vec<(String, f32)> = candidates
+            .iter()
+            .map(|c| (c.id.clone(), c.complexity))
+            .collect();
+        let scored = crate::analysis::score_hotspots(&pairs, &edges, safe_limit);
+
+        let by_id: HashMap<&str, &Candidate> =
+            candidates.iter().map(|c| (c.id.as_str(), c)).collect();
+        let mut out = Vec::with_capacity(scored.len());
+        for (id, score) in scored {
+            let Some(c) = by_id.get(id.as_str()) else {
+                continue;
+            };
+            out.push(ComplexityHotspot {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                kind: c.kind.clone(),
+                language: c.language.clone(),
+                file_path: c.file_path.clone(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                complexity: c.complexity,
+                afferent_coupling: score.afferent as i32,
+                efferent_coupling: score.efferent as i32,
+                instability: score.instability,
+                risk_score: score.risk_score,
+            });
+        }
+        Ok(out)
     }
 
     /// Count nodes for the current project (used for health checks)

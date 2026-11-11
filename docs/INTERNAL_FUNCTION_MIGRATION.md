@@ -45,7 +45,7 @@ scoring, dedupe, context assembly and every graph algorithm.
 |---|---|---|---|
 | 1 | `mutual_pairs` (cycles), `degrees`/`hubs`, `coupling` | low | done |
 | 2 | `expand`, `get_transitive_dependencies`, `get_reverse_dependencies`, `trace_call_chain` | medium | done |
-| 3 | `get_complexity_hotspots`, `find_nodes_by_name`, `get_top_directories`, `count_nodes_for_project` | low | not started |
+| 3 | `get_complexity_hotspots`, `find_nodes_by_name`, `get_top_directories`, `count_nodes_for_project` | low | hotspots done; the other three pending |
 | 4 | `knn_chunks`, `knn_nodes`, `semantic_search_*`, `search_snippets` | medium-high (keeps HNSW SQL) | not started |
 | 5 | `kmeans` | medium | not started |
 | 6 | helpers: `edge_types`, `parse_record_id`, `resolve_node`, `node_info`, `edge_context` | low | not started |
@@ -60,6 +60,22 @@ scoring, dedupe, context assembly and every graph algorithm.
 | same-depth ordering | `ORDER BY depth` has no tie-break; the native path emits BFS discovery order. | Tests compare after sorting by `(id, depth)`, so ordering is not part of the contract. |
 | `trace_bfs` path elements | Path stores node ids, not names: `TraceStep` only receives `EdgeRow`, which has no callee name. | Unobservable: `CallChainNode` has no `call_path` field, so the native path never emits it. |
 | `called_by` truncation | SurrealQL slices to 10 before hydrating; the native path does the same. Group order is undefined in SurrealQL. | Tests assert the count is 10, not which ten, to stay non-flaky. |
+
+### Degree counting and self-loops
+
+Self-loops are **not** rare: EasyTier has 8317 of 72940 edges (11.4%) with `from = to`,
+mostly recursive calls. `fn::get_hub_nodes` and `fn::get_complexity_hotspots` count them
+via `GROUP BY \`to\`` / `GROUP BY \`from\``, so a self-loop contributes one afferent and
+one efferent. `analysis::degrees` must mirror that; the first version skipped self-loops
+and silently under-counted every degree by up to 11%. Verified against live data:
+a node with one real incoming edge plus one self-loop reports `afferent=2, efferent=1`.
+
+`fn::detect_circular_dependencies` is the opposite case: it explicitly filters
+`\`from\` != \`to\``, so `analysis::mutual_pairs` must keep skipping self-loops.
+
+Any new degree-based function must decide which of the two rules applies and test the
+self-loop case explicitly — the fixture-based differential tests passed for weeks while
+this bug was live because the fixture had no self-loops.
 
 ### Latent decoding hazard (pre-existing, both paths)
 

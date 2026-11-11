@@ -442,6 +442,27 @@ async fn native_hub_nodes_match_surrealdb_function() {
     use std::sync::Arc;
 
     let db = db_with_fixture().await;
+    // A self-loop edge must count in both directions, like the stored procedure's
+    // independent GROUP BY `to` / GROUP BY `from` counts.
+    db.query(
+        "CREATE type::record('nodes', 'm') SET name = 'self_loop', node_type = 'Function', \
+         language = 'rust', file_path = 'src/loop.rs', start_line = 1, end_line = 2, \
+         project_id = $p",
+    )
+    .bind(("p", PROJECT.to_string()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    db.query(
+        "UPSERT type::record('edges', 'e7') SET `from` = type::record('nodes', 'm'), \
+         `to` = type::record('nodes', 'm'), edge_type = 'calls', project_id = $p",
+    )
+    .bind(("p", PROJECT.to_string()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
     let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
 
     let key = |rows: &[HubNode]| {
@@ -476,7 +497,7 @@ async fn native_hub_nodes_match_surrealdb_function() {
         );
     }
 
-    // Fixture degrees (self-loops excluded): a 2/1, b 1/2, c 1/1, d 1/1.
+    // Fixture degrees: a 2/1, b 1/2, c 1/1, d 1/1; m's self-loop makes it 1/1.
     let hubs = functions.get_hub_nodes_native(3).await.unwrap();
     assert_eq!(
         key(&hubs),
@@ -485,6 +506,38 @@ async fn native_hub_nodes_match_surrealdb_function() {
             ("nodes:b".to_string(), 1, 2, 3),
         ]
     );
+
+    let with_loop = functions.get_hub_nodes_native(2).await.unwrap();
+    let expected_with_loop = functions.get_hub_nodes(2).await.unwrap();
+    assert_eq!(
+        key(&with_loop),
+        key(&expected_with_loop),
+        "hub ranking diverged with a self-loop"
+    );
+    let m = with_loop
+        .iter()
+        .find(|h| h.node_id == "nodes:m")
+        .expect("self-loop node must rank at min_degree 2");
+    assert_eq!(
+        (m.afferent_degree, m.efferent_degree, m.total_degree),
+        (1, 1, 2)
+    );
+    assert_eq!(m.incoming_by_type.len(), 1, "{:?}", m.incoming_by_type);
+    assert_eq!(m.incoming_by_type[0].edge_type, "calls");
+    assert_eq!(m.incoming_by_type[0].count, 1);
+    assert_eq!(m.outgoing_by_type.len(), 1, "{:?}", m.outgoing_by_type);
+    assert_eq!(m.outgoing_by_type[0].count, 1);
+
+    let surreal_m = expected_with_loop
+        .iter()
+        .find(|h| h.node_id == "nodes:m")
+        .expect("surrealql ranks the self-loop node too");
+    assert_eq!(
+        (surreal_m.afferent_degree, surreal_m.efferent_degree),
+        (1, 1)
+    );
+    assert_eq!(surreal_m.incoming_by_type[0].count, 1);
+    assert_eq!(surreal_m.outgoing_by_type[0].count, 1);
 }
 
 /// Differential test for the `fn::*` -> Rust migration: the Rust cycle search must return
@@ -545,6 +598,27 @@ async fn native_coupling_metrics_match_surrealdb_function() {
     use std::sync::Arc;
 
     let db = db_with_fixture().await;
+    // Self-loop on m: `distinct(from)` and `distinct(to)` both contain m, so m becomes its
+    // own dependent and dependency (1/1), just like the stored procedure.
+    db.query(
+        "CREATE type::record('nodes', 'm') SET name = 'self_loop', node_type = 'Function', \
+         language = 'rust', file_path = 'src/loop.rs', start_line = 1, end_line = 2, \
+         project_id = $p",
+    )
+    .bind(("p", PROJECT.to_string()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    db.query(
+        "UPSERT type::record('edges', 'e7') SET `from` = type::record('nodes', 'm'), \
+         `to` = type::record('nodes', 'm'), edge_type = 'calls', project_id = $p",
+    )
+    .bind(("p", PROJECT.to_string()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
     let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
 
     let ids = |rows: &[codegraph_graph::graph_functions::NodeReference]| {
@@ -626,6 +700,38 @@ async fn native_coupling_metrics_match_surrealdb_function() {
             .unwrap()
             .is_none()
     );
+
+    // Self-loop: 1/1 on both paths, instability 0.5, and m appears in both neighbour sets.
+    let expected_m = functions
+        .calculate_coupling_metrics("m")
+        .await
+        .expect("surrealql path");
+    let native_m = functions
+        .calculate_coupling_metrics_native("m")
+        .await
+        .unwrap()
+        .expect("native path");
+    assert_eq!(native_m.metrics.afferent_coupling, 1);
+    assert_eq!(native_m.metrics.efferent_coupling, 1);
+    assert_eq!(
+        native_m.metrics.afferent_coupling,
+        expected_m.metrics.afferent_coupling
+    );
+    assert_eq!(
+        native_m.metrics.efferent_coupling,
+        expected_m.metrics.efferent_coupling
+    );
+    assert!((native_m.metrics.instability - 0.5).abs() < 1e-9);
+    assert!(
+        (native_m.metrics.instability - expected_m.metrics.instability).abs() < 1e-9,
+        "{} vs {}",
+        native_m.metrics.instability,
+        expected_m.metrics.instability
+    );
+    assert_eq!(ids(&native_m.dependents), vec!["nodes:m".to_string()]);
+    assert_eq!(ids(&native_m.dependencies), vec!["nodes:m".to_string()]);
+    assert_eq!(ids(&native_m.dependents), ids(&expected_m.dependents));
+    assert_eq!(ids(&native_m.dependencies), ids(&expected_m.dependencies));
 }
 
 /// Differential test for `fn::expand` in the `out` direction: the Rust BFS must return the
@@ -1212,4 +1318,214 @@ async fn native_trace_call_chain_matches_surrealdb_function() {
         Some(10),
         "surrealql called_by cap"
     );
+}
+
+/// Differential test for `fn::get_complexity_hotspots`: candidate selection, coupling
+/// counts, instability and risk must match the stored procedure. Integer coupling columns
+/// are compared exactly; the three float columns use a 1e-4 relative tolerance because the
+/// schema computes them as f64 while `ComplexityHotspot` stores f32.
+#[tokio::test]
+async fn native_complexity_hotspots_match_surrealdb_function() {
+    use codegraph_graph::graph_functions::{ComplexityHotspot, GraphFunctions};
+    use std::sync::Arc;
+
+    let db = db_with_fixture().await;
+    let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
+
+    let native_key = |rows: &[ComplexityHotspot]| -> Vec<(String, i32, i32)> {
+        let mut v: Vec<(String, i32, i32)> = rows
+            .iter()
+            .map(|r| (r.id.clone(), r.afferent_coupling, r.efferent_coupling))
+            .collect();
+        v.sort();
+        v
+    };
+    let surreal_key = |rows: &Value| -> Vec<(String, i32, i32)> {
+        let mut v: Vec<(String, i32, i32)> = rows
+            .as_array()
+            .expect("array result")
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap_or_default().to_string(),
+                    r["afferent_coupling"].as_i64().unwrap_or_default() as i32,
+                    r["efferent_coupling"].as_i64().unwrap_or_default() as i32,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // Relative tolerance, with |expected| clamped to 1 so an exact zero still passes.
+    let close = |native: f32, expected: &Value| -> bool {
+        let want = expected.as_f64().expect("float column");
+        (native as f64 - want).abs() <= 1e-4 * want.abs().max(1.0)
+    };
+
+    for min_complexity in [0.0_f32, 5.0, 100.0, -1.0] {
+        for limit in [1_i32, 5, 200] {
+            let expected = call(
+                &db,
+                "RETURN fn::get_complexity_hotspots($p, $mc, $l)",
+                vec![
+                    ("p", json!(PROJECT)),
+                    ("mc", json!(min_complexity)),
+                    ("l", json!(limit)),
+                ],
+            )
+            .await;
+            let actual = functions
+                .get_complexity_hotspots_native(min_complexity, limit)
+                .await
+                .expect("native path");
+
+            let label = format!("min_complexity={min_complexity}, limit={limit}");
+            assert_eq!(
+                native_key(&actual),
+                surreal_key(&expected),
+                "coupling diverged at {label}"
+            );
+
+            let expected_rows = expected.as_array().expect("array result");
+            for row in &actual {
+                let want = expected_rows
+                    .iter()
+                    .find(|r| r["id"] == row.id)
+                    .unwrap_or_else(|| panic!("{label}: {} missing (surrealql)", row.id));
+                assert!(
+                    close(row.complexity, &want["complexity"]),
+                    "{label}: {} complexity {} vs {}",
+                    row.id,
+                    row.complexity,
+                    want["complexity"]
+                );
+                assert!(
+                    close(row.instability, &want["instability"]),
+                    "{label}: {} instability {} vs {}",
+                    row.id,
+                    row.instability,
+                    want["instability"]
+                );
+                assert!(
+                    close(row.risk_score, &want["risk_score"]),
+                    "{label}: {} risk_score {} vs {}",
+                    row.id,
+                    row.risk_score,
+                    want["risk_score"]
+                );
+            }
+        }
+    }
+
+    // Fixture: a=12 with c->a and d->a incoming (aff 2) and a->b outgoing (eff 1);
+    // c=7 with b->c (aff 1) and c->a (eff 1). b=4 is below the default threshold of 5.
+    let hotspots = functions
+        .get_complexity_hotspots_native(0.0, 5)
+        .await
+        .unwrap();
+    let summary: Vec<(&str, i32, i32, f32, f32, f32)> = hotspots
+        .iter()
+        .map(|h| {
+            (
+                h.id.as_str(),
+                h.afferent_coupling,
+                h.efferent_coupling,
+                h.complexity,
+                h.instability,
+                h.risk_score,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("nodes:a", 2, 1, 12.0, 0.3333, 36.0),
+            ("nodes:c", 1, 1, 7.0, 0.5, 14.0),
+        ]
+    );
+    assert_eq!(
+        hotspots[0].file_path.as_deref(),
+        Some("src/config.rs"),
+        "candidate rows carry file_path"
+    );
+
+    // limit 1 keeps only the top risk; limit 200 falls back to the safe cap of 20.
+    let top = functions
+        .get_complexity_hotspots_native(0.0, 1)
+        .await
+        .unwrap();
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0].id, "nodes:a");
+    let capped = functions
+        .get_complexity_hotspots_native(0.0, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        capped.len(),
+        2,
+        "safe limit 20 still bounds by candidate count"
+    );
+
+    // threshold 100 matches nothing.
+    assert!(
+        functions
+            .get_complexity_hotspots_native(100.0, 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A `Method` node with a self-loop: both paths count the loop once as afferent and once
+    // as efferent, and the case-insensitive node_type match must include `Method`.
+    db.query(
+        "CREATE type::record('nodes', 'm') SET name = 'method_with_loop', node_type = 'Method', \
+         language = 'rust', file_path = 'src/m.rs', start_line = 1, end_line = 2, \
+         complexity = 20.0, project_id = $p",
+    )
+    .bind(("p", PROJECT.to_string()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    db.query(
+        "UPSERT type::record('edges', 'e7') SET `from` = type::record('nodes', 'm'), \
+         `to` = type::record('nodes', 'm'), edge_type = 'calls', project_id = $p",
+    )
+    .bind(("p", PROJECT.to_string()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let expected = call(
+        &db,
+        "RETURN fn::get_complexity_hotspots($p, 0.0, 5)",
+        vec![("p", json!(PROJECT))],
+    )
+    .await;
+    let actual = functions
+        .get_complexity_hotspots_native(0.0, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        native_key(&actual),
+        surreal_key(&expected),
+        "self-loop coupling diverged"
+    );
+
+    let row_m = actual
+        .iter()
+        .find(|h| h.id == "nodes:m")
+        .expect("native must match the Method node type");
+    assert_eq!((row_m.afferent_coupling, row_m.efferent_coupling), (1, 1));
+    assert_eq!(row_m.instability, 0.5);
+    assert!(
+        close(row_m.risk_score, &json!(40.0)),
+        "20 * (1 + 1) = 40, got {}",
+        row_m.risk_score
+    );
+    // 40 beats a's 36, so the self-loop node now ranks first on both paths.
+    assert_eq!(actual[0].id, "nodes:m");
+    assert_eq!(expected[0]["id"], "nodes:m");
 }
