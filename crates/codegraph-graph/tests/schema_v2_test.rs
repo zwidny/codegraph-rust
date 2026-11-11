@@ -433,3 +433,53 @@ async fn v2_cascade_and_index_use() {
         "expected compound edge index in plan: {plan_text}"
     );
 }
+
+/// Differential test for the `fn::*` -> Rust migration: the Rust cycle search must return
+/// exactly the pairs the SurrealQL function returns, for the same fixture project.
+#[tokio::test]
+async fn native_cycle_detection_matches_surrealdb_function() {
+    use codegraph_graph::graph_functions::{CircularDependency, GraphFunctions};
+    use std::sync::Arc;
+
+    let db = db_with_fixture().await;
+    // The fixture's calls graph is a 3-cycle (a->b->c->a) and contains no mutual pair, which
+    // fn::detect_circular_dependencies reports as empty. Add b->a so a real pair exists.
+    db.query(
+        "UPSERT type::record('edges', 'e6') SET `from` = type::record('nodes','b'), \
+         `to` = type::record('nodes','a'), edge_type = 'calls', project_id = $p",
+    )
+    .bind(("p", PROJECT.to_string()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
+    let expected = functions
+        .detect_circular_dependencies("calls")
+        .await
+        .expect("surrealql path");
+    let actual = functions
+        .detect_circular_dependencies_native("calls")
+        .await
+        .expect("native path");
+
+    let pairs = |rows: &[CircularDependency]| {
+        let mut v: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.node1_id.clone(), r.node2_id.clone()))
+            .collect();
+        v.sort();
+        v
+    };
+
+    assert_eq!(pairs(&expected), pairs(&actual));
+    assert_eq!(
+        actual.len(),
+        1,
+        "fixture must expose exactly one mutual pair"
+    );
+    assert_eq!(actual[0].dependency_type, "calls");
+    assert_eq!(actual[0].node1.name, "parse_config");
+    assert_eq!(actual[0].node2.name, "load_file");
+}

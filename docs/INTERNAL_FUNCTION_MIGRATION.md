@@ -1,0 +1,89 @@
+# Migrating `fn::*` stored procedures into Rust
+
+Status: in progress. First slice landed (`codegraph-graph/src/analysis/`).
+
+## Why
+
+`schema/codegraph_v2.surql` defines 25 `fn::*` functions and 17 in `codegraph.surql`.
+They hold the analysis logic for the whole product: circular dependencies, coupling
+metrics, hub nodes, call chains, kNN search, k-means clustering.
+
+That placement causes four concrete problems:
+
+1. **Not unit-testable.** Every rule needs a live datastore; a wrong `array::intersect`
+   is only visible end-to-end.
+2. **Hard SurrealQL limits.** `fn::get_hub_nodes` documents that `array::concat` output is
+   capped at 1 MiB, so it can only rank the top 500 nodes per direction. Rust has no such
+   cap and can count exactly.
+3. **Backend lock-in.** Swapping SurrealDB currently means re-implementing all 25
+   functions in a second dialect.
+4. **Debuggability.** A failing analyzer reports a SurrealQL error, not a stack frame.
+
+The database should be storage plus indexes. Algorithms belong in Rust.
+
+## Target layering (validated with `plan_check`)
+
+```
+consumer   McpTools            (codegraph-mcp-tools)
+api        AnalysisApi         (codegraph-graph/src/graph_functions.rs)
+query      GraphQueries        (load subgraph / KNN candidates)
+algorithm  AnalysisCore        (codegraph-graph/src/analysis, pure functions)
+model      GraphSnapshot       (EdgeRow, NodeRow)
+storage    SurrealSchema       (tables, indexes, RELATION, access)
+```
+
+Constraints: `acyclic` and `layering` over the order above. `AnalysisCore` must never
+depend on `GraphQueries`, so it stays a pure function library.
+
+**Boundary that does not move:** KNN candidate retrieval still has to send SurrealQL
+(`<|K,EF|>`, `vector::distance::knn`) because the operator needs literal K/EF. Rust owns
+scoring, dedupe, context assembly and every graph algorithm.
+
+## Batches
+
+| # | Functions | Risk | Status |
+|---|---|---|---|
+| 1 | `mutual_pairs` (cycles), `degrees`/`hubs`, `coupling` | low | cycles + hubs算法 done in `analysis`; DB wiring pending |
+| 2 | `expand`, `get_transitive_dependencies`, `get_reverse_dependencies`, `trace_call_chain` | medium | not started |
+| 3 | `get_complexity_hotspots`, `find_nodes_by_name`, `get_top_directories`, `count_nodes_for_project` | low | not started |
+| 4 | `knn_chunks`, `knn_nodes`, `semantic_search_*`, `search_snippets` | medium-high (keeps HNSW SQL) | not started |
+| 5 | `kmeans` | medium | not started |
+| 6 | helpers: `edge_types`, `parse_record_id`, `resolve_node`, `node_info`, `edge_context` | low | not started |
+
+Each batch: pure function + unit tests, then a `*_native` method beside the existing
+call, then the differential test below, then remove the SurrealQL function.
+
+## Differential testing (required per batch)
+
+The SurrealQL function stays until its Rust replacement is proven equal:
+
+```rust
+// same fixture project in both paths
+let sql = functions.detect_circular_dependencies("calls").await?;
+let native = functions.detect_circular_dependencies_native("calls").await?;
+assert_eq!(normalize(sql), normalize(native));
+```
+
+Normalisation means sorting by `node1_id, node2_id` because `HashMap` iteration order is
+not part of the contract. `schema_v2_test.rs` already seeds a fixture project, so the
+comparison runs against real schema rows, not mocks.
+
+Deleting a SurrealQL function is the last step, never the first — otherwise a mismatch
+has no reference to compare against.
+
+## Enabling SurrealDB features (approved scope)
+
+| Feature | Decision | Note |
+|---|---|---|
+| `TYPE RELATION` edge table | yes | replaces `TYPE NORMAL` + `record<nodes>` references; needs data migration and `RELATE` write path |
+| `->` traversal syntax | partial | only for 1–2 hop direct neighbours; deeper walks stay in `AnalysisCore` |
+| `DEFINE ACCESS` least-privilege user | yes | replaces `root/root`; per-database user, read/write on its own database |
+| `DEFINE EVENT` | no | the project deliberately avoids cascades (`edges survive a node delete on purpose`) |
+| Live query | no | `--watch` is in-process; no consumer needs DB push today |
+
+## Non-goals
+
+- No backend swap (SurrealDB stays).
+- No change to existing result structs (`CircularDependency`, `HubNode`, ...); the
+  migration swaps implementations, not signatures, so MCP tool output stays stable.
+- No removal of `schema/codegraph.surql` (v1) until the v2-only path is proven.

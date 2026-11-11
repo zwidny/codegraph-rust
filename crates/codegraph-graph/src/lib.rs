@@ -43,6 +43,7 @@ fn serde_compatible_value(value: surrealdb::types::Value) -> surrealdb::types::V
     }
 }
 
+pub mod analysis;
 pub mod edge;
 
 #[cfg(feature = "surrealdb")]

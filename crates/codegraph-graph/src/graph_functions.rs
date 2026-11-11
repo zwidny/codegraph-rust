@@ -249,6 +249,78 @@ impl GraphFunctions {
         Ok(result)
     }
 
+    /// Rust implementation of `fn::detect_circular_dependencies`.
+    ///
+    /// Runs beside the SurrealQL version until `native_cycle_detection_matches_surrealdb_function`
+    /// proves both return the same pairs. Only the cycle search moved: node hydration still
+    /// reads the `nodes` table, which is storage, not analysis.
+    pub async fn detect_circular_dependencies_native(
+        &self,
+        edge_type: &str,
+    ) -> Result<Vec<CircularDependency>> {
+        let edges: Vec<crate::analysis::EdgeRow> = self
+            .db
+            .query(
+                "SELECT <string>`from` AS `from`, <string>`to` AS `to`, edge_type \
+                 FROM edges WHERE project_id = $project_id AND edge_type = $edge_type",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .bind(("edge_type", edge_type.to_lowercase()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native cycle edge load failed: {}", e)))?
+            .take(0)
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native cycle edge decode failed: {}", e))
+            })?;
+
+        let pairs = crate::analysis::mutual_pairs(&edges, edge_type);
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ids: Vec<String> = Vec::with_capacity(pairs.len() * 2);
+        for (left, right) in &pairs {
+            ids.push(left.clone());
+            ids.push(right.clone());
+        }
+
+        let infos: Vec<NodeInfo> = self
+            .db
+            .query(
+                "SELECT <string>id AS id, name, node_type AS kind, language, content, metadata, \
+                 { end_line: end_line, file_path: file_path, start_line: start_line } AS location \
+                 FROM nodes WHERE <string>id IN $ids",
+            )
+            .bind(("ids", ids))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native cycle node load failed: {}", e)))?
+            .take(0)
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native cycle node decode failed: {}", e))
+            })?;
+        let by_id: std::collections::HashMap<String, NodeInfo> =
+            infos.into_iter().map(|n| (n.id.clone(), n)).collect();
+
+        let dependency_type = edge_type.to_lowercase();
+        let mut out = Vec::with_capacity(pairs.len());
+        for (left, right) in pairs {
+            // fn::detect_circular_dependencies drops pairs whose endpoints cannot be
+            // hydrated; keep that behaviour so both paths stay comparable.
+            let (Some(node1), Some(node2)) = (by_id.get(&left), by_id.get(&right)) else {
+                continue;
+            };
+            out.push(CircularDependency {
+                node1_id: left,
+                node2_id: right,
+                node1: node1.clone(),
+                node2: node2.clone(),
+                dependency_type: dependency_type.clone(),
+            });
+        }
+
+        Ok(out)
+    }
+
     /// Trace the call chain starting from a node
     ///
     /// # Arguments
