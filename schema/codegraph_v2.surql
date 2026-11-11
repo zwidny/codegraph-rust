@@ -417,8 +417,9 @@ DEFINE FUNCTION OVERWRITE fn::trace_call_chain($project_id: string, $from_node: 
         -- One entry per new callee; the first hop seen provides its path.
         LET $next = array::distinct($hops.map(|$h| $h.callee)).map(|$callee| {
             LET $hop = $hops.find(|$h| $h.callee = $callee);
-            LET $parent = $acc.frontier.find(|$f| $f.id = $hop.caller);
-            RETURN { id: $callee, path: array::append($parent.path, $hop.callee_name) };
+            -- `$parent` is a protected variable name in SurrealDB 4.x; use a distinct name.
+            LET $parent_entry = $acc.frontier.find(|$f| $f.id = $hop.caller);
+            RETURN { id: $callee, path: array::append($parent_entry.path, $hop.callee_name) };
         });
         RETURN {
             visited: array::concat($acc.visited, $next.map(|$n| $n.id)),

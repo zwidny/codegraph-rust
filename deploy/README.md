@@ -53,8 +53,8 @@ therefore the only lever. Measured on this host:
 | `mem_limit` | block cache | memtable |
 |---|---|---|
 | none (31GB host) | 15.6 GB | 1 GB |
-| `12g` | 5 GB | 256 MB |
-| `8g` (default) | 3 GB | 256 MB |
+| `8g` | 3 GB | 256 MB |
+| `12g` (default) | 5 GB | 256 MB |
 
 Verify it after any change:
 

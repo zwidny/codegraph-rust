@@ -85,7 +85,7 @@ dirs = "7.0.0"
 dotenv = "0.15.0"
 nix = { version = "0.31.3", features = ["process", "signal"] }
 
-surrealdb = { version = "3.3.0", features = ["kv-mem", "kv-surrealkv"] }
+surrealdb = { version = "4.0.1", features = ["kv-mem", "kv-surrealkv"] }
 [dev-dependencies]
 tokenizers = { workspace = true }
 serial_test = "4.0.1"

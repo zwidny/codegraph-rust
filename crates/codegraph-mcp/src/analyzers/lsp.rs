@@ -1010,15 +1010,7 @@ pub async fn enrich_async(
                 }
                 if let Some(node_idx) = node_idx {
                     let node = &mut nodes[node_idx];
-                    node.metadata
-                        .attributes
-                        .insert("qualified_name".to_string(), sym.qualified_name.clone());
-                    node.metadata
-                        .attributes
-                        .insert("analyzer".to_string(), "lsp_symbols".to_string());
-                    node.metadata
-                        .attributes
-                        .insert("analyzer_confidence".to_string(), "1.0".to_string());
+                    apply_symbol_metadata(node, &sym.qualified_name, qualified_names_enabled());
                     stats.nodes_enriched += 1;
                 }
             }
@@ -1133,6 +1125,43 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// `CODEGRAPH_LSP_QUALIFIED_NAMES` gates the only LSP output that feeds edge
+/// resolution: `metadata.attributes["qualified_name"]`, read by `resolution.rs`.
+///
+/// Unlike `native_analysis_enabled` (opt-in, default off), this switch defaults
+/// **on**: qualified names are long-standing resolution input, so the variable
+/// exists purely to measure their contribution and must not change behaviour
+/// unless explicitly disabled. Only `0` / `false` skip the write; any other value
+/// (including unset) keeps it.
+fn qualified_names_enabled_for(value: Option<&str>) -> bool {
+    !matches!(value, Some("0") | Some("false"))
+}
+
+fn qualified_names_enabled() -> bool {
+    qualified_names_enabled_for(
+        std::env::var("CODEGRAPH_LSP_QUALIFIED_NAMES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Writes the LSP symbol metadata. `write_qualified_name` is separate from the
+/// analyzer provenance fields so the measurement switch never changes
+/// `lsp_nodes_enriched` or the other attributes.
+fn apply_symbol_metadata(node: &mut CodeNode, qualified_name: &str, write_qualified_name: bool) {
+    if write_qualified_name {
+        node.metadata
+            .attributes
+            .insert("qualified_name".to_string(), qualified_name.to_string());
+    }
+    node.metadata
+        .attributes
+        .insert("analyzer".to_string(), "lsp_symbols".to_string());
+    node.metadata
+        .attributes
+        .insert("analyzer_confidence".to_string(), "1.0".to_string());
 }
 
 fn unique_symbol_index(indices: &[usize]) -> Option<usize> {
@@ -1322,6 +1351,48 @@ pub fn decode_one_lsp_message(buffer: &[u8]) -> Result<Option<(String, usize)>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualified_name_write_is_on_by_default_and_skipped_only_for_0_or_false() {
+        assert!(qualified_names_enabled_for(None));
+        assert!(qualified_names_enabled_for(Some("1")));
+        assert!(qualified_names_enabled_for(Some("true")));
+        assert!(qualified_names_enabled_for(Some("")));
+        assert!(!qualified_names_enabled_for(Some("0")));
+        assert!(!qualified_names_enabled_for(Some("false")));
+
+        use codegraph_core::Location;
+        let location = || Location {
+            file_path: "src/lib.rs".to_string(),
+            line: 1,
+            column: 0,
+            end_line: Some(1),
+            end_column: Some(10),
+        };
+
+        let mut written = CodeNode::new("f", None, None, location());
+        apply_symbol_metadata(&mut written, "krate::f", true);
+        assert_eq!(
+            written.metadata.attributes.get("qualified_name"),
+            Some(&"krate::f".to_string())
+        );
+        assert_eq!(
+            written.metadata.attributes.get("analyzer"),
+            Some(&"lsp_symbols".to_string())
+        );
+
+        let mut skipped = CodeNode::new("f", None, None, location());
+        apply_symbol_metadata(&mut skipped, "krate::f", false);
+        assert!(!skipped.metadata.attributes.contains_key("qualified_name"));
+        assert_eq!(
+            skipped.metadata.attributes.get("analyzer"),
+            Some(&"lsp_symbols".to_string())
+        );
+        assert_eq!(
+            skipped.metadata.attributes.get("analyzer_confidence"),
+            Some(&"1.0".to_string())
+        );
+    }
 
     #[test]
     fn ambiguous_symbol_and_definition_results_remain_unresolved() {
