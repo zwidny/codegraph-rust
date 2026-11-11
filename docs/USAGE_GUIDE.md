@@ -318,6 +318,18 @@ codegraph start stdio --watch
 
 This keeps the index current as you edit files.
 
+For manual updates, prefer the narrowest path that changed:
+
+```bash
+codegraph index packages/core/src/tool.ts   # one file
+codegraph index packages/core               # one directory
+```
+
+A partial re-index keeps the rest of the project graph intact and reuses the
+project's existing symbols to resolve edges. See
+[Incremental indexing](INCREMENTAL_INDEXING.md) for project-root resolution,
+scope rules and limits.
+
 ---
 
 ## Troubleshooting

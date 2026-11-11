@@ -132,6 +132,17 @@ pub fn parse_cargo_metadata_json(json: &str, project_id: &str) -> Result<BuildCo
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
+    // Only workspace members belong in this project's graph. `cargo metadata`
+    // also lists every registry dependency; indexing those violates the
+    // project-only policy and inflates node counts by ~25%.
+    let members: std::collections::HashSet<&str> = root
+        .get("workspace_members")
+        .and_then(|v| v.as_array())
+        .map(|rows| rows.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let filter_members = !members.is_empty();
+    let mut member_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
     let mut out = BuildContextOutput::default();
 
     let mut package_ids: std::collections::HashMap<String, codegraph_core::NodeId> =
@@ -146,6 +157,10 @@ pub fn parse_cargo_metadata_json(json: &str, project_id: &str) -> Result<BuildCo
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let package_identity = pkg.get("id").and_then(|v| v.as_str()).unwrap_or(name);
+        if filter_members && !members.contains(package_identity) {
+            continue;
+        }
+        member_names.insert(name);
         let package_qualified = format!("package::{}", package_identity);
 
         let mut node = CodeNode::new(
@@ -273,6 +288,9 @@ pub fn parse_cargo_metadata_json(json: &str, project_id: &str) -> Result<BuildCo
             let Some(dep_name) = dep.get("name").and_then(|v| v.as_str()) else {
                 continue;
             };
+            if filter_members && !member_names.contains(dep_name) {
+                continue;
+            }
             out.edges.push(EdgeRelationship {
                 from: from_id,
                 to: dep_name.to_string(),
@@ -293,6 +311,43 @@ pub fn parse_cargo_metadata_json(json: &str, project_id: &str) -> Result<BuildCo
 mod tests {
     use super::*;
     use codegraph_core::{EdgeType, Language, NodeType};
+
+    #[test]
+    fn non_workspace_packages_are_not_indexed() {
+        let json = r#"
+        {
+          "workspace_members": ["app-id"],
+          "packages": [
+            {
+              "name": "app",
+              "id": "app-id",
+              "manifest_path": "/repo/app/Cargo.toml",
+              "dependencies": [{"name": "serde"}],
+              "features": {}
+            },
+            {
+              "name": "serde",
+              "id": "serde-1.0",
+              "manifest_path": "/home/user/.cargo/registry/src/serde-1.0/Cargo.toml",
+              "dependencies": [],
+              "features": {}
+            }
+          ]
+        }"#;
+        let out = parse_cargo_metadata_json(json, "project").unwrap();
+        assert_eq!(out.nodes.len(), 1, "only workspace members are indexed");
+        assert_eq!(out.nodes[0].name.as_str(), "app");
+        assert!(
+            out.edges.is_empty(),
+            "dependency edges to non-members are dropped"
+        );
+        assert!(
+            out.nodes
+                .iter()
+                .all(|node| !node.location.file_path.contains(".cargo/registry")),
+            "registry manifests must not enter the project graph"
+        );
+    }
 
     #[test]
     fn cargo_metadata_produces_package_nodes_and_dependency_edges() {

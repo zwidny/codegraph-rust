@@ -47,4 +47,34 @@ known, use ordinary repository tools. Do not install, configure, download models
 reindex merely because this guidance was injected. Internal graph analysis tools
 are for CodeGraph's built-in agents; use only the four agentic commands above.
 
+For a large or multi-hop change, externalise the design and gate it before editing:
+
+```sh
+codegraph plan --project . check plan.json     # offline: nodes/edges/constraints
+codegraph plan --project . verify plan.json    # compare with the indexed code graph
+```
+
+`plan check` catches undeclared references, layering violations and cycles before the
+code exists. `plan verify` reports `unplanned_code_edges` (dependencies the code already
+has that the plan forgot) and `existing_planned_nodes` (symbols you may be re-creating).
+Use it when adding a module, crossing layers, chaining 3+ hops, or changing the public
+interfaces of 3+ files; skip it for a single-file fix.
+
+A partial re-index skips language servers by default (they load the whole workspace).
+Enable them deliberately and pin the project:
+
+```sh
+CODEGRAPH_LSP_ON_PARTIAL=1 codegraph index packages/happy-android \
+  --project-root . --index-tier balanced --languages kotlin
+```
+
+`--project-root` (or `CODEGRAPH_PROJECT_ID`) must match the indexed project; the scan
+path stays relative to it. A cold LSP import may exceed the 30s `initialize` deadline on
+large repos — retry once warmed up, or do one full `codegraph index <root>` pass first.
+
+LSP edges depend on the tier: `balanced` uses `SymbolsOnly` and produces **0 definition
+edges** (only `documentSymbol`); `full` uses `SymbolsAndDefinitions` and resolves them.
+`0 edges resolved` on balanced is expected. Set `CODEGRAPH_LSP_DEFINITIONS=1` to force
+definition resolution on balanced.
+
 Reload this guidance with `codegraph agent instructions` after context loss.

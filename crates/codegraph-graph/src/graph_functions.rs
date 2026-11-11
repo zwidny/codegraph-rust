@@ -175,7 +175,7 @@ impl GraphFunctions {
     ///
     /// # Arguments
     /// * `node_id` - The ID of the node to analyze
-    /// * `edge_type` - The type of edge to follow (e.g., "Calls", "Imports")
+    /// * `edge_type` - The type of edge to follow (e.g., "calls", "imports")
     /// * `depth` - Maximum depth to traverse (1-10, defaults to 3)
     ///
     /// # Returns
@@ -217,7 +217,7 @@ impl GraphFunctions {
     /// Detect circular dependencies for a given edge type
     ///
     /// # Arguments
-    /// * `edge_type` - The type of edge to analyze (e.g., "Imports", "Uses")
+    /// * `edge_type` - The type of edge to analyze (e.g., "imports", "uses")
     ///
     /// # Returns
     /// Vector of circular dependency pairs (A <-> B relationships)

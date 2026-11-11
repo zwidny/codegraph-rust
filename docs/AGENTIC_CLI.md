@@ -7,9 +7,14 @@ answers. The CLI does not expose their internal graph analysis tools.
 ## Build and prerequisites
 
 ```sh
-cargo build -p codegraph-mcp-server --bin codegraph --features full
-./target/debug/codegraph agent --help
+# Default local build: thin LTO, no local/onnx embeddings (~3x faster than fat LTO)
+cargo build --profile release-dist -p codegraph-mcp-server --bin codegraph \
+  --features "daemon,ai-enhanced,server-http,embeddings-openai,embeddings-ollama,embeddings-jina,embeddings-lmstudio"
+./target/release-dist/codegraph agent --help
 ```
+
+Published artifacts use `cargo build --release --features full` (fat LTO);
+`.github/workflows/release.yml` does that.
 
 `ai-enhanced` is the required feature for agentic execution; `full` also includes
 embedding providers, HTTP transport, and all agent backends. Select the embedding

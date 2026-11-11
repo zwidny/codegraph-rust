@@ -71,12 +71,13 @@ jobs:
         run: echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
 
       - name: Build codegraph
-        run: cargo build --profile release-dist --target ${{ matrix.target }} -p codegraph-mcp-server --bin codegraph --features full
+        # Published artifacts use the fat-LTO profile; local builds default to release-dist.
+        run: cargo build --release --target ${{ matrix.target }} -p codegraph-mcp-server --bin codegraph --features full
 
       - name: Package archive and checksum
         shell: bash
         run: |
-          BIN="target/${{ matrix.target }}/release-dist/codegraph"
+          BIN="target/${{ matrix.target }}/release/codegraph"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             cp "${BIN}.exe" "${{ matrix.name }}.exe"
             7z a "${{ matrix.name }}.zip" "${{ matrix.name }}.exe"

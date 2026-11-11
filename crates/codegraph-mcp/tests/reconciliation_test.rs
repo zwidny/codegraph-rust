@@ -123,6 +123,158 @@ async fn incremental_catalog_matches_full_graph_and_removes_stale_definitions() 
     Ok(())
 }
 
+#[tokio::test]
+async fn inbound_edges_follow_symbols_that_only_shifted_lines() -> Result<()> {
+    if !test_env::run(
+        concat!(
+            module_path!(),
+            "::inbound_edges_follow_symbols_that_only_shifted_lines"
+        ),
+        &[
+            ("CODEGRAPH_SURREALDB_URL", Some("mem://")),
+            ("CODEGRAPH_NO_PROGRESS", Some("1")),
+            ("CODEGRAPH_ANALYZERS", Some("0")),
+            ("CODEGRAPH_ANALYZERS_REQUIRE_TOOLS", Some("0")),
+        ],
+    ) {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let caller = dir.path().join("caller.rs");
+    let target = dir.path().join("target.rs");
+    std::fs::write(&caller, "fn caller() { target(); }\n")?;
+    std::fs::write(&target, "fn target() {}\n")?;
+
+    let config = IndexerConfig {
+        project_root: dir.path().into(),
+        indexing_tier: IndexingTier::Fast,
+        ..Default::default()
+    };
+    let indexer = ProjectIndexer::new(
+        config,
+        &CodeGraphConfig::default(),
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
+    )
+    .await?;
+    indexer
+        .surreal_storage()
+        .await
+        .lock()
+        .await
+        .db()
+        .query(include_str!("../../../schema/codegraph_v2.surql"))
+        .await?
+        .check()?;
+    indexer.index_project(dir.path()).await?;
+
+    // Only the position changes: `target` moves from line 1 to line 3, so its node id
+    // changes even though the symbol is unchanged. The caller edge must follow it.
+    std::fs::write(&target, "\n\nfn target() {}\n")?;
+    indexer.index_single_file(&target).await?;
+
+    let storage = indexer.surreal_storage().await;
+    let mut response = storage
+        .lock()
+        .await
+        .db()
+        .query(
+            "SELECT <string> id AS id FROM nodes WHERE name = 'target'; \
+             SELECT <string> to AS to FROM edges WHERE edge_type = 'calls';",
+        )
+        .await?
+        .check()?;
+    let targets: Vec<Value> = response.take(0)?;
+    let edges: Vec<Value> = response.take(1)?;
+
+    assert_eq!(targets.len(), 1, "expected exactly one target node");
+    let target_id = targets[0]["id"]
+        .as_str()
+        .expect("target node id is a string");
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge["to"].as_str() == Some(target_id)),
+        "caller edge must follow the shifted target id; target={target_id}, edges={edges:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_file_index_resolves_edges_against_the_project_catalog() -> Result<()> {
+    if !test_env::run(
+        concat!(
+            module_path!(),
+            "::single_file_index_resolves_edges_against_the_project_catalog"
+        ),
+        &[
+            ("CODEGRAPH_SURREALDB_URL", Some("mem://")),
+            ("CODEGRAPH_NO_PROGRESS", Some("1")),
+            ("CODEGRAPH_ANALYZERS", Some("0")),
+            ("CODEGRAPH_ANALYZERS_REQUIRE_TOOLS", Some("0")),
+        ],
+    ) {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let caller = dir.path().join("caller.rs");
+    let helper = dir.path().join("helper.rs");
+    std::fs::write(&caller, "fn caller() { helper(); }\n")?;
+    std::fs::write(&helper, "fn helper() {}\n")?;
+
+    let config = IndexerConfig {
+        project_root: dir.path().into(),
+        indexing_tier: IndexingTier::Fast,
+        ..Default::default()
+    };
+    let indexer = ProjectIndexer::new(
+        config,
+        &CodeGraphConfig::default(),
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
+    )
+    .await?;
+    indexer
+        .surreal_storage()
+        .await
+        .lock()
+        .await
+        .db()
+        .query(include_str!("../../../schema/codegraph_v2.surql"))
+        .await?
+        .check()?;
+    indexer.index_project(dir.path()).await?;
+
+    // Re-index only the caller, which still references helper() from another file.
+    std::fs::write(&caller, "fn caller() {\n    helper();\n}\n")?;
+    indexer.index_single_file(&caller).await?;
+
+    let storage = indexer.surreal_storage().await;
+    let mut response = storage
+        .lock()
+        .await
+        .db()
+        .query(
+            "SELECT <string> id AS id FROM nodes WHERE name = 'helper'; \
+             SELECT <string> to AS to FROM edges WHERE edge_type = 'calls';",
+        )
+        .await?
+        .check()?;
+    let helpers: Vec<Value> = response.take(0)?;
+    let edges: Vec<Value> = response.take(1)?;
+
+    assert_eq!(helpers.len(), 1, "expected exactly one helper node");
+    let helper_id = helpers[0]["id"]
+        .as_str()
+        .expect("helper node id is a string");
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge["to"].as_str() == Some(helper_id)),
+        "a partial re-index must resolve cross-file calls from the project catalog; \
+         helper={helper_id}, edges={edges:?}"
+    );
+    Ok(())
+}
+
 mod test_env {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

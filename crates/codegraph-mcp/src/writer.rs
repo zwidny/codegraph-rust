@@ -121,8 +121,14 @@ async fn execute(
         Job::Flush(_) | Job::Shutdown(_) => unreachable!("barriers handled by writer"),
     }
     metrics.jobs.fetch_add(1, Ordering::Relaxed);
-    metrics.rows.fetch_add(rows as u64, Ordering::Relaxed);
+    let previous_rows = metrics.rows.fetch_add(rows as u64, Ordering::Relaxed);
     metrics.bytes.fetch_add(bytes, Ordering::Relaxed);
+    // File-visible progress every ~5k rows. The interactive progress bars are dropped
+    // when stdout is not a TTY, so a stalled write otherwise looks like silence.
+    let total_rows = previous_rows + rows as u64;
+    if total_rows / 5_000 != previous_rows / 5_000 {
+        tracing::info!("graph writer: {total_rows} rows persisted");
+    }
     Ok(())
 }
 

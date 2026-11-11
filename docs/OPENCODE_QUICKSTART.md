@@ -47,10 +47,14 @@ curl -s -X POST http://127.0.0.1:8010/sql -u root:root \
 MSRV 是 1.95；系统需要 `libssl-dev pkg-config`。
 
 ```bash
-cargo +1.97.1 build -p codegraph-mcp-server --bin codegraph --features full
-ln -sf "$PWD/target/debug/codegraph" ~/.local/bin/codegraph
+# 默认本地构建：thin LTO，去掉 local/onnx embedding（比 fat LTO 快约 3 倍）
+cargo +1.97.1 build --profile release-dist -p codegraph-mcp-server --bin codegraph \
+  --features "daemon,ai-enhanced,server-http,embeddings-openai,embeddings-ollama,embeddings-jina,embeddings-lmstudio"
+ln -sf "$PWD/target/release-dist/codegraph" ~/.local/bin/codegraph
 command -v codegraph
 ```
+
+发布产物用 `cargo build --release --features full`（fat LTO），由 `.github/workflows/release.yml` 执行。
 
 `--features full` 才有 agent、embedding 与 HTTP 能力。
 

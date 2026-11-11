@@ -19,6 +19,16 @@ struct LexicalCandidate {
     characters: usize,
 }
 
+/// A symbol loaded from storage to seed a partial re-index's resolution catalog.
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalSymbol {
+    pub id: NodeId,
+    pub file: String,
+    pub name: String,
+    pub kind: Option<String>,
+    pub qualified: Option<String>,
+}
+
 pub(crate) struct SymbolCatalog {
     aliases: BTreeMap<String, Vec<NodeId>>,
     symbols: HashMap<NodeId, Symbol>,
@@ -27,21 +37,41 @@ pub(crate) struct SymbolCatalog {
 }
 
 pub(crate) fn aliases(node: &CodeNode) -> BTreeSet<String> {
-    let name = node.name.to_string();
-    let mut names = BTreeSet::from([name.clone(), format!("{}::{name}", node.location.file_path)]);
-    if let Some(qualified) = node.metadata.attributes.get("qualified_name") {
-        names.insert(qualified.clone());
+    let kind = node.node_type.as_ref().map(|kind| format!("{kind:?}"));
+    let mut names = aliases_for(
+        &node.location.file_path,
+        node.name.as_str(),
+        kind.as_deref(),
+        node.metadata
+            .attributes
+            .get("qualified_name")
+            .map(String::as_str),
+    );
+    for attribute in ["method_of", "implements_trait"] {
+        if let Some(owner) = node.metadata.attributes.get(attribute) {
+            names.insert(format!("{owner}::{}", node.name));
+        }
     }
-    if let Some(kind) = &node.node_type {
-        names.insert(format!("{kind:?}::{name}"));
+    names
+}
+
+/// Aliases derivable from stored symbol columns, used for external symbols loaded
+/// from the project catalog instead of a parsed `CodeNode`.
+pub(crate) fn aliases_for(
+    file: &str,
+    name: &str,
+    kind: Option<&str>,
+    qualified: Option<&str>,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::from([name.to_string(), format!("{file}::{name}")]);
+    if let Some(qualified) = qualified {
+        names.insert(qualified.to_string());
+    }
+    if let Some(kind) = kind {
+        names.insert(format!("{kind}::{name}"));
     }
     if let Some(short) = name.rsplit("::").next() {
         names.insert(short.to_string());
-    }
-    for attribute in ["method_of", "implements_trait"] {
-        if let Some(owner) = node.metadata.attributes.get(attribute) {
-            names.insert(format!("{owner}::{name}"));
-        }
     }
     names
 }
@@ -59,6 +89,18 @@ fn trigrams(name: &str) -> BTreeSet<String> {
 
 impl SymbolCatalog {
     pub(crate) fn new(nodes: &[CodeNode]) -> Self {
+        Self::build(nodes, &[])
+    }
+
+    /// Build the catalog with symbols loaded from storage appended.
+    ///
+    /// A partial re-index only parses the scanned files, so its edges can only resolve
+    /// if the rest of the project's symbols are available as a base.
+    pub(crate) fn new_with_external(nodes: &[CodeNode], external: &[ExternalSymbol]) -> Self {
+        Self::build(nodes, external)
+    }
+
+    fn build(nodes: &[CodeNode], external: &[ExternalSymbol]) -> Self {
         let mut catalog = Self {
             aliases: BTreeMap::new(),
             symbols: HashMap::new(),
@@ -66,41 +108,73 @@ impl SymbolCatalog {
             trigrams: HashMap::new(),
         };
         for node in nodes {
-            catalog.symbols.insert(
+            catalog.insert_symbol(
                 node.id,
-                Symbol {
-                    id: node.id,
-                    file: node.location.file_path.clone(),
-                    qualified: node
-                        .metadata
-                        .attributes
-                        .get("qualified_name")
-                        .cloned()
-                        .unwrap_or_else(|| node.name.to_string()),
-                },
+                &node.location.file_path,
+                node.name.as_str(),
+                node.metadata
+                    .attributes
+                    .get("qualified_name")
+                    .map(String::as_str),
             );
             for alias in aliases(node) {
-                let ids = catalog.aliases.entry(alias).or_default();
-                if !ids.contains(&node.id) {
-                    ids.push(node.id);
+                catalog.add_alias(alias, node.id);
+            }
+        }
+        for symbol in external {
+            let seen = catalog.symbols.contains_key(&symbol.id);
+            catalog.insert_symbol(
+                symbol.id,
+                &symbol.file,
+                &symbol.name,
+                symbol.qualified.as_deref(),
+            );
+            if !seen {
+                for alias in aliases_for(
+                    &symbol.file,
+                    &symbol.name,
+                    symbol.kind.as_deref(),
+                    symbol.qualified.as_deref(),
+                ) {
+                    catalog.add_alias(alias, symbol.id);
                 }
             }
         }
-        for ids in catalog.aliases.values_mut() {
+        catalog.finalize()
+    }
+
+    fn insert_symbol(&mut self, id: NodeId, file: &str, name: &str, qualified: Option<&str>) {
+        self.symbols.insert(
+            id,
+            Symbol {
+                id,
+                file: file.to_string(),
+                qualified: qualified
+                    .map(str::to_string)
+                    .unwrap_or_else(|| name.to_string()),
+            },
+        );
+    }
+
+    fn add_alias(&mut self, alias: String, id: NodeId) {
+        let ids = self.aliases.entry(alias).or_default();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+
+    fn finalize(mut self) -> Self {
+        for ids in self.aliases.values_mut() {
             ids.sort();
         }
-        for alias in catalog.aliases.keys() {
+        for alias in self.aliases.keys() {
             let normalized = alias.to_lowercase();
-            let index = catalog.lexical.len();
+            let index = self.lexical.len();
             let grams = trigrams(&normalized);
             for gram in &grams {
-                catalog
-                    .trigrams
-                    .entry(gram.clone())
-                    .or_default()
-                    .push(index);
+                self.trigrams.entry(gram.clone()).or_default().push(index);
             }
-            catalog.lexical.push(LexicalCandidate {
+            self.lexical.push(LexicalCandidate {
                 alias: alias.clone(),
                 characters: normalized.chars().count(),
                 normalized,
@@ -108,7 +182,7 @@ impl SymbolCatalog {
                 gram_count: grams.len(),
             });
         }
-        catalog
+        self
     }
 
     /// Legacy consumers receive only aliases with exactly one target.

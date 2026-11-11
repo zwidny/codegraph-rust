@@ -125,6 +125,53 @@ fn project_connection(configured: Option<String>) -> String {
     configured.unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
 }
 
+/// One database per project on a shared server (default).
+///
+/// Set `CODEGRAPH_DATABASE_PER_PROJECT=0` to fall back to the shared
+/// `CODEGRAPH_SURREALDB_DATABASE` (the old behaviour).
+fn database_per_project() -> bool {
+    database_per_project_with(env::var("CODEGRAPH_DATABASE_PER_PROJECT").ok().as_deref())
+}
+
+fn database_per_project_with(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "false" | "off"))
+}
+
+/// Stable, identifier-safe database name for a project root.
+///
+/// The suffix keeps two checkouts with the same directory name apart while the prefix
+/// keeps the name readable in `INFO FOR DB` and SurrealDB tooling.
+fn project_database_name(project_root: &Path) -> String {
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let base = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    let mut sanitized: String = base
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    sanitized.truncate(32);
+    if sanitized.is_empty() {
+        sanitized.push_str("project");
+    }
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let hash = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{:02x}", *byte))
+        .collect::<String>();
+    format!("{sanitized}_{hash}")
+}
+
 /// SurrealDB storage implementation with flexible schema support
 #[derive(Clone)]
 pub struct SurrealDbStorage {
@@ -155,8 +202,20 @@ impl SurrealDbConfig {
     /// [`DEFAULT_SERVER_URL`]; the embedded per-project store is opt-in by pointing the
     /// URL at a `surrealkv://` path.
     pub fn for_project(project_root: &Path) -> Self {
-        let _ = project_root;
-        Self::remote(project_connection(env_value("CODEGRAPH_SURREALDB_URL")))
+        let connection = project_connection(env_value("CODEGRAPH_SURREALDB_URL"));
+        let mut config = Self::remote(connection);
+        // Shared servers keep every project in one `chunks` table today, so one HNSW
+        // index covers all projects. Derive one database per project instead; embedded
+        // stores are already isolated by their file path.
+        if !config.is_embedded() && database_per_project() {
+            config.database = project_database_name(project_root);
+            debug!(
+                "Per-project database '{}' for {}",
+                config.database,
+                project_root.display()
+            );
+        }
+        config
     }
 
     /// Settings for the embedded store under `project_root`.
@@ -294,12 +353,29 @@ impl SurrealDbStorage {
         project: &str,
         fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
         fresh_chunks: &BTreeSet<String>,
+        scope: Option<&ReconcileScope>,
     ) -> Result<()> {
         let decode_id = |raw: &str| {
             raw.strip_prefix("nodes:")
                 .unwrap_or(raw)
                 .trim_matches('`')
                 .to_string()
+        };
+
+        // Without a scope every file in the project is in scope; with one, only
+        // files under `scan_root` may be treated as deleted or re-emitted.
+        let in_scope = |file: &str| -> bool {
+            let Some(scope) = scope else {
+                return true;
+            };
+            let candidate = Path::new(file);
+            let absolute = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                scope.project_root.join(candidate)
+            };
+            let absolute = lexical_normalize_path(&absolute);
+            absolute == scope.scan_root || absolute.starts_with(&scope.scan_root)
         };
 
         // --- Single scan over nodes: (raw id, file_path) -------------------
@@ -314,22 +390,25 @@ impl SurrealDbStorage {
         let node_rows: Vec<Vec<Option<String>>> = response.take(0).unwrap_or_default();
 
         let mut existing_by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut file_by_node: BTreeMap<String, String> = BTreeMap::new();
         for row in &node_rows {
             if let (Some(raw_id), Some(file)) = (
                 row.first().and_then(|v| v.as_deref()),
                 row.get(1).and_then(|v| v.as_deref()),
             ) {
+                let id = decode_id(raw_id);
+                file_by_node.insert(id.clone(), file.to_string());
                 existing_by_file
                     .entry(file.to_string())
                     .or_default()
-                    .push(decode_id(raw_id));
+                    .push(id);
             }
         }
 
         // --- Files that disappeared entirely (including stale path formats) --
         let deleted_files: Vec<String> = existing_by_file
             .keys()
-            .filter(|file| !fresh_nodes_by_file.contains_key(*file))
+            .filter(|file| in_scope(file) && !fresh_nodes_by_file.contains_key(*file))
             .cloned()
             .collect();
         if !deleted_files.is_empty() {
@@ -390,6 +469,13 @@ impl SurrealDbStorage {
                 };
                 let id = decode_chunk(raw_id);
                 let parent = decode_id(raw_parent);
+                // Chunks whose owning node lives outside the scanned scope are not
+                // this run's to delete.
+                if let Some(file) = file_by_node.get(&parent)
+                    && !in_scope(file)
+                {
+                    continue;
+                }
                 if !fresh_chunk_ids.contains(id.as_str())
                     || stale_node_ids.contains(parent.as_str())
                     || !fresh_parent_ids.contains(parent.as_str())
@@ -432,6 +518,50 @@ impl SurrealDbStorage {
     pub fn disable_ingestion_cache(&mut self) {
         self.config.cache_enabled = false;
         self.node_cache.clear();
+    }
+
+    /// Symbol columns used to seed resolution when only part of a project is re-indexed.
+    ///
+    /// A partial scan only parses the scanned files, so edges from those files can only
+    /// resolve against the rest of the project if its symbols are loaded as a base.
+    pub async fn load_symbols_excluding(
+        &self,
+        project: &str,
+        excluded_files: &[String],
+    ) -> Result<Vec<SymbolRow>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT <string> id AS id, file_path, name, node_type, \
+                 metadata.qualified_name AS qualified FROM nodes \
+                 WHERE project_id = $project AND file_path NOT IN $files;",
+            )
+            .bind(("project", project.to_string()))
+            .bind(("files", excluded_files.to_vec()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("Symbol load failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("Symbol load failed: {e}")))?;
+        let rows: Vec<JsonValue> = response.take(0).unwrap_or_default();
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(SymbolRow {
+                    id: row.get("id")?.as_str()?.to_string(),
+                    file_path: row.get("file_path")?.as_str()?.to_string(),
+                    name: row.get("name")?.as_str()?.to_string(),
+                    node_type: row
+                        .get("node_type")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    qualified_name: row
+                        .get("qualified")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                })
+            })
+            .collect())
     }
 
     /// Delete dependent rows before nodes, with native record IDs and project scope.
@@ -495,7 +625,8 @@ impl SurrealDbStorage {
                 CodeGraphError::Database(format!("Failed to select namespace/database: {}", e))
             })?;
 
-        if persistent_embedded && config.auto_migrate {
+        let per_project_database = database_per_project() && !config.is_embedded();
+        if config.auto_migrate && (persistent_embedded || per_project_database) {
             Self::ensure_bundled_schema(&db).await?;
         }
 
@@ -633,7 +764,7 @@ impl SurrealDbStorage {
             return Self::refresh_or_warn(db, name, schema, &checksum).await;
         }
 
-        info!("Applying bundled {} schema to new embedded database", name);
+        info!("Applying bundled {} schema to new database", name);
         let schema = crate::vector_indexes::VectorIndexMode::from_env()?.initial_schema(schema);
         db.query(schema)
             .await
@@ -1130,6 +1261,20 @@ impl SurrealDbStorage {
     }
 
     pub async fn upsert_nodes_batch(&mut self, nodes: &[CodeNode]) -> Result<()> {
+        self.upsert_nodes_batch_with_timeout(nodes, write_timeout_from_env())
+            .await
+    }
+
+    /// Upsert nodes with an explicit client-side deadline.
+    ///
+    /// A stalled SurrealKV flush makes the server stop answering; without a deadline the
+    /// index run waits forever (see `deploy/README.md`). The deadline turns that into a
+    /// loud error the writer and the indexer can surface.
+    pub async fn upsert_nodes_batch_with_timeout(
+        &mut self,
+        nodes: &[CodeNode],
+        timeout: std::time::Duration,
+    ) -> Result<()> {
         if nodes.is_empty() {
             return Ok(());
         }
@@ -1140,25 +1285,27 @@ impl SurrealDbStorage {
         }
 
         let record_count = records.len();
-        self.db
-            .query(UPSERT_NODES_QUERY)
-            .bind(("data", records))
-            .await
-            .map_err(|e| {
-                CodeGraphError::Database(format!(
-                    "Failed to upsert node batch ({} items): {}",
-                    record_count,
-                    truncate_surreal_error(&e)
-                ))
-            })?
-            .check()
-            .map_err(|e| {
-                CodeGraphError::Database(format!(
-                    "Node batch upsert returned error ({} items): {}",
-                    record_count,
-                    truncate_surreal_error(&e)
-                ))
-            })?;
+        let response = with_write_deadline(
+            timeout,
+            self.db.query(UPSERT_NODES_QUERY).bind(("data", records)),
+            "Node batch upsert",
+            record_count,
+        )
+        .await?
+        .map_err(|e| {
+            CodeGraphError::Database(format!(
+                "Failed to upsert node batch ({} items): {}",
+                record_count,
+                truncate_surreal_error(&e)
+            ))
+        })?;
+        response.check().map_err(|e| {
+            CodeGraphError::Database(format!(
+                "Node batch upsert returned error ({} items): {}",
+                record_count,
+                truncate_surreal_error(&e)
+            ))
+        })?;
 
         if self.config.cache_enabled {
             for node in nodes {
@@ -1170,6 +1317,17 @@ impl SurrealDbStorage {
     }
 
     pub async fn upsert_edges_batch(&mut self, edges: &[CodeEdge]) -> Result<()> {
+        self.upsert_edges_batch_with_timeout(edges, write_timeout_from_env())
+            .await
+    }
+
+    /// Upsert edges with an explicit client-side deadline (see
+    /// [`Self::upsert_nodes_batch_with_timeout`]).
+    pub async fn upsert_edges_batch_with_timeout(
+        &mut self,
+        edges: &[CodeEdge],
+        timeout: std::time::Duration,
+    ) -> Result<()> {
         if edges.is_empty() {
             return Ok(());
         }
@@ -1191,24 +1349,30 @@ impl SurrealDbStorage {
             })
             .collect();
 
-        self.db
-            .query(UPSERT_EDGES_QUERY)
-            .bind(("data", strip_null_fields(payloads)))
-            .await
-            .map_err(|e| {
-                CodeGraphError::Database(format!(
-                    "Failed to upsert edge batch ({} items): {}",
-                    edges.len(),
-                    truncate_surreal_error(&e)
-                ))
-            })?
-            .check()
-            .map_err(|e| {
-                CodeGraphError::Database(format!(
-                    "Edge batch upsert returned error: {}",
-                    truncate_surreal_error(&e)
-                ))
-            })?;
+        let record_count = payloads.len();
+        let response = with_write_deadline(
+            timeout,
+            self.db
+                .query(UPSERT_EDGES_QUERY)
+                .bind(("data", strip_null_fields(payloads))),
+            "Edge batch upsert",
+            record_count,
+        )
+        .await?
+        .map_err(|e| {
+            CodeGraphError::Database(format!(
+                "Failed to upsert edge batch ({} items): {}",
+                record_count,
+                truncate_surreal_error(&e)
+            ))
+        })?;
+        response.check().map_err(|e| {
+            CodeGraphError::Database(format!(
+                "Edge batch upsert returned error ({} items): {}",
+                record_count,
+                truncate_surreal_error(&e)
+            ))
+        })?;
 
         Ok(())
     }
@@ -2837,6 +3001,40 @@ fn truncate_surreal_error(e: &SurrealError) -> String {
     msg
 }
 
+/// Wrap a query future in the graph-write deadline and report a diagnosable timeout.
+///
+/// `surrealdb::method::Query` implements `IntoFuture`, not `Future`, so callers pass the
+/// builder directly (same shape as the existing chunk-embedding timeout).
+async fn with_write_deadline<T>(
+    timeout: std::time::Duration,
+    future: impl std::future::IntoFuture<Output = T>,
+    label: &str,
+    items: usize,
+) -> Result<T> {
+    tokio::time::timeout(timeout, future.into_future())
+        .await
+        .map_err(|_| {
+            CodeGraphError::Database(format!(
+                "{label} timed out after {timeout:?} ({items} items). \
+             The SurrealDB write path stalled; check the server's memtable flush/compaction."
+            ))
+        })
+}
+
+/// Client-side deadline for graph node/edge writes.
+///
+/// Defaults to 120s; override with `CODEGRAPH_DB_WRITE_TIMEOUT_SECS`. A non-positive
+/// value is ignored so a typo cannot disable the protection.
+fn write_timeout_from_env() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 120;
+    let secs = std::env::var("CODEGRAPH_DB_WRITE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// SurrealKV reports concurrent transaction conflicts as retryable. Detect those
 /// so callers can retry instead of aborting a long indexing run.
 fn is_retryable_write_conflict(message: &str) -> bool {
@@ -2871,6 +3069,23 @@ fn parse_count(values: Vec<JsonValue>) -> Result<i64> {
 mod tests {
     use super::*;
 
+    /// A stalled server write must surface as a timeout, not park the run forever.
+    #[tokio::test]
+    async fn write_deadline_reports_stalled_queries() {
+        let err = with_write_deadline(
+            std::time::Duration::ZERO,
+            std::future::pending::<()>(),
+            "Node batch upsert",
+            2,
+        )
+        .await
+        .expect_err("a pending query must time out");
+        let message = err.to_string();
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("2 items"), "{message}");
+        assert!(message.contains("Node batch upsert"), "{message}");
+    }
+
     /// Regression for the indexing crash on SurrealKV write-write conflicts.
     /// `upsert_symbol_embeddings_batch` retries only when the classifier says the
     /// error is transient; everything else must still fail fast so real problems
@@ -2899,6 +3114,8 @@ mod tests {
             "connection reset by peer",
             "Serialization error: invalid UTF-8",
             "Failed to upsert symbol embedding batch (3 items): permission denied",
+            "Edge batch upsert timed out after 120s (512 items). The SurrealDB write path \
+             stalled; check the server's memtable flush/compaction.",
         ];
         for message in fatal {
             assert!(
@@ -3059,6 +3276,28 @@ mod tests {
     }
 
     #[test]
+    fn project_database_names_are_stable_and_distinct() {
+        let happy = project_database_name(Path::new("/repo/happy"));
+        assert_eq!(happy, project_database_name(Path::new("/repo/happy")));
+        assert!(happy.starts_with("happy_"));
+        assert!(
+            happy
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        );
+        assert_ne!(happy, project_database_name(Path::new("/repo/opencode")));
+    }
+
+    #[test]
+    fn database_per_project_can_be_disabled() {
+        assert!(database_per_project_with(None));
+        assert!(database_per_project_with(Some("1")));
+        assert!(!database_per_project_with(Some("0")));
+        assert!(!database_per_project_with(Some("false")));
+        assert!(!database_per_project_with(Some("off")));
+    }
+
+    #[test]
     fn project_connection_keeps_an_explicit_url() {
         assert_eq!(
             project_connection(Some("surrealkv:///tmp/x/.codegraph/db".into())),
@@ -3075,3 +3314,42 @@ crate::impl_surreal_serde!(
     SurrealNodeRecord,
     ChunkEmbeddingRecord
 );
+
+/// A symbol row loaded from storage to seed a partial re-index's resolution catalog.
+#[derive(Debug, Clone)]
+pub struct SymbolRow {
+    pub id: String,
+    pub file_path: String,
+    pub name: String,
+    pub node_type: Option<String>,
+    pub qualified_name: Option<String>,
+}
+
+/// Restricts a catalog reconciliation to files under one scan root.
+///
+/// Without a scope, every node the current scan did not re-emit is treated as deleted.
+/// Scoped reconciliation only touches files under `scan_root`, so indexing a single
+/// file or a subdirectory cannot wipe the rest of the project's graph.
+#[derive(Debug, Clone)]
+pub struct ReconcileScope {
+    /// Canonical project root that stored relative `file_path` values resolve against.
+    pub project_root: PathBuf,
+    /// Canonical directory or file the current scan covered.
+    pub scan_root: PathBuf,
+}
+
+/// Resolve `.` and `..` lexically without touching the filesystem, so paths for
+/// deleted files still normalize the same way as paths for files that exist.
+fn lexical_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}

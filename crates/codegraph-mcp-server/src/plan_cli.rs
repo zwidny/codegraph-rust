@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum PlanAction {
@@ -40,6 +40,17 @@ pub enum PlanAction {
     },
     /// Delete a stored plan and its nodes/edges.
     Drop { plan_id: String },
+    /// Compare a plan against the code graph of a project.
+    ///
+    /// Reports planned nodes that already exist (possible duplicate work), planned
+    /// edges already present, planned edges not implemented yet, and code dependencies
+    /// between planned nodes that the plan forgot to record.
+    Verify {
+        /// Plan file (JSON or YAML); `-` reads JSON from stdin.
+        file: String,
+        #[arg(short, long, value_enum, default_value_t = PlanFormat::Human)]
+        format: PlanFormat,
+    },
 }
 
 impl PlanAction {
@@ -51,6 +62,14 @@ impl PlanAction {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct PlanArgs {
+    /// Project root used to open the store and compare plans.
+    ///
+    /// Defaults to the current directory. A subdirectory (for example
+    /// `crates/codegraph-core/benches`) resolves to its enclosing `.git` or
+    /// `.codegraph` root, so every `plan` subcommand uses the same project as
+    /// `codegraph index` and the MCP server.
+    #[arg(long, global = true)]
+    pub project: Option<PathBuf>,
     #[command(subcommand)]
     pub action: PlanAction,
 }
@@ -159,16 +178,17 @@ pub fn run_offline(action: &PlanAction) -> Result<()> {
 }
 
 /// Persistent entry point (runs after configuration is loaded).
-pub async fn run_async(action: PlanAction) -> Result<()> {
+pub async fn run_async(action: PlanAction, project: Option<PathBuf>) -> Result<()> {
     match action {
         PlanAction::Check { file, format } => check(&file, format),
         PlanAction::Store {
             file,
             plan_id,
             force,
-        } => store(&file, plan_id, force).await,
-        PlanAction::Show { plan_id, format } => show(&plan_id, format).await,
-        PlanAction::Drop { plan_id } => drop_plan(&plan_id).await,
+        } => store(&file, plan_id, force, project).await,
+        PlanAction::Show { plan_id, format } => show(&plan_id, format, project).await,
+        PlanAction::Drop { plan_id } => drop_plan(&plan_id, project).await,
+        PlanAction::Verify { file, format } => verify(&file, project, format).await,
     }
 }
 
@@ -205,13 +225,40 @@ fn default_plan_id(file: &str) -> String {
         .unwrap_or_else(|| "plan".to_string())
 }
 
-async fn connect_storage() -> Result<SurrealDbStorage> {
-    let project_root = std::env::current_dir()?;
-    let config = SurrealDbConfig::for_project(&project_root);
+async fn connect_storage_at(project_root: &Path) -> Result<SurrealDbStorage> {
+    let config = SurrealDbConfig::for_project(project_root);
     let connection = config.connection.clone();
     SurrealDbStorage::new(config)
         .await
         .map_err(|error| anyhow::anyhow!("connect to SurrealDB at {connection}: {error}"))
+}
+
+/// Resolve the project a `plan` command operates on.
+///
+/// A subdirectory (for example `crates/codegraph-core/benches`) resolves to its
+/// enclosing `.git` or `.codegraph` root, matching how `codegraph index` and the MCP
+/// server determine the project. This keeps `plan verify` and the store connection on
+/// the same `project_id` as the indexed graph.
+fn resolve_project_root(project: Option<PathBuf>) -> Result<PathBuf> {
+    let start = match project {
+        Some(path) => path,
+        None => std::env::current_dir()?,
+    };
+    let start = start.canonicalize().unwrap_or(start);
+    let start_dir = if start.is_dir() {
+        start.clone()
+    } else {
+        start
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| start.clone())
+    };
+    for marker in [".git", ".codegraph"] {
+        if let Some(root) = start_dir.ancestors().find(|dir| dir.join(marker).exists()) {
+            return Ok(root.to_path_buf());
+        }
+    }
+    Ok(if start.is_dir() { start } else { start_dir })
 }
 
 async fn count_plan_nodes(storage: &SurrealDbStorage, project: &str) -> Result<usize> {
@@ -231,12 +278,67 @@ async fn count_plan_nodes(storage: &SurrealDbStorage, project: &str) -> Result<u
         .unwrap_or(0) as usize)
 }
 
-async fn store(file: &str, plan_id: Option<String>, force: bool) -> Result<()> {
+async fn write_plan_constraints(
+    storage: &SurrealDbStorage,
+    project: &str,
+    constraints: &[Constraint],
+) -> Result<()> {
+    let constraints = serde_json::to_value(constraints)?;
+    storage
+        .db()
+        .query(
+            "UPSERT project_metadata SET project_id = $project, name = $project, \
+             root_path = $project, metadata = { plan_constraints: $constraints } \
+             WHERE project_id = $project;",
+        )
+        .bind(("project", project.to_string()))
+        .bind(("constraints", constraints))
+        .await
+        .context("write plan constraints")?
+        .check()
+        .context("write plan constraints")?;
+    Ok(())
+}
+
+async fn read_plan_constraints(
+    storage: &SurrealDbStorage,
+    project: &str,
+) -> Result<Vec<Constraint>> {
+    let mut response = storage
+        .db()
+        .query(
+            "SELECT metadata.plan_constraints AS constraints FROM project_metadata \
+             WHERE project_id = $project LIMIT 1;",
+        )
+        .bind(("project", project.to_string()))
+        .await
+        .context("read plan constraints")?
+        .check()
+        .context("read plan constraints")?;
+    let rows: Vec<Value> = response.take(0).unwrap_or_default();
+    let Some(value) = rows
+        .first()
+        .and_then(|row| row.get("constraints"))
+        .filter(|value| !value.is_null())
+        .cloned()
+    else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(value).context("parse stored plan constraints")
+}
+
+async fn store(
+    file: &str,
+    plan_id: Option<String>,
+    force: bool,
+    project_path: Option<PathBuf>,
+) -> Result<()> {
     let (doc, source) = load(file)?;
     let plan_id = plan_id.unwrap_or_else(|| default_plan_id(file));
     let project = draft_project_id(&plan_id);
 
-    let mut storage = connect_storage().await?;
+    let root = resolve_project_root(project_path)?;
+    let mut storage = connect_storage_at(&root).await?;
     let existing = count_plan_nodes(&storage, &project).await?;
     if existing > 0 {
         if !force {
@@ -281,7 +383,7 @@ async fn store(file: &str, plan_id: Option<String>, force: bool) -> Result<()> {
                 .attributes
                 .insert("draft_kind".to_string(), kind.clone());
         }
-        id_by_name.insert(planned.id.clone(), node.id.clone());
+        id_by_name.insert(planned.id.clone(), node.id);
         nodes.push(node);
     }
     storage
@@ -304,6 +406,7 @@ async fn store(file: &str, plan_id: Option<String>, force: bool) -> Result<()> {
         .upsert_edges_batch(&edges)
         .await
         .map_err(|error| anyhow::anyhow!("write plan edges: {error}"))?;
+    write_plan_constraints(&storage, &project, &doc.constraints).await?;
 
     println!(
         "{}",
@@ -313,20 +416,24 @@ async fn store(file: &str, plan_id: Option<String>, force: bool) -> Result<()> {
             "project_id": project,
             "nodes": nodes.len(),
             "edges": edges.len(),
+            "constraints": doc.constraints.len(),
             "next": format!("codegraph plan show {plan_id}"),
         }))?
     );
     Ok(())
 }
 
-async fn show(plan_id: &str, format: PlanFormat) -> Result<()> {
+async fn show(plan_id: &str, format: PlanFormat, project_path: Option<PathBuf>) -> Result<()> {
     let project = draft_project_id(plan_id);
-    let storage = connect_storage().await?;
+    let root = resolve_project_root(project_path)?;
+    let storage = connect_storage_at(&root).await?;
     if count_plan_nodes(&storage, &project).await? == 0 {
         bail!(
             "plan '{plan_id}' is not stored; run `codegraph plan store <file> --plan-id {plan_id}` first"
         );
     }
+
+    let constraints = read_plan_constraints(&storage, &project).await?;
 
     let mut node_response = storage
         .db()
@@ -347,21 +454,25 @@ async fn show(plan_id: &str, format: PlanFormat) -> Result<()> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let layer = row
+        let metadata = row
             .get("metadata")
             .and_then(Value::as_str)
-            .and_then(|encoded| codegraph_core::decompress_json(encoded).ok())
-            .and_then(|metadata| {
-                metadata
-                    .get("layer")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
+            .and_then(|encoded| codegraph_core::decompress_json(encoded).ok());
+        let layer = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("layer"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let kind = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("draft_kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         name_by_record.insert(record.to_string(), name.clone());
         nodes.push(PlanNode {
             id: name,
             layer,
-            kind: None,
+            kind,
         });
     }
 
@@ -399,11 +510,11 @@ async fn show(plan_id: &str, format: PlanFormat) -> Result<()> {
         });
     }
 
-    // Constraints live in the plan file, not the graph; keep them there.
+    // Constraints are persisted next to the draft graph in `project_metadata`.
     let doc = PlanDoc {
         nodes,
         edges,
-        constraints: Vec::new(),
+        constraints,
     };
 
     match format {
@@ -423,15 +534,19 @@ async fn show(plan_id: &str, format: PlanFormat) -> Result<()> {
                 println!("  edge {} -[{}]-> {}", edge.from, edge.kind, edge.to);
             }
             println!("Nodes: {}  Edges: {}", doc.nodes.len(), doc.edges.len());
-            println!("Constraints are not persisted; keep them in the plan file.");
+            println!(
+                "Constraints: {} (re-run `codegraph plan check` after editing the plan file)",
+                doc.constraints.len()
+            );
         }
     }
     Ok(())
 }
 
-async fn drop_plan(plan_id: &str) -> Result<()> {
+async fn drop_plan(plan_id: &str, project_path: Option<PathBuf>) -> Result<()> {
     let project = draft_project_id(plan_id);
-    let storage = connect_storage().await?;
+    let root = resolve_project_root(project_path)?;
+    let storage = connect_storage_at(&root).await?;
     let nodes = count_plan_nodes(&storage, &project).await?;
     if nodes == 0 {
         bail!("plan '{plan_id}' is not stored");
@@ -449,6 +564,236 @@ async fn drop_plan(plan_id: &str) -> Result<()> {
             "nodes": nodes,
         }))?
     );
+    Ok(())
+}
+
+/// Code-graph view used to compare a plan against what already exists.
+#[derive(Default)]
+struct CodeIndex {
+    names: HashMap<String, Vec<String>>,
+    edges: HashSet<(String, String)>,
+    nodes: usize,
+    edge_count: usize,
+}
+
+/// Differences between a plan and the project's code graph.
+#[derive(Default)]
+struct CodeComparison {
+    /// Planned node names that already exist in code (possible duplicate work).
+    existing_planned_nodes: Vec<(String, Vec<String>)>,
+    /// Planned dependencies already present in code.
+    edges_already_present: Vec<(String, String)>,
+    /// Planned dependencies not implemented yet.
+    missing_code_edges: Vec<(String, String)>,
+    /// Code dependencies between planned nodes that the plan does not record.
+    unplanned_code_edges: Vec<(String, String)>,
+}
+
+async fn load_code_index(storage: &SurrealDbStorage, project: &str) -> Result<CodeIndex> {
+    let mut node_response = storage
+        .db()
+        .query("SELECT <string> id AS id, name, file_path FROM nodes WHERE project_id = $project;")
+        .bind(("project", project.to_string()))
+        .await
+        .context("read code nodes")?
+        .check()
+        .context("read code nodes")?;
+    let node_rows: Vec<Value> = node_response.take(0).unwrap_or_default();
+
+    let mut id_to_name: HashMap<String, String> = HashMap::new();
+    let mut index = CodeIndex::default();
+    for row in node_rows {
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let file = row
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        id_to_name.insert(id.to_string(), name.clone());
+        index.names.entry(name).or_default().push(file);
+        index.nodes += 1;
+    }
+
+    let mut edge_response = storage
+        .db()
+        .query(
+            "SELECT <string> from AS from_id, <string> to AS to_id FROM edges \
+             WHERE project_id = $project;",
+        )
+        .bind(("project", project.to_string()))
+        .await
+        .context("read code edges")?
+        .check()
+        .context("read code edges")?;
+    let edge_rows: Vec<Value> = edge_response.take(0).unwrap_or_default();
+
+    let mut pairs = Vec::new();
+    for row in edge_rows {
+        index.edge_count += 1;
+        let from = row
+            .get("from_id")
+            .and_then(Value::as_str)
+            .and_then(|id| id_to_name.get(id));
+        let to = row
+            .get("to_id")
+            .and_then(Value::as_str)
+            .and_then(|id| id_to_name.get(id));
+        if let (Some(from), Some(to)) = (from, to) {
+            pairs.push((from.clone(), to.clone()));
+        }
+    }
+    index.edges.extend(pairs);
+    Ok(index)
+}
+
+fn compare_with_code(doc: &PlanDoc, code: &CodeIndex) -> CodeComparison {
+    let mut comparison = CodeComparison::default();
+    let planned: HashSet<&str> = doc.nodes.iter().map(|node| node.id.as_str()).collect();
+
+    for node in &doc.nodes {
+        if let Some(files) = code.names.get(&node.id) {
+            let mut files = files.clone();
+            files.sort();
+            files.dedup();
+            comparison
+                .existing_planned_nodes
+                .push((node.id.clone(), files));
+        }
+    }
+
+    let planned_edges: HashSet<(String, String)> = doc
+        .edges
+        .iter()
+        .map(|edge| (edge.from.clone(), edge.to.clone()))
+        .collect();
+    for edge in &doc.edges {
+        let pair = (edge.from.clone(), edge.to.clone());
+        if code.edges.contains(&pair) {
+            comparison.edges_already_present.push(pair);
+        } else {
+            comparison.missing_code_edges.push(pair);
+        }
+    }
+
+    for (from, to) in &code.edges {
+        if planned.contains(from.as_str())
+            && planned.contains(to.as_str())
+            && !planned_edges.contains(&(from.clone(), to.clone()))
+        {
+            comparison
+                .unplanned_code_edges
+                .push((from.clone(), to.clone()));
+        }
+    }
+
+    comparison
+}
+
+fn print_verify_human(
+    source: &str,
+    project_id: &str,
+    code: &CodeIndex,
+    report: &PlanReport,
+    comparison: &CodeComparison,
+) {
+    println!("Plan verify: {source}");
+    println!(
+        "Code graph: project_id={project_id} nodes={} edges={}",
+        code.nodes, code.edge_count
+    );
+    for check in &report.checks {
+        let marker = if check.ok { "PASS" } else { "FAIL" };
+        match &check.detail {
+            Some(detail) => println!("  [{marker}] {}: {detail}", check.rule),
+            None => println!("  [{marker}] {}", check.rule),
+        }
+    }
+    for (node, files) in &comparison.existing_planned_nodes {
+        println!(
+            "  [WARN] planned node '{node}' already exists in code: {}",
+            files.join(", ")
+        );
+    }
+    for (from, to) in &comparison.edges_already_present {
+        println!("  [INFO] dependency '{from}' -> '{to}' already exists in code");
+    }
+    for (from, to) in &comparison.unplanned_code_edges {
+        println!("  [WARN] code depends '{from}' -> '{to}' but the plan does not record it");
+    }
+    for (from, to) in &comparison.missing_code_edges {
+        println!("  [INFO] planned dependency '{from}' -> '{to}' is not in the code yet");
+    }
+    if comparison.existing_planned_nodes.is_empty() && code.nodes > 0 {
+        println!(
+            "  [NOTE] no planned node name matched the code graph; if these symbols already \
+             exist, re-run `codegraph index` so the index is current"
+        );
+    }
+    println!(
+        "Plan: {} nodes, {} edges | code: {} nodes, {} edges",
+        report.nodes, report.edges, code.nodes, code.edge_count
+    );
+}
+
+async fn verify(file: &str, project: Option<PathBuf>, format: PlanFormat) -> Result<()> {
+    let (doc, source) = load(file)?;
+    let report = analyze(&doc);
+
+    let root = resolve_project_root(project)?;
+    let project_id = std::env::var("CODEGRAPH_PROJECT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| root.display().to_string());
+
+    let storage = connect_storage_at(&root).await?;
+    let code = load_code_index(&storage, &project_id).await?;
+    let comparison = compare_with_code(&doc, &code);
+
+    match format {
+        PlanFormat::Json => {
+            let output = json!({
+                "ok": report.ok,
+                "plan": {
+                    "nodes": doc.nodes.len(),
+                    "edges": doc.edges.len(),
+                    "constraints": doc.constraints.len(),
+                },
+                "code": {
+                    "project_id": project_id,
+                    "nodes": code.nodes,
+                    "edges": code.edge_count,
+                },
+                "checks": &report.checks,
+                "violations": &report.violations,
+                "warnings": &report.warnings,
+                "existing_planned_nodes": comparison.existing_planned_nodes,
+                "edges_already_present": comparison.edges_already_present,
+                "unplanned_code_edges": comparison.unplanned_code_edges,
+                "missing_code_edges": comparison.missing_code_edges,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        PlanFormat::Human => {
+            print_verify_human(&source, &project_id, &code, &report, &comparison);
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "plan verify reported {} plan violation(s); see the output above",
+            report.violations.len()
+        );
+    }
     Ok(())
 }
 
@@ -551,13 +896,13 @@ pub fn analyze(doc: &PlanDoc) -> PlanReport {
                     .collect();
                 let mut local = Vec::new();
                 for node in &doc.nodes {
-                    if let Some(layer) = &node.layer {
-                        if !index.contains_key(layer.as_str()) {
-                            warnings.push(format!(
-                                "node '{}' has layer '{}' not listed in layering order",
-                                node.id, layer
-                            ));
-                        }
+                    if let Some(layer) = &node.layer
+                        && !index.contains_key(layer.as_str())
+                    {
+                        warnings.push(format!(
+                            "node '{}' has layer '{}' not listed in layering order",
+                            node.id, layer
+                        ));
                     }
                 }
                 for edge in &doc.edges {
@@ -940,5 +1285,69 @@ mod tests {
             constraints: vec![Constraint::Acyclic { edge_kind: None }],
         };
         assert!(analyze(&doc).ok);
+    }
+
+    fn code_index(nodes: &[(&str, &str)], edges: &[(&str, &str)]) -> CodeIndex {
+        let mut index = CodeIndex::default();
+        for (name, file) in nodes {
+            index
+                .names
+                .entry(name.to_string())
+                .or_default()
+                .push(file.to_string());
+            index.nodes += 1;
+        }
+        for (from, to) in edges {
+            index.edges.insert((from.to_string(), to.to_string()));
+            index.edge_count += 1;
+        }
+        index
+    }
+
+    #[test]
+    fn verify_flags_duplicates_missing_and_unplanned_edges() {
+        let doc = PlanDoc {
+            nodes: vec![node("existing"), node("new"), node("other")],
+            edges: vec![edge("new", "existing"), edge("other", "new")],
+            constraints: Vec::new(),
+        };
+        let code = code_index(&[("existing", "src/a.rs")], &[("other", "existing")]);
+
+        let comparison = compare_with_code(&doc, &code);
+        assert_eq!(comparison.existing_planned_nodes.len(), 1);
+        assert!(comparison.edges_already_present.is_empty());
+        assert_eq!(
+            comparison.missing_code_edges,
+            vec![
+                ("new".to_string(), "existing".to_string()),
+                ("other".to_string(), "new".to_string()),
+            ]
+        );
+        assert_eq!(
+            comparison.unplanned_code_edges,
+            vec![("other".to_string(), "existing".to_string())],
+            "a code dependency between planned nodes must be reported when the plan omits it"
+        );
+    }
+
+    #[test]
+    fn verify_recognises_dependencies_that_already_exist() {
+        let doc = PlanDoc {
+            nodes: vec![node("a"), node("b")],
+            edges: vec![edge("a", "b")],
+            constraints: Vec::new(),
+        };
+        let code = code_index(&[], &[("a", "b")]);
+
+        let comparison = compare_with_code(&doc, &code);
+        assert_eq!(
+            comparison.edges_already_present,
+            vec![("a".to_string(), "b".to_string())]
+        );
+        assert!(comparison.missing_code_edges.is_empty());
+        assert!(
+            comparison.unplanned_code_edges.is_empty(),
+            "a planned edge is not an unplanned one"
+        );
     }
 }

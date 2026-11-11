@@ -70,7 +70,11 @@ impl AnalyzerSettings {
             std::env::var("CODEGRAPH_ANALYZERS_REQUIRE_TOOLS").as_deref(),
             Ok("0" | "false" | "off")
         );
-        Self::configured(tier, enabled, require_tools)
+        let definitions = matches!(
+            std::env::var("CODEGRAPH_LSP_DEFINITIONS").as_deref(),
+            Ok("1" | "true" | "on")
+        );
+        with_lsp_definitions(Self::configured(tier, enabled, require_tools), definitions)
     }
     fn configured(
         tier: codegraph_core::config_manager::IndexingTier,
@@ -118,6 +122,14 @@ pub enum LspMode {
     Off,
     SymbolsOnly,
     SymbolsAndDefinitions,
+}
+
+/// `CODEGRAPH_LSP_DEFINITIONS=1` forces definition resolution on balanced.
+fn with_lsp_definitions(mut settings: AnalyzerSettings, requested: bool) -> AnalyzerSettings {
+    if requested && settings.lsp_enabled() {
+        settings.lsp_mode = LspMode::SymbolsAndDefinitions;
+    }
+    settings
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +184,13 @@ pub fn lsp_server_for_language(language: &Language) -> Option<LspServerSpec> {
             language_id: "java",
             name_joiner: ".",
         }),
+        Language::Kotlin => Some(LspServerSpec {
+            // jdtls cannot read `.kt`; Kotlin needs the Kotlin Language Server.
+            tool_name: "kotlin-language-server",
+            args: &[],
+            language_id: "kotlin",
+            name_joiner: ".",
+        }),
         Language::Cpp => Some(LspServerSpec {
             tool_name: "clangd",
             args: &[],
@@ -219,6 +238,16 @@ pub fn required_tools_for_languages(languages: &[Language]) -> Vec<RequiredTool>
                 name: "jdtls",
                 language: Language::Java,
             }),
+            Language::Kotlin => {
+                out.push(RequiredTool {
+                    name: "java",
+                    language: Language::Kotlin,
+                });
+                out.push(RequiredTool {
+                    name: "kotlin-language-server",
+                    language: Language::Kotlin,
+                });
+            }
             Language::Cpp => out.push(RequiredTool {
                 name: "clangd",
                 language: Language::Cpp,
@@ -276,9 +305,35 @@ mod tests {
     }
 
     #[test]
+    fn lsp_definitions_can_be_forced_on_balanced() {
+        let forced = with_lsp_definitions(AnalyzerSettings::for_tier(IndexingTier::Balanced), true);
+        assert!(forced.lsp_definitions_enabled());
+
+        let default =
+            with_lsp_definitions(AnalyzerSettings::for_tier(IndexingTier::Balanced), false);
+        assert!(default.lsp_enabled());
+        assert!(!default.lsp_definitions_enabled());
+
+        // Forcing definitions must not re-enable LSP when analyzers are off.
+        let off = with_lsp_definitions(AnalyzerSettings::for_tier(IndexingTier::Fast), true);
+        assert!(!off.lsp_definitions_enabled());
+    }
+
+    #[test]
     fn required_tools_include_rust_analyzer_for_rust() {
         let tools = required_tools_for_languages(&[Language::Rust]);
         assert!(tools.iter().any(|t| t.name == "rust-analyzer"));
+    }
+
+    #[test]
+    fn kotlin_uses_kotlin_language_server() {
+        let spec = lsp_server_for_language(&Language::Kotlin).expect("kotlin LSP spec");
+        assert_eq!(spec.tool_name, "kotlin-language-server");
+        assert_eq!(spec.language_id, "kotlin");
+
+        let tools = required_tools_for_languages(&[Language::Kotlin]);
+        assert!(tools.iter().any(|t| t.name == "kotlin-language-server"));
+        assert!(tools.iter().any(|t| t.name == "java"));
     }
 
     #[test]

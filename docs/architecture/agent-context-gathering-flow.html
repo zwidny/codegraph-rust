@@ -849,7 +849,7 @@
                         <text class="node-text" x="335" y="770" text-anchor="middle">get_transitive_deps</text>
                         <text class="node-subtext" x="335" y="790" text-anchor="middle">Forward dependencies</text>
                         <text class="node-subtext" x="335" y="808" text-anchor="middle">node_id: String</text>
-                        <text class="node-subtext" x="335" y="823" text-anchor="middle">edge_type: Calls</text>
+                        <text class="node-subtext" x="335" y="823" text-anchor="middle">edge_type: calls</text>
                         <text class="node-subtext" x="335" y="838" text-anchor="middle">depth: 3 (default)</text>
                     </g>
 
@@ -859,7 +859,7 @@
                         <text class="node-text" x="525" y="770" text-anchor="middle">get_reverse_deps</text>
                         <text class="node-subtext" x="525" y="790" text-anchor="middle">What depends on this</text>
                         <text class="node-subtext" x="525" y="808" text-anchor="middle">node_id: String</text>
-                        <text class="node-subtext" x="525" y="823" text-anchor="middle">edge_type: Calls</text>
+                        <text class="node-subtext" x="525" y="823" text-anchor="middle">edge_type: calls</text>
                         <text class="node-subtext" x="525" y="838" text-anchor="middle">depth: 3 (default)</text>
                     </g>
 
@@ -877,7 +877,7 @@
                         <rect class="node-box" x="810" y="745" width="150" height="110" fill="#1e293b" stroke="#F59E0B" stroke-width="2"/>
                         <text class="node-text" x="885" y="770" text-anchor="middle">detect_cycles</text>
                         <text class="node-subtext" x="885" y="790" text-anchor="middle">Circular deps</text>
-                        <text class="node-subtext" x="885" y="808" text-anchor="middle">edge_type: Calls</text>
+                        <text class="node-subtext" x="885" y="808" text-anchor="middle">edge_type: calls</text>
                     </g>
 
                     <!-- calculate_coupling -->
@@ -1231,7 +1231,7 @@
                 description: 'Get all transitive dependencies of a code node up to specified depth.',
                 details: [
                     'node_id: String - Node to analyze (e.g., "nodes:123")',
-                    'edge_type: String - Calls, Imports, Uses, etc. (default: Calls)',
+                    'edge_type: String - calls, defines, uses, imports, extends, implements, contains, references (default: calls)',
                     'depth: i32 - Max traversal depth (default: 3)',
                     'Follows dependency edges recursively'
                 ]
@@ -1241,7 +1241,7 @@
                 description: 'Get all nodes that depend on the specified node.',
                 details: [
                     'node_id: String - Node to analyze',
-                    'edge_type: String - Dependency type (default: Calls)',
+                    'edge_type: String - Dependency type (default: calls)',
                     'depth: i32 - Max depth (default: 3)',
                     'Useful for impact analysis'
                 ]
@@ -1259,7 +1259,7 @@
                 title: 'detect_cycles',
                 description: 'Detect circular dependencies and cycles in the codebase graph.',
                 details: [
-                    'edge_type: String - Type to check (default: Calls)',
+                    'edge_type: String - Type to check (default: calls)',
                     'Returns all detected cycles',
                     'Important for architectural health'
                 ]

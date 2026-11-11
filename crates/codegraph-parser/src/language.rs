@@ -81,14 +81,14 @@ impl LanguageRegistry {
             },
         );
 
-        // Temporarily disabled due to tree-sitter version conflicts - TODO: Fix when compatible versions available
-        // configs.insert(
-        //     Language::Kotlin,
-        //     LanguageConfig {
-        //         language: tree_sitter_kotlin::language(),
-        //         file_extensions: vec!["kt", "kts"],
-        //     },
-        // );
+        configs.insert(
+            Language::Kotlin,
+            LanguageConfig {
+                language: tree_sitter_kotlin_ng::LANGUAGE.into(),
+                // `.kts` scripts use different semantics; keep them out of the code graph.
+                file_extensions: vec!["kt"],
+            },
+        );
 
         configs.insert(
             Language::CSharp,
@@ -169,5 +169,17 @@ mod tests {
                 LANGUAGE_VERSION
             );
         }
+    }
+
+    #[test]
+    fn kotlin_is_registered_for_kt_only() {
+        let registry = LanguageRegistry::new();
+        assert!(matches!(
+            registry.detect_language("src/Main.kt"),
+            Some(Language::Kotlin)
+        ));
+        // Script files use different semantics and stay out of the code graph.
+        assert!(registry.detect_language("build.gradle.kts").is_none());
+        assert!(registry.create_parser(&Language::Kotlin).is_some());
     }
 }

@@ -76,15 +76,15 @@ async fn smoke_graph_tools() {
         Err(e) => eprintln!("semantic_search_with_context error: {e}"),
     }
 
-    // 2) Transitive deps (edge type Calls) from a placeholder node
+    // 2) Transitive deps (edge type calls) from a placeholder node
     let node_id = "nodes:1"; // replace with a real node id in your DB if desired
-    match graph.get_transitive_dependencies(node_id, "Calls", 2).await {
+    match graph.get_transitive_dependencies(node_id, "calls", 2).await {
         Ok(res) => println!("get_transitive_dependencies: {} deps", res.len()),
         Err(e) => eprintln!("get_transitive_dependencies error: {e}"),
     }
 
     // 3) Reverse deps
-    match graph.get_reverse_dependencies(node_id, "Calls", 2).await {
+    match graph.get_reverse_dependencies(node_id, "calls", 2).await {
         Ok(res) => println!("get_reverse_dependencies: {} reverse deps", res.len()),
         Err(e) => eprintln!("get_reverse_dependencies error: {e}"),
     }

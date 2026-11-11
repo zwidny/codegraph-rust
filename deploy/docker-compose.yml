@@ -1,0 +1,67 @@
+# SurrealDB for CodeGraph
+#
+# Purpose of the memory limits in this file: SurrealKV derives its block cache and
+# memtable budget from the memory it can see (~40-50% for the block cache, 256MB-1GB
+# for the memtable). Without a cgroup limit on a 31GB host it reserved a 15.6GB block
+# cache and a 1GB memtable, and under heavy re-indexing the memtable flush stalled
+# (see deploy/README.md for the incident timeline). A container memory limit makes
+# SurrealKV shrink both budgets automatically; it is the only supported lever because
+# SurrealDB v3.3.0 exposes no flag/env for either value.
+#
+# Usage:
+#   cd deploy
+#   cp .env.example .env        # then set SURREALDB_PASSWORD
+#   docker compose up -d
+#
+# The default volume name matches an existing non-compose deployment
+# (`cg-server-data`), so switching to this compose file reuses the current data.
+
+name: codegraph
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:${SURREALDB_IMAGE_TAG:-v3.3.0}
+    container_name: codegraph-db
+    restart: unless-stopped
+    # The image defaults to `nonroot`, but a volume created by an earlier root-run
+    # deployment (e.g. `docker run ... -v cg-server-data:/data`) is owned by root and
+    # cannot be opened by `nonroot` (the server exits with
+    # "IO error: Permission denied (os error 13)"). Keep root to reuse that data; to
+    # harden instead, chown the volume to the image's nonroot user and drop this line.
+    user: "0:0"
+    command:
+      - start
+      - --user
+      - ${SURREALDB_USER:-root}
+      - --pass
+      - ${SURREALDB_PASSWORD:?SURREALDB_PASSWORD must be set (see deploy/.env.example)}
+      - --bind
+      - 0.0.0.0:8000
+      - --log
+      - ${SURREALDB_LOG:-info}
+      # Switch backends with SURREALDB_STORAGE, e.g. `rocksdb:/data`.
+      # RocksDB needs an EMPTY volume: it cannot open a SurrealKV directory, so a
+      # backend switch also means re-indexing every project into the new store.
+      - ${SURREALDB_STORAGE:-surrealkv:/data}
+    ports:
+      # Bound to the host loopback by default; widen to 0.0.0.0 only if remote
+      # clients need direct access.
+      - "${SURREALDB_HOST:-127.0.0.1}:${SURREALDB_PORT:-8010}:8000"
+    volumes:
+      - codegraph-data:/data
+    mem_limit: ${SURREALDB_MEM_LIMIT:-8g}
+    memswap_limit: ${SURREALDB_MEM_LIMIT:-8g}
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  codegraph-data:
+    external: true
+    name: ${SURREALDB_DATA_VOLUME:-cg-server-data}

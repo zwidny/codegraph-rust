@@ -98,8 +98,8 @@ enum Commands {
         about = "Validate an LLM's draft plan graph offline, or persist it under project_id plan:<id>"
     )]
     Plan {
-        #[command(subcommand)]
-        action: plan_cli::PlanAction,
+        #[command(flatten)]
+        args: plan_cli::PlanArgs,
     },
 
     #[command(about = "Emit agent guidance or install project-local harness hooks")]
@@ -164,6 +164,10 @@ enum Commands {
                         --include, filter with --languages, and exclude node_modules/dist/generated/*.d.ts.\n\
                       - A single non-UTF-8 source file aborts the whole run; exclude it with --exclude.\n\
                       - Indexing is incremental by default (changed files + cache); --force rebuilds from scratch.\n\
+                      - A subdirectory or file path updates only that scope; --project-root sets the owning project\n\
+                        (defaults to the nearest .git or .codegraph ancestor).\n\
+                      - Partial re-indexes skip language servers; set CODEGRAPH_LSP_ON_PARTIAL=1 and pass\n\
+                        --project-root to enable them (LSP loads the whole project, not just the scan path).\n\
                       - An embedding provider is required; without one the run fails before writing the graph.\n\
                       - Re-run after code changes, or start the MCP server with --watch to keep it fresh."
     )]
@@ -253,6 +257,12 @@ enum Commands {
         complete_deferred: bool,
         #[arg(long, help = "Write indexing metrics and completion status as JSON")]
         stats_json: Option<PathBuf>,
+
+        #[arg(
+            long,
+            help = "Project root that owns the index; defaults to the nearest .git or .codegraph ancestor"
+        )]
+        project_root: Option<PathBuf>,
     },
 
     #[command(
@@ -581,9 +591,9 @@ fn main() -> Result<()> {
     if let Commands::Query { args } = cli.command {
         return query_cli::run(args);
     }
-    if let Commands::Plan { ref action } = cli.command {
-        if action.is_offline() {
-            return plan_cli::run_offline(action);
+    if let Commands::Plan { ref args } = cli.command {
+        if args.action.is_offline() {
+            return plan_cli::run_offline(&args.action);
         }
     }
     if let Commands::Agent { ref action } = cli.command {
@@ -630,6 +640,7 @@ fn main() -> Result<()> {
             index_tier,
             complete_deferred: false,
             stats_json: None,
+            project_root: None,
         };
     }
     if let Some(path) = &cli.config {
@@ -668,8 +679,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
         | Commands::Query { .. } => {
             unreachable!("handled before configuration")
         }
-        Commands::Plan { action } => {
-            plan_cli::run_async(action).await?;
+        Commands::Plan { args } => {
+            plan_cli::run_async(args.action, args.project).await?;
         }
         Commands::Start {
             transport,
@@ -704,6 +715,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             index_tier,
             complete_deferred,
             stats_json,
+            project_root,
         } => {
             handle_index(
                 config,
@@ -724,6 +736,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 index_tier,
                 complete_deferred,
                 stats_json,
+                project_root,
                 cli.debug,
             )
             .await?;
@@ -1231,6 +1244,57 @@ async fn handle_status(pid_file: Option<PathBuf>, detailed: bool) -> Result<()> 
     Ok(())
 }
 
+/// Decide which project the scanned path belongs to.
+///
+/// Explicit `--project-root` wins, then `CODEGRAPH_PROJECT_ID` when it names a real
+/// directory, then the nearest ancestor containing `.git` (preferred) or `.codegraph`.
+/// Falling back to the scanned path keeps standalone indexing working outside a
+/// repository, while indexing a subdirectory inside a repo now updates that repo's
+/// project instead of creating a separate one.
+fn resolve_project_root(scan: &Path, explicit: Option<PathBuf>) -> PathBuf {
+    resolve_project_root_with_env(scan, explicit, std::env::var("CODEGRAPH_PROJECT_ID").ok())
+}
+
+fn resolve_project_root_with_env(
+    scan: &Path,
+    explicit: Option<PathBuf>,
+    env_project: Option<String>,
+) -> PathBuf {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    if let Some(root) = explicit {
+        return canonical(&root);
+    }
+    if let Some(value) = env_project {
+        let candidate = PathBuf::from(value);
+        if candidate.is_dir() {
+            return canonical(&candidate);
+        }
+    }
+
+    let scan = canonical(scan);
+    let start = if scan.is_dir() {
+        scan.clone()
+    } else {
+        scan.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| scan.clone())
+    };
+    for marker in [".git", ".codegraph"] {
+        if let Some(root) = find_ancestor_with(&start, marker) {
+            return root;
+        }
+    }
+    if scan.is_dir() { scan } else { start }
+}
+
+fn find_ancestor_with(start: &Path, marker: &str) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(marker).exists())
+        .map(Path::to_path_buf)
+}
+
 async fn handle_index(
     config: &codegraph_core::config_manager::CodeGraphConfig,
     path: PathBuf,
@@ -1250,9 +1314,10 @@ async fn handle_index(
     index_tier: Option<IndexTier>,
     complete_deferred: bool,
     stats_json: Option<PathBuf>,
+    project_root_override: Option<PathBuf>,
     debug_log: bool,
 ) -> Result<()> {
-    let project_root = path.clone().canonicalize().unwrap_or_else(|_| path.clone());
+    let project_root = resolve_project_root(&path, project_root_override);
 
     let env_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -2594,6 +2659,61 @@ async fn handle_daemon_start(
 mod cli_command_tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn project_root_prefers_git_ancestor_over_scanned_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("packages/core/src")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+
+        let scan = root.join("packages/core");
+        assert_eq!(
+            resolve_project_root_with_env(&scan, None, None),
+            root,
+            "a scanned subdirectory belongs to the repository root"
+        );
+    }
+
+    #[test]
+    fn project_root_honours_explicit_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("packages/core")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+
+        let explicit = root.join("packages");
+        assert_eq!(
+            resolve_project_root_with_env(
+                &root.join("packages/core"),
+                Some(explicit.clone()),
+                None
+            ),
+            explicit.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn project_root_falls_back_to_scanned_directory_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().canonicalize().unwrap().join("standalone");
+        std::fs::create_dir_all(&scan).unwrap();
+
+        assert_eq!(resolve_project_root_with_env(&scan, None, None), scan);
+    }
+
+    #[test]
+    fn project_root_uses_existing_env_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("packages/core")).unwrap();
+
+        let scan = root.join("packages/core");
+        assert_eq!(
+            resolve_project_root_with_env(&scan, None, Some(root.display().to_string())),
+            root
+        );
+    }
 
     #[test]
     fn indexing_batch_size_preserves_explicit_values_and_rejects_zero() {

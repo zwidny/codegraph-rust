@@ -48,6 +48,14 @@ pub fn collect_source_files_with_config(
         "**/__pycache__/**",
         "**/.pytest_cache/**",
         "**/.codegraph/**",
+        "**/.gradle/**",
+        "**/.settings/**",
+        "**/.idea/**",
+        "**/.kotlin/**",
+        "**/.cxx/**",
+        "**/.externalNativeBuild/**",
+        "**/.classpath",
+        "**/.project",
     ];
 
     let mut combined_excludes: Vec<String> =

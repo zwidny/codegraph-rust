@@ -666,8 +666,8 @@ impl GraphToolExecutor {
             .as_str()
             .ok_or_else(|| McpError::Protocol("Missing node_id".to_string()))?;
 
-        // Default to "Calls" if edge_type not provided (for LATS compatibility)
-        let edge_type = params["edge_type"].as_str().unwrap_or("Calls");
+        // Default to "calls" if edge_type not provided (for LATS compatibility)
+        let edge_type = params["edge_type"].as_str().unwrap_or("calls");
 
         let depth = params["depth"].as_i64().unwrap_or(3) as i32;
 
@@ -794,8 +794,8 @@ impl GraphToolExecutor {
             .as_str()
             .ok_or_else(|| McpError::Protocol("Missing node_id".to_string()))?;
 
-        // Default to "Calls" if edge_type not provided (for LATS compatibility)
-        let edge_type = params["edge_type"].as_str().unwrap_or("Calls");
+        // Default to "calls" if edge_type not provided (for LATS compatibility)
+        let edge_type = params["edge_type"].as_str().unwrap_or("calls");
 
         let depth = params["depth"].as_i64().unwrap_or(3) as i32;
 
@@ -1268,12 +1268,12 @@ mod tests {
     fn test_parameter_extraction() {
         let params = json!({
             "node_id": "nodes:123",
-            "edge_type": "Calls",
+            "edge_type": "calls",
             "depth": 5
         });
 
         assert_eq!(params["node_id"].as_str().unwrap(), "nodes:123");
-        assert_eq!(params["edge_type"].as_str().unwrap(), "Calls");
+        assert_eq!(params["edge_type"].as_str().unwrap(), "calls");
         assert_eq!(params["depth"].as_i64().unwrap(), 5);
     }
 
@@ -1420,17 +1420,17 @@ mod tests {
     fn test_cache_key_generation() {
         let params1 = json!({
             "node_id": "nodes:123",
-            "edge_type": "Calls",
+            "edge_type": "calls",
             "depth": 3
         });
         let params2 = json!({
             "node_id": "nodes:123",
-            "edge_type": "Calls",
+            "edge_type": "calls",
             "depth": 3
         });
         let params3 = json!({
             "node_id": "nodes:456",
-            "edge_type": "Calls",
+            "edge_type": "calls",
             "depth": 3
         });
 
@@ -1506,7 +1506,7 @@ mod tests {
         let logs = capture_logs(|| {
             let params = serde_json::json!({
                 "node_id": "nodes:123",
-                "edge_type": "Calls"
+                "edge_type": "calls"
             });
             log_tool_call_start("get_transitive_dependencies", &params);
         });

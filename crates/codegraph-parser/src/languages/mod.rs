@@ -10,6 +10,7 @@ pub mod cpp;
 pub mod csharp;
 pub mod go;
 pub mod java;
+pub mod kotlin;
 pub mod php;
 pub mod ruby;
 pub mod swift;
@@ -63,6 +64,7 @@ pub use csharp::CSharpExtractor;
 pub use go::GoExtractor;
 pub use java::JavaExtractor;
 pub use javascript::TypeScriptExtractor;
+pub use kotlin::KotlinExtractor;
 pub use php::PhpExtractor;
 pub use python::PythonExtractor;
 pub use ruby::RubyExtractor;
@@ -114,6 +116,9 @@ pub fn extract_for_language_with_policy(
             tree, content, file_path,
         )),
         Language::Java => Some(<JavaExtractor as LanguageExtractor>::extract_with_edges(
+            tree, content, file_path,
+        )),
+        Language::Kotlin => Some(<KotlinExtractor as LanguageExtractor>::extract_with_edges(
             tree, content, file_path,
         )),
         Language::Cpp => Some(<CppExtractor as LanguageExtractor>::extract_with_edges(

@@ -217,8 +217,12 @@ for a very large monorepo — use `--index-tier fast` and scope what you index:
 
 ```bash
 codegraph init . --hooks both --index-tier fast
-codegraph index server --index-tier fast -l typescript   # one subtree
+codegraph index server --index-tier fast -l typescript   # one subtree; belongs to the repo project
 ```
+
+Indexing a subdirectory or a single file updates only that scope and leaves the rest
+of the project graph intact; see
+[incremental indexing](docs/INCREMENTAL_INDEXING.md) for project-root resolution and limits.
 
 Verify the index:
 
@@ -279,7 +283,7 @@ codegraph agent impact  "if I change RequestRouter, what breaks?"
   - `codegraph daemon start .` — a separate background watcher (`daemon status` / `daemon stop`).
   - `codegraph index .` — manual **incremental** re-index (detects changed files, reuses the
     cache); add `--force` for a full rebuild, or `--complete-deferred` to finish deferred
-    semantic inference.
+    semantic inference. `codegraph index <dir|file>` narrows the update to that scope.
   - Set `[daemon] auto_start_with_mcp = true` to make plain `codegraph start` watch by default.
 
 That's it — `~/repos/github.com/paperclip` is indexed and your agent can reason over its graph.

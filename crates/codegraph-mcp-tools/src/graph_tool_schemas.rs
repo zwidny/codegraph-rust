@@ -12,6 +12,23 @@ pub struct ToolSchema {
     pub parameters: JsonValue,
 }
 
+/// Relationship names every dependency tool accepts.
+///
+/// Mirrors `EdgeType::from_str` (minus its free-form `Other`) and stays lowercase to
+/// agree with stored values, `EdgeType`'s `Display`, the MCP tool descriptions and the
+/// benchmark scripts. `EdgeType::from_str` still lowercases its input, so callers that
+/// send `"Calls"` keep working.
+pub const EDGE_TYPE_VALUES: [&str; 8] = [
+    "calls",
+    "defines",
+    "uses",
+    "imports",
+    "extends",
+    "implements",
+    "contains",
+    "references",
+];
+
 /// Collection of all graph analysis tool schemas
 pub struct GraphToolSchemas;
 
@@ -76,7 +93,7 @@ impl GraphToolSchemas {
                     "edge_type": {
                         "type": "string",
                         "description": "Type of dependency relationship to follow",
-                    "enum": ["Calls", "Imports", "Uses", "Extends", "Implements", "References"]
+                    "enum": EDGE_TYPE_VALUES
                     },
                     "depth": {
                         "type": "integer",
@@ -105,7 +122,7 @@ impl GraphToolSchemas {
                     "edge_type": {
                         "type": "string",
                         "description": "Type of dependency relationship to analyze for cycles",
-                        "enum": ["Calls", "Imports", "Uses", "Extends", "Implements", "References"]
+                        "enum": EDGE_TYPE_VALUES
                     }
                 },
                 "required": ["edge_type"]
@@ -206,7 +223,7 @@ impl GraphToolSchemas {
                     "edge_type": {
                         "type": "string",
                         "description": "Type of dependency relationship to follow backwards",
-                        "enum": ["Calls", "Imports", "Uses", "Extends", "Implements", "References"]
+                        "enum": EDGE_TYPE_VALUES
                     },
                     "depth": {
                         "type": "integer",
@@ -344,6 +361,51 @@ mod tests {
         assert!(names.contains(&"get_reverse_dependencies".to_string()));
         assert!(names.contains(&"semantic_code_search".to_string()));
         assert!(names.contains(&"find_complexity_hotspots".to_string()));
+    }
+
+    /// `edge_type` must accept every relationship `EdgeType::from_str` understands,
+    /// spelled in lowercase like every other surface (stored values, `Display`, the
+    /// benchmark scripts and the MCP tool descriptions).
+    #[test]
+    fn edge_type_enum_is_lowercase_and_complete() {
+        let expected = [
+            "calls",
+            "defines",
+            "uses",
+            "imports",
+            "extends",
+            "implements",
+            "contains",
+            "references",
+        ];
+
+        let mut seen = Vec::new();
+        for schema in GraphToolSchemas::all() {
+            let Some(edge_type) = schema
+                .parameters
+                .get("properties")
+                .and_then(|properties| properties.get("edge_type"))
+            else {
+                continue;
+            };
+
+            let values: Vec<&str> = edge_type
+                .get("enum")
+                .and_then(|value| value.as_array())
+                .unwrap_or_else(|| panic!("`{}` edge_type has no enum: {edge_type}", schema.name))
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default())
+                .collect();
+
+            assert_eq!(values, expected, "`{}` edge_type enum", schema.name);
+            seen.push(schema.name);
+        }
+
+        assert_eq!(
+            seen.len(),
+            3,
+            "expected edge_type on exactly three tools, saw: {seen:?}"
+        );
     }
 
     #[test]

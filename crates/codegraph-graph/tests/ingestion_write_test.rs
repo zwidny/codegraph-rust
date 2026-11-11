@@ -4,7 +4,7 @@
 
 use codegraph_core::{CodeNode, EdgeType, Language, Location, NodeType};
 use codegraph_graph::{
-    ChunkEmbeddingRecord, FileMetadataRecord, SurrealDbConfig, SurrealDbStorage,
+    ChunkEmbeddingRecord, FileMetadataRecord, ReconcileScope, SurrealDbConfig, SurrealDbStorage,
     SymbolEmbeddingRecord, edge::CodeEdge,
 };
 use serde_json::Value;
@@ -185,6 +185,33 @@ async fn statement_errors_reach_ingestion_callers() {
     assert!(store.upsert_symbol_embeddings_batch(&[bad]).await.is_err());
 }
 
+/// A stalled SurrealKV flush previously parked an index run forever: the node and edge
+/// upserts had no client-side deadline. This covers the happy path of the deadline
+/// wrapper; the timeout branch itself is covered by the unit test in
+/// `surrealdb_storage::write_deadline_tests`.
+#[tokio::test]
+async fn node_and_edge_upserts_accept_a_deadline() {
+    let mut store = storage(include_str!("../../../schema/codegraph_v2.surql")).await;
+    let nodes = [node("test", "a"), node("test", "b")];
+
+    store
+        .upsert_nodes_batch_with_timeout(&nodes, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+
+    let mut edge = CodeEdge::new(nodes[0].id, nodes[1].id, EdgeType::Calls);
+    edge.set_deterministic_id("test");
+    store
+        .upsert_edges_batch_with_timeout(
+            std::slice::from_ref(&edge),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count(&store, "nodes", "test").await, 2);
+    assert_eq!(count(&store, "edges", "test").await, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Per-file catalog reconciliation (replaces the project-wide NOT IN variant)
 // ---------------------------------------------------------------------------
@@ -270,7 +297,7 @@ mod per_file_reconciliation {
         );
         fresh.insert("b.rs".to_string(), vec![b1.id.to_string()]);
         store
-            .reconcile_catalog_by_file(project, &fresh, &BTreeSet::new())
+            .reconcile_catalog_by_file(project, &fresh, &BTreeSet::new(), None)
             .await
             .unwrap();
         assert_eq!(table_len(&store, "nodes", project).await, 3, "no-op pass");
@@ -280,7 +307,7 @@ mod per_file_reconciliation {
         let mut shrunk = BTreeMap::new();
         shrunk.insert("a.rs".to_string(), vec![a1.id.to_string()]);
         store
-            .reconcile_catalog_by_file(project, &shrunk, &BTreeSet::new())
+            .reconcile_catalog_by_file(project, &shrunk, &BTreeSet::new(), None)
             .await
             .unwrap();
 
@@ -308,6 +335,63 @@ mod per_file_reconciliation {
             remaining,
             vec!["a.rs".to_string()],
             "only the fresh node survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_leaves_files_outside_the_scanned_directory_untouched() {
+        let mut store = storage(include_str!("../../../schema/codegraph_v2.surql")).await;
+        let project = "recon_scope";
+
+        let core = node_in(project, "packages/core/a.rs", "alpha", 1);
+        let app = node_in(project, "packages/app/b.rs", "beta", 1);
+        store
+            .upsert_nodes_batch(&[core.clone(), app.clone()])
+            .await
+            .unwrap();
+
+        // Only packages/core was scanned; packages/app is not part of this run.
+        let mut fresh = BTreeMap::new();
+        fresh.insert("packages/core/a.rs".to_string(), vec![core.id.to_string()]);
+        let scope = ReconcileScope {
+            project_root: std::path::PathBuf::from("/repo"),
+            scan_root: std::path::PathBuf::from("/repo/packages/core"),
+        };
+        store
+            .reconcile_catalog_by_file(project, &fresh, &BTreeSet::new(), Some(&scope))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table_len(&store, "nodes", project).await,
+            2,
+            "files outside the scan scope must survive a scoped reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_still_removes_files_that_disappeared_within_it() {
+        let mut store = storage(include_str!("../../../schema/codegraph_v2.surql")).await;
+        let project = "recon_scope_delete";
+
+        let core = node_in(project, "packages/core/a.rs", "alpha", 1);
+        let app = node_in(project, "packages/app/b.rs", "beta", 1);
+        store.upsert_nodes_batch(&[core, app]).await.unwrap();
+
+        // packages/core no longer emits a.rs, so it must be removed; app stays.
+        let scope = ReconcileScope {
+            project_root: std::path::PathBuf::from("/repo"),
+            scan_root: std::path::PathBuf::from("/repo/packages/core"),
+        };
+        store
+            .reconcile_catalog_by_file(project, &BTreeMap::new(), &BTreeSet::new(), Some(&scope))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table_len(&store, "nodes", project).await,
+            1,
+            "a deleted file inside the scope is still reconciled"
         );
     }
 
@@ -353,7 +437,7 @@ mod per_file_reconciliation {
         fresh_chunks.insert(keep.id.clone());
 
         store
-            .reconcile_catalog_by_file(project, &fresh, &fresh_chunks)
+            .reconcile_catalog_by_file(project, &fresh, &fresh_chunks, None)
             .await
             .unwrap();
 

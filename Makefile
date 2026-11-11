@@ -8,9 +8,32 @@ all: check test
 build:
 	cargo build --workspace
 
-# Build in release mode
+# Published artifacts (GitHub Actions release.yml): fat LTO, slowest build, best runtime/size
 build-release:
 	cargo build --workspace --release
+
+# Default local build: thin LTO and no local/onnx embeddings, ~3x faster to compile
+#
+# Everyone carries all remote embedding providers by default. Drop the ones you never
+# use with DIST_FEATURES, e.g. an OpenAI-compatible-only setup (F2LLM, local vLLM,
+# DeepSeek embeddings):
+#   make install-dist DIST_FEATURES="daemon,ai-enhanced,server-http,embeddings-openai"
+DIST_FEATURES ?= daemon,ai-enhanced,server-http,embeddings-openai,embeddings-ollama,embeddings-jina,embeddings-lmstudio
+
+.PHONY: build-dist install-dist build-dist-openai install-dist-openai
+build-dist:
+	cargo build --profile release-dist -p codegraph-mcp-server --bin codegraph --features "$(DIST_FEATURES)"
+
+install-dist: build-dist
+	install -m 755 target/release-dist/codegraph $(HOME)/.cargo/bin/codegraph
+
+# Shortcut for OpenAI-compatible embeddings only (no jina/ollama/lmstudio).
+# Note: `cloud` embeddings require embeddings-jina, so do not use this if you enable them.
+build-dist-openai:
+	$(MAKE) build-dist DIST_FEATURES="daemon,ai-enhanced,server-http,embeddings-openai"
+
+install-dist-openai: build-dist-openai
+	install -m 755 target/release-dist/codegraph $(HOME)/.cargo/bin/codegraph
 
 # macOS: build/test using LLVM lld for faster linking (requires ld64.lld on PATH)
 check-llvm:

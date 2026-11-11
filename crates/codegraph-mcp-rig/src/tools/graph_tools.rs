@@ -26,7 +26,7 @@ pub enum GraphToolError {
 pub struct TransitiveDepsArgs {
     /// Node ID exactly as returned by an earlier tool result, such as semantic_code_search. A symbol name is not a node ID.
     pub node_id: String,
-    /// Relationship to follow: "Calls", "Imports", "Uses", "Extends", "Implements", or "References" (default: "Calls")
+    /// Relationship to follow: "calls", "defines", "uses", "imports", "extends", "implements", "contains", or "references" (default: "calls")
     #[serde(default = "default_edge_type")]
     pub edge_type: String,
     /// How many hops to follow, 1-10 (default: 3). Results grow quickly with depth.
@@ -37,7 +37,7 @@ pub struct TransitiveDepsArgs {
 /// Arguments for detect_circular_dependencies tool
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct DetectCyclesArgs {
-    /// Relationship to check for cycles: "Calls", "Imports", "Uses", "Extends", "Implements", or "References"
+    /// Relationship to check for cycles: "calls", "defines", "uses", "imports", "extends", "implements", "contains", or "references"
     pub edge_type: String,
 }
 
@@ -71,7 +71,7 @@ pub struct HubNodesArgs {
 pub struct ReverseDepsArgs {
     /// Node ID exactly as returned by an earlier tool result, such as semantic_code_search. A symbol name is not a node ID.
     pub node_id: String,
-    /// Relationship to follow: "Calls", "Imports", "Uses", "Extends", "Implements", or "References" (default: "Calls")
+    /// Relationship to follow: "calls", "defines", "uses", "imports", "extends", "implements", "contains", or "references" (default: "calls")
     #[serde(default = "default_edge_type")]
     pub edge_type: String,
     /// How many hops to follow, 1-10 (default: 3). Depth 1 gives direct dependents only.
@@ -105,7 +105,7 @@ pub struct ComplexityHotspotsArgs {
 
 // Default value functions
 fn default_edge_type() -> String {
-    "Calls".to_string()
+    "calls".to_string()
 }
 fn default_depth() -> i32 {
     3
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_default_values() {
-        assert_eq!(default_edge_type(), "Calls");
+        assert_eq!(default_edge_type(), "calls");
         assert_eq!(default_depth(), 3);
         assert_eq!(default_max_depth(), 5);
         assert_eq!(default_min_degree(), 5);

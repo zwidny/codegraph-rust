@@ -21,6 +21,58 @@ pub fn encode_lsp_message(body: &str) -> Vec<u8> {
     format!("Content-Length: {}\r\n\r\n{}", body.as_bytes().len(), body).into_bytes()
 }
 
+/// Default heap cap for Node-based language servers (tsserver, pyright).
+const DEFAULT_LSP_NODE_HEAP_MB: usize = 4096;
+
+/// Build `NODE_OPTIONS` for a language-server child process.
+///
+/// `CODEGRAPH_LSP_NODE_HEAP_MB` overrides the default. An explicit
+/// `--max-old-space-size` already present in the environment is respected.
+fn lsp_node_options() -> String {
+    let heap = std::env::var("CODEGRAPH_LSP_NODE_HEAP_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LSP_NODE_HEAP_MB);
+    let existing = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    node_options_with_heap(&existing, heap)
+}
+
+fn node_options_with_heap(existing: &str, heap_mb: usize) -> String {
+    if existing
+        .split_whitespace()
+        .any(|flag| flag.starts_with("--max-old-space-size"))
+    {
+        return existing.to_string();
+    }
+    format!("{existing} --max-old-space-size={heap_mb}")
+        .trim()
+        .to_string()
+}
+
+fn is_kotlin_language_server(command: &Path) -> bool {
+    command
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains("kotlin-language-server"))
+}
+
+/// `CODEGRAPH_LSP_KLS_GRADLE_DAEMON=1` keeps the Gradle daemon alive between runs.
+fn kls_gradle_daemon_allowed() -> bool {
+    matches!(
+        std::env::var("CODEGRAPH_LSP_KLS_GRADLE_DAEMON").as_deref(),
+        Ok("1" | "true" | "on")
+    )
+}
+
+/// Add `-Dorg.gradle.daemon=false` unless it is already present.
+fn opts_without_gradle_daemon(existing: &str) -> String {
+    const FLAG: &str = "-Dorg.gradle.daemon=false";
+    if existing.split_whitespace().any(|flag| flag == FLAG) {
+        return existing.to_string();
+    }
+    format!("{existing} {FLAG}").trim().to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LspPosition {
     pub line: u32,
@@ -99,6 +151,29 @@ pub struct LspClient {
 
 const STDERR_TAIL_BYTES: usize = 4096;
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Initialization loads the whole workspace (KLS imports Gradle, tsserver the tsconfig
+/// project), so a cold start needs far more than a normal request.
+const LSP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn env_duration(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+fn request_timeout() -> Duration {
+    env_duration("CODEGRAPH_LSP_REQUEST_TIMEOUT_SECS", LSP_REQUEST_TIMEOUT)
+}
+
+fn initialize_timeout() -> Duration {
+    env_duration(
+        "CODEGRAPH_LSP_INITIALIZE_TIMEOUT_SECS",
+        LSP_INITIALIZE_TIMEOUT,
+    )
+}
 const CONTENT_MODIFIED_BACKOFF: [Duration; 5] = [
     Duration::from_millis(100),
     Duration::from_millis(200),
@@ -258,6 +333,17 @@ impl LspClient {
         );
 
         let mut process = Command::new(command);
+        // Node-based servers (tsserver, pyright) honour this heap cap, so a runaway
+        // language server is killed by Node instead of taking the machine into swap.
+        process.env("NODE_OPTIONS", lsp_node_options());
+        // KLS spawns a Gradle daemon as a grandchild; `kill_on_drop` only kills KLS, so
+        // the daemon would outlive the index by hours (~2.4GB JVM). Disable it by default.
+        if is_kotlin_language_server(command) && !kls_gradle_daemon_allowed() {
+            let gradle_opts = std::env::var("GRADLE_OPTS").unwrap_or_default();
+            process.env("GRADLE_OPTS", opts_without_gradle_daemon(&gradle_opts));
+            let java_opts = std::env::var("JAVA_TOOL_OPTIONS").unwrap_or_default();
+            process.env("JAVA_TOOL_OPTIONS", opts_without_gradle_daemon(&java_opts));
+        }
         if let Some(root) = Url::parse(root_uri)
             .ok()
             .and_then(|uri| uri.to_file_path().ok())
@@ -484,7 +570,9 @@ impl LspClient {
             }
         });
 
-        let _ = client.request("initialize", init_params).await?;
+        let _ = client
+            .request_with_timeout("initialize", init_params, initialize_timeout())
+            .await?;
         client.notify("initialized", serde_json::json!({})).await?;
 
         info!("🧠 LSP server initialized in {:.1?}", start.elapsed());
@@ -492,7 +580,7 @@ impl LspClient {
     }
 
     pub async fn request(&self, method: &str, params: JsonValue) -> Result<JsonValue> {
-        self.request_with_timeout(method, params, LSP_REQUEST_TIMEOUT)
+        self.request_with_timeout(method, params, request_timeout())
             .await
     }
 
@@ -1653,5 +1741,40 @@ while True:
             let observed = index.position_for_byte_offset(offset);
             assert_eq!(observed, expected, "mismatch at byte offset {offset}");
         }
+    }
+}
+
+#[cfg(test)]
+mod node_options_tests {
+    use super::*;
+
+    #[test]
+    fn heap_cap_is_appended_unless_already_set() {
+        assert_eq!(
+            node_options_with_heap("", 4096),
+            "--max-old-space-size=4096"
+        );
+        assert_eq!(
+            node_options_with_heap("--enable-source-maps", 2048),
+            "--enable-source-maps --max-old-space-size=2048"
+        );
+        assert_eq!(
+            node_options_with_heap("--max-old-space-size=8192", 4096),
+            "--max-old-space-size=8192",
+            "an explicit user cap must not be overridden"
+        );
+    }
+
+    #[test]
+    fn gradle_daemon_flag_is_added_once() {
+        assert_eq!(opts_without_gradle_daemon(""), "-Dorg.gradle.daemon=false");
+        assert_eq!(
+            opts_without_gradle_daemon("-Xmx1g"),
+            "-Xmx1g -Dorg.gradle.daemon=false"
+        );
+        assert_eq!(
+            opts_without_gradle_daemon("-Dorg.gradle.daemon=false"),
+            "-Dorg.gradle.daemon=false"
+        );
     }
 }

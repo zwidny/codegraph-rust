@@ -90,6 +90,73 @@ use `imports`.
 
 ---
 
+## Plan before a large change (`plan_check`)
+
+`plan_check` validates a **draft logic graph** (nodes, edges, constraints) offline,
+before the code exists. Use it to make implicit dependencies explicit: on a long,
+multi-hop task the model does not reliably re-read earlier context, so the same
+constraint can be violated several steps later.
+
+**When** (any one of these):
+
+- adding a module, crate-level feature or provider/factory path;
+- a cross-layer change (e.g. `cli -> core -> vector`) or reversing that direction;
+- a multi-hop dependency (A calls B calls C, or a new type implements a trait elsewhere);
+- changing the public interface of 3+ files (signature, trait method, config key, schema).
+
+Skip it for a single-file fix, a docs/text change or a mechanical rename inside one
+module.
+
+**How**:
+
+1. Write the plan object: `nodes` = modules/types/traits you intend to add or touch
+   (`id` should be the real symbol name you will write), `edges` = `calls` /
+   `implements` / `uses`, `constraints` = `acyclic` + `layering` (order low -> high) +
+   `coverage` (optionally `no_path`, `max_fan_in`, `max_fan_out`).
+2. Call `plan_check` and fix `violations` until `ok: true`. `known_nodes` flags edges to
+   undeclared nodes; `layering` / `acyclic` catch design errors.
+3. After the code graph is indexed, compare the plan with reality:
+   `codegraph plan --project <root> verify plan.json`. `unplanned_code_edges` means the
+   code depends on something the plan forgot; `existing_planned_nodes` means you may be
+   re-creating an existing symbol.
+4. `codegraph plan --project <root> store plan.json --plan-id <id>` keeps the plan and
+   its constraints for later sessions; `codegraph plan show <id>` reads it back.
+
+## Language servers on a partial re-index
+
+`codegraph index <scan_root>` updates only that scope and **does not start language
+servers** by default. LSP servers load the whole workspace, so a single-file update
+would pay the full project import cost.
+
+Start them deliberately when you need cross-file symbols/definitions:
+
+```bash
+CODEGRAPH_LSP_ON_PARTIAL=1 codegraph index packages/happy-android \
+  --project-root /path/to/repo --index-tier balanced --languages kotlin
+```
+
+- Pass the **project root** (`--project-root`, or set `CODEGRAPH_PROJECT_ID`) so the
+  index and the LSP server agree on the project. Keep the scan path (e.g.
+  `packages/happy-android`) relative to that root.
+- The LSP server is initialised with the **project root**, not the scan root: a cold
+  import can take 1–5 minutes on a large Android/Java/TypeScript repository.
+  `initialize` waits up to 180s (`CODEGRAPH_LSP_INITIALIZE_TIMEOUT_SECS`); other requests
+  wait 30s (`CODEGRAPH_LSP_REQUEST_TIMEOUT_SECS`). If it still times out, the run
+  downgrades to a warning and indexing continues with AST results.
+- Required tools: `kotlin-language-server` (Kotlin), `jdtls` (Java),
+  `typescript-language-server` (TS/JS), `rust-analyzer` (Rust), `gopls` (Go).
+  TypeScript 7 native preview has no `lib/tsserver.js`, so it is launched as
+  `tsc --lsp --stdio` instead of through `typescript-language-server`.
+- **Tier and edge resolution.** `balanced` runs language servers in `SymbolsOnly` mode:
+  it enriches node names with `documentSymbol` but does **not** request `definition`, so
+  LSP contributes **0 graph edges**. Only `full` uses `SymbolsAndDefinitions` and resolves
+  definition edges. `N nodes enriched + 0 edges resolved` on `balanced` is expected, not a
+  failure. To get LSP edges on balanced, set `CODEGRAPH_LSP_DEFINITIONS=1` (slower).
+- For a large repository, prefer one full `codegraph index <root>` pass with LSP, then
+  use partial re-indexes without LSP for day-to-day edits.
+
+---
+
 ## Recommended workflows
 
 ### 1. Change safety check (before editing)

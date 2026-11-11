@@ -70,7 +70,7 @@ async fn run() -> anyhow::Result<()> {
         "id": "smoke-edge-alpha-beta",
         "from": "smoke-node-alpha",
         "to": "smoke-node-beta",
-        "edge_type": "Calls",
+        "edge_type": "calls",
         "weight": 1.0,
         "metadata": {"sample": true},
     });

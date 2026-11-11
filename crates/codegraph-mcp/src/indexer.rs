@@ -456,7 +456,8 @@ impl ProjectIndexer {
                                 target: "codegraph_mcp::indexer",
                                 "CODEGRAPH_EMBEDDING_PROVIDER=local requested but the 'embeddings-local' feature is not enabled; using auto provider"
                             );
-                            let g = EmbeddingGenerator::with_auto_from_env().await?;
+                            #[allow(unused_mut)]
+                            let mut g = EmbeddingGenerator::with_auto_from_env().await?;
                             // Set batch_size and max_concurrent for Jina provider if applicable
                             #[cfg(feature = "embeddings-jina")]
                             {
@@ -864,7 +865,40 @@ impl ProjectIndexer {
                     *previous_support = Some(support_fingerprint);
                 }
             }
-            let analyzer_settings = AnalyzerSettings::from_env(self.config.indexing_tier);
+            // A partial re-index must not start language servers: they load the whole
+            // workspace (tsserver reads the tsconfig project), so scoping the parsed files
+            // does not scope their memory use. Large repos abort on this.
+            let reconcile_scope = Self::reconcile_scope(&self.project_root, path);
+            let mut analyzer_settings = AnalyzerSettings::from_env(self.config.indexing_tier);
+            let base_lsp_mode = analyzer_settings.lsp_mode;
+            analyzer_settings.lsp_mode = effective_lsp_mode(
+                base_lsp_mode,
+                reconcile_scope.is_some(),
+                partial_lsp_allowed(),
+            );
+            if base_lsp_mode != analyzer_settings.lsp_mode {
+                info!(
+                    "🧩 Partial re-index scope: language servers disabled \
+                     (set CODEGRAPH_LSP_ON_PARTIAL=1 to force them on)"
+                );
+            }
+            // Hard guard: do not start a language server when the machine is already short
+            // of memory. The cap is configurable for headroom tuning.
+            if analyzer_settings.lsp_enabled()
+                && let Some(free_mb) = available_memory_mb()
+            {
+                let minimum = std::env::var("CODEGRAPH_LSP_MIN_FREE_MB")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(4096);
+                if free_mb < minimum {
+                    analyzer_settings.lsp_mode = crate::analyzers::LspMode::Off;
+                    warn!(
+                        "Only {free_mb} MB available and CODEGRAPH_LSP_MIN_FREE_MB={minimum}; \
+                         disabling language servers for this run"
+                    );
+                }
+            }
             let path_env = std::env::var("PATH").unwrap_or_default();
             let mut analyzer_languages: HashSet<codegraph_core::Language> = HashSet::new();
             let needs_language_scan = analyzer_settings.lsp_enabled()
@@ -934,7 +968,7 @@ impl ProjectIndexer {
             // Clone files for parsing (we need them again for metadata persistence)
             let ast_cache = codegraph_core::artifact_cache::ArtifactCache::new(
                 self.project_root.join(".codegraph/index-cache"),
-                "unified-ast-v4",
+                "unified-ast-v5",
             );
             let parse_start = std::time::Instant::now();
             let (mut nodes, mut edges, pstats) = crate::estimation::parse_snapshots_with_cache(
@@ -979,6 +1013,25 @@ impl ProjectIndexer {
             {
                 nodes.extend(build_context_out.nodes);
                 edges.extend(build_context_out.edges);
+            }
+
+            // Stable project-relative posix file paths: node ids embed the path, so the
+            // same file must not appear as `./src/a.rs`, `src/a.rs` or an absolute path
+            // depending on how `codegraph index` was invoked. The normalized -> original
+            // map keeps chunk source lookups working against the captured snapshots.
+            let mut source_by_normalized: std::collections::HashMap<String, PathBuf> =
+                std::collections::HashMap::new();
+            for (path, _) in &files {
+                source_by_normalized
+                    .entry(normalize_file_path(
+                        &self.project_root,
+                        &path.to_string_lossy(),
+                    ))
+                    .or_insert_with(|| path.clone());
+            }
+            for node in nodes.iter_mut() {
+                node.location.file_path =
+                    normalize_file_path(&self.project_root, &node.location.file_path);
             }
 
             let removed_edges = filter_edges_for_tier(self.config.indexing_tier, &mut edges);
@@ -1124,8 +1177,28 @@ impl ProjectIndexer {
                 for (_, (spec, mut files)) in grouped {
                     files.sort();
                     files.dedup();
-                    let candidates =
+                    // Trade some cross-project accuracy for bounded memory: rust-analyzer
+                    // loads dependency crates by default, clangd indexes in the background.
+                    let mut server_args: Vec<&'static str> = spec.args.to_vec();
+                    server_args.extend(extra_server_args(
+                        spec.tool_name,
+                        clangd_background_allowed(),
+                    ));
+                    let mut candidates =
                         crate::analyzers::find_tool_candidates_on_path(spec.tool_name, &path_env);
+                    // TypeScript 7 (native preview) ships `tsc --lsp` but no `tsserver.js`,
+                    // which `typescript-language-server` requires.
+                    if spec.tool_name == "typescript-language-server"
+                        && let Some((command, args)) = typescript_lsp_command(&project_root)
+                    {
+                        info!(
+                            "🧠 TypeScript native preview: using {} {}",
+                            command.display(),
+                            args.join(" ")
+                        );
+                        candidates = vec![command];
+                        server_args = args;
+                    }
                     if candidates.is_empty() {
                         return Err(anyhow!(
                             "Missing required analyzer tool: {}",
@@ -1139,7 +1212,7 @@ impl ProjectIndexer {
                             &self.lsp_pool,
                             Some(&source_snapshots),
                             &tool,
-                            spec.args,
+                            &server_args,
                             spec.language_id,
                             spec.name_joiner,
                             analyzer_settings.lsp_definitions_enabled(),
@@ -1163,8 +1236,13 @@ impl ProjectIndexer {
                         }
                     }
                     if !success {
-                        return Err(last_error
-                            .unwrap_or_else(|| anyhow!("No LSP server candidate succeeded")));
+                        let reason = last_error
+                            .map(|error| error.to_string())
+                            .unwrap_or_else(|| "no usable LSP candidate".to_string());
+                        warn!(
+                            "LSP enrichment for {} failed: {reason}; continuing with AST-only results",
+                            spec.tool_name
+                        );
                     }
                 }
 
@@ -1384,6 +1462,12 @@ impl ProjectIndexer {
                 analyzers_start.elapsed().as_millis() as u64,
             );
             let chunks_start = std::time::Instant::now();
+            // Analyzers can add nodes with raw paths; normalize again before chunking and
+            // before reconciliation groups nodes by file.
+            for node in nodes.iter_mut() {
+                node.location.file_path =
+                    normalize_file_path(&self.project_root, &node.location.file_path);
+            }
             // Store counts for final summary (before consumption)
             let total_nodes_extracted = nodes.len();
             let total_edges_extracted = edges.len();
@@ -1409,8 +1493,10 @@ impl ProjectIndexer {
                         .as_ref()
                         .expect("sync provider initialized")
                         .chunk_nodes_with_source_lookup(&nodes, |file| {
-                            source_snapshots
+                            source_by_normalized
                                 .get(file)
+                                .and_then(|path| source_snapshots.get(path))
+                                .or_else(|| source_snapshots.get(file))
                                 .and_then(|snapshot| snapshot.contents().ok())
                         })
                 };
@@ -1579,7 +1665,13 @@ impl ProjectIndexer {
             // safe and cut the 26k-node persist phase measured at 137s down
             // proportionally.
             let storage_batch = node_db_batch_size(self.config.batch_size);
-            for chunk in nodes.chunks(storage_batch) {
+            // Periodic, file-visible progress. The indicatif spinners above are lost when
+            // stdout is not a TTY (nohup, systemd, CI), which made a stalled write look
+            // like total silence for hours.
+            let total_node_batches = nodes.len().div_ceil(storage_batch.max(1));
+            let node_log_every = (total_node_batches / 10).max(1);
+            let mut written_nodes = 0usize;
+            for (batch_index, chunk) in nodes.chunks(storage_batch).enumerate() {
                 let dirty: Vec<_> = chunk
                     .iter()
                     .filter(|node| {
@@ -1593,7 +1685,18 @@ impl ProjectIndexer {
                 if !dirty.is_empty() {
                     self.persist_nodes_batch(&dirty).await?;
                 }
+                written_nodes += chunk.len();
                 store_nodes_pb.inc(chunk.len() as u64);
+                let batch_number = batch_index + 1;
+                if batch_number % node_log_every == 0 || batch_number == total_node_batches {
+                    info!(
+                        "🗄️ Persisted {}/{} nodes (batch {}/{})",
+                        written_nodes,
+                        nodes.len(),
+                        batch_number,
+                        total_node_batches
+                    );
+                }
             }
             self.flush_surreal_writer().await?;
             self.finish_bar(store_nodes_pb, "📈 Nodes stored")?;
@@ -1869,7 +1972,33 @@ impl ProjectIndexer {
                 embedding_start.elapsed().as_millis() as u64,
             );
             let resolution_start = std::time::Instant::now();
-            let catalog = crate::resolution::SymbolCatalog::new(&nodes);
+            // A partial re-index only sees the scanned files. Load the rest of the
+            // project's symbols so edges emitted by the scanned files still resolve.
+            let catalog = if reconcile_scope.is_some() {
+                let excluded: Vec<String> = fresh_nodes_by_file.keys().cloned().collect();
+                let rows = self
+                    .surreal
+                    .lock()
+                    .await
+                    .load_symbols_excluding(&self.project_id, &excluded)
+                    .await?;
+                let external: Vec<crate::resolution::ExternalSymbol> = rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let id = codegraph_core::NodeId::parse_str(decode_node_id(&row.id)).ok()?;
+                        Some(crate::resolution::ExternalSymbol {
+                            id,
+                            file: row.file_path,
+                            name: row.name,
+                            kind: row.node_type,
+                            qualified: row.qualified_name,
+                        })
+                    })
+                    .collect();
+                crate::resolution::SymbolCatalog::new_with_external(&nodes, &external)
+            } else {
+                crate::resolution::SymbolCatalog::new(&nodes)
+            };
             let symbol_map = catalog.unique_aliases();
             let mut targets = Vec::with_capacity(edges.len());
             let mut resolution_provenance = Vec::with_capacity(edges.len());
@@ -1913,9 +2042,6 @@ impl ProjectIndexer {
                             });
                             target = catalog.exact(edge, &variants);
                             provenance.0 = "normalized";
-                        }
-                        if target.is_some() {
-                            provenance.0 = provenance.0;
                         }
                         if target.is_none() && !catalog.ambiguous(&edge.to) {
                             let lexical = *lexical_cache
@@ -2186,6 +2312,20 @@ impl ProjectIndexer {
             // Per-file reconciliation: the project-wide variant issues `NOT IN`
             // deletes over every node/edge/chunk id and cannot use an index, which
             // measured at 10+ minutes per run on this project.
+            // Point already-stored inbound edges at the new node ids before reconciliation
+            // deletes the old rows. Only symbols that still exist in the same file with the
+            // same name and kind move; genuinely removed symbols keep their edges until
+            // reconciliation drops them.
+            if reconcile_scope.is_some() && !fresh_nodes_by_file.is_empty() {
+                let mut by_identity = std::collections::HashMap::new();
+                for node in &nodes {
+                    by_identity.insert(Self::node_identity(node), node.id);
+                }
+                let new_ids: std::collections::HashSet<codegraph_core::NodeId> =
+                    nodes.iter().map(|node| node.id).collect();
+                self.redirect_inbound_edges(&fresh_nodes_by_file, &new_ids, &by_identity)
+                    .await?;
+            }
             self.surreal
                 .lock()
                 .await
@@ -2193,6 +2333,7 @@ impl ProjectIndexer {
                     &self.project_id,
                     &fresh_nodes_by_file,
                     &next_catalog.chunks,
+                    reconcile_scope.as_ref(),
                 )
                 .await?;
             source_snapshots.validate_current().await?;
@@ -2200,14 +2341,22 @@ impl ProjectIndexer {
                 path,
                 &file_config,
             )?;
-            if current_files != all_files
+            // Language servers (jdtls/KLS) generate IDE/Gradle files while importing the
+            // project, so the second walk can legitimately differ from the first. The graph
+            // already written is a consistent snapshot; mark it incomplete instead of
+            // failing the whole run and dropping the stats file.
+            let inputs_changed = current_files != all_files
                 || crate::reconciliation::support_fingerprints(&self.project_root)? != support
-                || crate::analyzers::build_context::external_input_fingerprints(&self.project_root)?
-                    != external_support
-            {
-                return Err(anyhow!(
-                    "Project inputs changed during indexing; retry reconciliation"
-                ));
+                || crate::analyzers::build_context::external_input_fingerprints(
+                    &self.project_root,
+                )? != external_support;
+            if inputs_changed {
+                warn!(
+                    "Project inputs changed during indexing ({} files now, {} scanned); \
+                     graph is a consistent snapshot, rerun `codegraph index` to reconcile",
+                    current_files.len(),
+                    all_files.len()
+                );
             }
             stats.vector_index_ready = codegraph_graph::vector_indexes::ensure_ready(
                 &self.surreal.lock().await.db(),
@@ -2236,7 +2385,7 @@ impl ProjectIndexer {
             stats.graph_complete = true;
             stats.embedding_status = self.policies.embeddings.status().into();
             stats.semantic_status = self.policies.semantic.status().into();
-            stats.complete = !self.policies.pending();
+            stats.complete = !self.policies.pending() && !inputs_changed;
             if self.policies.pending() {
                 crate::policy::pending_cache(&self.project_root).put(
                     &self.project_id,
@@ -2510,6 +2659,7 @@ impl ProjectIndexer {
                     "ts" | "typescript" | "tsx" => matches!(lang, "ts" | "tsx"),
                     "go" => matches!(lang, "go"),
                     "java" => matches!(lang, "java"),
+                    "kotlin" | "kt" => matches!(lang, "kt"),
                     "cpp" | "c++" | "cc" | "cxx" | "hpp" | "h" | "c" => {
                         matches!(lang, "cpp" | "cc" | "cxx" | "hpp" | "h" | "c")
                     }
@@ -3507,17 +3657,142 @@ impl ProjectIndexer {
         Ok(())
     }
 
-    /// Index a single file (for daemon mode incremental updates)
-    /// Uses upsert semantics - no duplicate records created
-    pub async fn index_single_file(&self, _path: &Path) -> Result<()> {
-        self.reconcile_project(&self.project_root, false).await?;
+    /// Limit reconciliation to the scanned path when it is narrower than the project.
+    ///
+    /// Indexing a subdirectory or a single file must not treat every other file in the
+    /// project as deleted, which is what the unscoped reconciliation would do.
+    fn reconcile_scope(
+        project_root: &Path,
+        scanned: &Path,
+    ) -> Option<codegraph_graph::ReconcileScope> {
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+        let scan_root = scanned.canonicalize().unwrap_or_else(|_| {
+            if scanned.is_absolute() {
+                scanned.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(scanned)
+            }
+        });
+        if scan_root == project_root {
+            return None;
+        }
+        Some(codegraph_graph::ReconcileScope {
+            project_root,
+            scan_root,
+        })
+    }
+
+    /// Repoint stored inbound edges from old node ids to the new ids of symbols that
+    /// survived this re-index under the same file, name and kind.
+    ///
+    /// Node ids embed the source line, so moving a symbol changes its id even when the
+    /// symbol itself is unchanged. Callers in other files still hold the old id; without
+    /// this they would lose the edge when reconciliation deletes the stale node.
+    async fn redirect_inbound_edges(
+        &self,
+        fresh_nodes_by_file: &std::collections::BTreeMap<String, Vec<String>>,
+        new_ids: &std::collections::HashSet<codegraph_core::NodeId>,
+        by_identity: &std::collections::HashMap<(String, String, String), codegraph_core::NodeId>,
+    ) -> Result<()> {
+        let files: Vec<String> = fresh_nodes_by_file.keys().cloned().collect();
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let storage = self.surreal.lock().await;
+        let db = storage.db();
+        let mut response = db
+            .query(
+                "SELECT <string> id AS id, file_path, name, node_type FROM nodes \
+                 WHERE project_id = $project AND file_path IN $files;",
+            )
+            .bind(("project", self.project_id.clone()))
+            .bind(("files", files))
+            .await?
+            .check()?;
+        let rows: Vec<serde_json::Value> = response.take(0)?;
+
+        let mut updates: Vec<(String, String)> = Vec::new();
+        for row in rows {
+            let Some(raw_id) = row.get("id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let old = decode_node_id(raw_id).to_string();
+            let old_id = codegraph_core::NodeId::parse_str(&old).ok();
+            if old_id.is_some_and(|id| new_ids.contains(&id)) {
+                continue; // already a current id
+            }
+            let file = row
+                .get("file_path")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let name = row
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let kind = row
+                .get("node_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if let Some(new_id) =
+                by_identity.get(&(file.to_string(), name.to_string(), kind.to_string()))
+            {
+                let new = new_id.to_string();
+                if new != old {
+                    updates.push((old, new));
+                }
+            }
+        }
+
+        for (old, new) in updates {
+            db.query(
+                "UPDATE edges SET to = type::record('nodes', $new) \
+                 WHERE project_id = $project AND to = type::record('nodes', $old);",
+            )
+            .bind(("project", self.project_id.clone()))
+            .bind(("old", old))
+            .bind(("new", new))
+            .await?
+            .check()?;
+        }
+
         Ok(())
     }
 
-    /// Reconciliation also removes obsolete definitions and rebinds unchanged callers.
-    pub async fn delete_file_data(&self, _path: &Path) -> Result<()> {
-        self.reconcile_project(&self.project_root, false).await?;
-        Ok(())
+    /// Identity used to match a symbol across re-indexes: file, name and node kind.
+    fn node_identity(node: &codegraph_core::CodeNode) -> (String, String, String) {
+        (
+            node.location.file_path.clone(),
+            node.name.to_string(),
+            node.node_type
+                .as_ref()
+                .map(|kind| format!("{kind:?}"))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Index a single file, leaving every other file in the project untouched.
+    /// Uses upsert semantics - no duplicate records created.
+    pub async fn index_single_file(&self, path: &Path) -> Result<()> {
+        self.reconcile_project(path, false).await.map(|_| ())
+    }
+
+    /// Drop the stored graph rows for one file only.
+    pub async fn delete_file_data(&self, path: &Path) -> Result<()> {
+        let relative = path
+            .strip_prefix(&self.project_root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf());
+        let mut key = relative.to_string_lossy().replace('\\', "/");
+        while let Some(stripped) = key.strip_prefix("./") {
+            key = stripped.to_string();
+        }
+        self.delete_data_for_files(&[key]).await?;
+        self.flush_surreal_writer().await
     }
 
     /// Detect language from file extension
@@ -4016,3 +4291,252 @@ struct FileStats {
 }
 #[cfg(feature = "embeddings")]
 use codegraph_vector::prep::chunker::ChunkMeta;
+
+/// Language servers load the whole workspace, so a partial re-index disables them
+/// unless `CODEGRAPH_LSP_ON_PARTIAL` presses them back on.
+fn effective_lsp_mode(
+    base: crate::analyzers::LspMode,
+    partial_scope: bool,
+    allow_partial_lsp: bool,
+) -> crate::analyzers::LspMode {
+    if partial_scope && !allow_partial_lsp {
+        crate::analyzers::LspMode::Off
+    } else {
+        base
+    }
+}
+
+fn partial_lsp_allowed() -> bool {
+    matches!(
+        std::env::var("CODEGRAPH_LSP_ON_PARTIAL").as_deref(),
+        Ok("1" | "true" | "on")
+    )
+}
+
+/// TypeScript 7 native preview ships `tsc --lsp --stdio` but no `lib/tsserver.js`.
+///
+/// Returns the native command when the project's TypeScript cannot drive
+/// `typescript-language-server`; `None` means classic tsserver is available.
+fn typescript_lsp_command(project_root: &Path) -> Option<(PathBuf, Vec<&'static str>)> {
+    let mut dir = Some(project_root);
+    for _ in 0..4 {
+        let root = dir?;
+        let ts_dir = root.join("node_modules/typescript");
+        if ts_dir.join("lib/tsserver.js").is_file() {
+            return None;
+        }
+        let bin = root.join("node_modules/.bin/tsc");
+        let raw = ts_dir.join("bin/tsc");
+        let command = if bin.is_file() {
+            Some(bin)
+        } else if raw.is_file() {
+            Some(raw)
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            return Some((command, vec!["--lsp", "--stdio"]));
+        }
+        dir = root.parent();
+    }
+    None
+}
+
+/// Extra server flags that trade some cross-project accuracy for lower memory use.
+fn extra_server_args(tool_name: &str, clangd_background_index: bool) -> Vec<&'static str> {
+    let mut extra = Vec::new();
+    // rust-analyzer rejects `--no-deps` on the LSP entrypoint (it belongs to
+    // `analysis-stats`), so never pass it here.
+    if tool_name == "clangd" && !clangd_background_index {
+        extra.push("--background-index=false");
+    }
+    extra
+}
+
+fn clangd_background_allowed() -> bool {
+    matches!(
+        std::env::var("CODEGRAPH_LSP_CLANGD_BACKGROUND").as_deref(),
+        Ok("1" | "true" | "on")
+    )
+}
+
+/// Available memory in MiB, when the platform exposes it cheaply.
+fn available_memory_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kib / 1024);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // No cheap "available" counter; total memory is a conservative upper bound.
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let bytes: u64 = String::from_utf8(output.stdout).ok()?.trim().parse().ok()?;
+        Some(bytes / 1024 / 1024)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Strip the record prefix and quoting from a `nodes` id returned by SurrealDB.
+fn decode_node_id(raw: &str) -> &str {
+    raw.strip_prefix("nodes:")
+        .unwrap_or(raw)
+        .trim_matches('`')
+        .trim_matches('⟨')
+        .trim_matches('⟩')
+}
+
+/// Normalize a source path to a project-relative, posix-style key.
+///
+/// Node ids embed this path, so the same file must resolve to one key regardless of
+/// whether `codegraph index` was given `.`, `./src`, an absolute path, or a path from a
+/// different working directory. Paths outside the project root keep their original
+/// form (minus `./`), so external analyzer inputs are not misrepresented as project
+/// files.
+pub(crate) fn normalize_file_path(project_root: &Path, raw: &str) -> String {
+    let raw_path = Path::new(raw);
+    let absolute = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        project_root.join(raw_path)
+    };
+    let normalized = lexical_normalize(&absolute);
+
+    let relative = match normalized.strip_prefix(project_root) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => normalized,
+    };
+
+    let mut out = relative.to_string_lossy().replace('\\', "/");
+    while let Some(stripped) = out.strip_prefix("./") {
+        out = stripped.to_string();
+    }
+    if out.is_empty() { ".".to_string() } else { out }
+}
+
+#[cfg(test)]
+mod partial_lsp_tests {
+    use super::*;
+    use crate::analyzers::LspMode;
+
+    #[test]
+    fn partial_scope_disables_language_servers_unless_forced() {
+        assert_eq!(
+            effective_lsp_mode(LspMode::SymbolsAndDefinitions, true, false),
+            LspMode::Off
+        );
+        assert_eq!(
+            effective_lsp_mode(LspMode::SymbolsOnly, true, false),
+            LspMode::Off
+        );
+        assert_eq!(
+            effective_lsp_mode(LspMode::SymbolsOnly, true, true),
+            LspMode::SymbolsOnly
+        );
+        assert_eq!(
+            effective_lsp_mode(LspMode::SymbolsOnly, false, false),
+            LspMode::SymbolsOnly
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_guard_tests {
+    use super::*;
+
+    #[test]
+    fn extra_flags_shrink_server_memory_by_default() {
+        // rust-analyzer must not receive `--no-deps`: the LSP entrypoint rejects it.
+        assert!(extra_server_args("rust-analyzer", false).is_empty());
+        assert_eq!(
+            extra_server_args("clangd", false),
+            vec!["--background-index=false"]
+        );
+        assert!(extra_server_args("clangd", true).is_empty());
+        assert!(extra_server_args("typescript-language-server", false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod typescript_lsp_tests {
+    use super::*;
+
+    #[test]
+    fn detects_native_typescript_without_tsserver() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("node_modules/typescript/lib")).unwrap();
+        std::fs::write(root.join("node_modules/typescript/lib/tsserver.js"), "").unwrap();
+        assert!(
+            typescript_lsp_command(root).is_none(),
+            "classic tsserver means typescript-language-server works"
+        );
+
+        std::fs::remove_file(root.join("node_modules/typescript/lib/tsserver.js")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        std::fs::write(root.join("node_modules/.bin/tsc"), "").unwrap();
+        let (command, args) = typescript_lsp_command(root).expect("native tsc");
+        assert!(command.ends_with("node_modules/.bin/tsc"));
+        assert_eq!(args, vec!["--lsp", "--stdio"]);
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+#[cfg(test)]
+mod normalize_file_path_tests {
+    use super::*;
+
+    #[test]
+    fn strips_dot_prefix_and_absolute_roots() {
+        let root = Path::new("/repo");
+        assert_eq!(normalize_file_path(root, "./src/a.rs"), "src/a.rs");
+        assert_eq!(normalize_file_path(root, "src/a.rs"), "src/a.rs");
+        assert_eq!(normalize_file_path(root, "/repo/src/a.rs"), "src/a.rs");
+        assert_eq!(
+            normalize_file_path(root, "./src/./nested/../a.rs"),
+            "src/a.rs"
+        );
+    }
+
+    #[test]
+    fn keeps_paths_outside_the_project_root_absolute() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            normalize_file_path(root, "/usr/local/crate/src/lib.rs"),
+            "/usr/local/crate/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let root = Path::new("/repo");
+        let once = normalize_file_path(root, "./packages/core/src/tool/mcp.ts");
+        assert_eq!(once, "packages/core/src/tool/mcp.ts");
+        assert_eq!(normalize_file_path(root, &once), once);
+    }
+}

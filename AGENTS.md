@@ -170,13 +170,37 @@ Unit tests sit alongside modules; integration tests use each crate's `tests/`. S
 
 Bare Cargo commands target only `codegraph-core`; specify `--workspace` or `-p <crate>`.
 
+**Build through the Makefile targets.** They are the project's single source of truth for
+profile, crate, binary and feature flags. Do not re-assemble the underlying `cargo` command
+by hand: doing so has already lost the `install` step and left a stale `codegraph` on PATH.
+Fall back to a bare `cargo` command only when no target exists, and state why in the reply.
+
+- `make build-dist`: **default local build** (thin LTO, no local/onnx embeddings; output
+  `target/release-dist/codegraph`, about 3x faster than fat LTO). Ships every remote
+  embedding provider; drop unused ones with
+  `DIST_FEATURES="daemon,ai-enhanced,server-http,embeddings-openai"`.
+- `make build-dist-openai` / `make install-dist-openai`: shortcut for OpenAI-compatible
+  embeddings only (no jina/ollama/lmstudio). Not for `cloud` embeddings, which need
+  `embeddings-jina`.
+- `make install-dist`: runs `build-dist`, then copies the binary to
+  `$(HOME)/.cargo/bin/codegraph`. Use this whenever the `codegraph` on `PATH` must carry
+  your changes.
+- `make check` (format + lint + tests) / `make dev` (same, for local loops) / `make test`
+  (tests only).
+- `make lint`: checks only core and suppresses warnings. For CI parity use
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`; strict workspace
+  Clippy currently reports pre-existing core/zerocopy diagnostics, so disclose that
+  limitation rather than calling a non-strict run lint-clean.
+
+Underlying commands, for reference only (all of the above already wrap them):
+
+- `cargo build --profile release-dist -p codegraph-mcp-server --bin codegraph --features "daemon,ai-enhanced,server-http,embeddings-openai,embeddings-ollama,embeddings-jina,embeddings-lmstudio"`
 - `cargo check --workspace`: check all crates without producing binaries.
-- `cargo build -p codegraph-mcp-server --bin codegraph --features full`: build the CLI with agent, embedding, and HTTP features; add `--release` for optimized builds.
+- `cargo build --release --features full`: published-artifact profile only (fat LTO); `.github/workflows/release.yml` uses it.
 - `./target/debug/codegraph start stdio`: run the built MCP server after configuring providers. A shared server is the default target (`ws://127.0.0.1:8000`) and needs `schema/codegraph_v2.surql` applied; only an explicit `surrealkv://` URL opens an embedded per-project store, which applies the bundled v2 schema automatically. Respect `CARGO_TARGET_DIR` when locating binaries.
 - `cargo test -p codegraph-mcp`: test the indexing crate; use `cargo test --workspace` for all crates.
 - `cargo test -p codegraph-mcp-server --lib` and `cargo test -p codegraph-mcp-server --test project_init_integration --test agent_cli_integration`: verify project setup, hook preservation and CLI contracts without live providers.
-- `cargo fmt --all -- --check`: verify formatting; omit `-- --check` to format.
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: run CI-style linting. `make lint` checks only core and suppresses warnings.
+- `cargo fmt --all -- --check`: verify formatting; omit `-- --check` to format. `make fmt-check` / `make fmt` wrap these.
 
 ## Coding Style & Naming Conventions
 
@@ -309,4 +333,57 @@ instructions. Agent queries use the configured model and may incur provider cost
 Use the four public agent commands; internal graph tools belong to CodeGraph's
 built-in agents. Reload usage details with `codegraph agent instructions`.
 <!-- codegraph:end -->
+
+### 何时必须先用 `plan`（规划校验）
+
+写代码**之前**，只要命中下面任一条，就先外化节点/边/约束并调用 `plan_check`（离线）或
+`codegraph plan check`：
+
+- 新增模块 / crate 级特性 / provider-factory 路径；
+- 跨层改动（例如 `cli -> core -> vector`），或要改变这个方向；
+- 多跳依赖（A 调 B、B 调 C，或新类型在别处实现某个 trait）；
+- 同时改动 ≥3 个文件的公共接口（签名、trait 方法、配置键、schema）。
+
+单文件 bug fix、改文案、单模块内机械重命名**不用** plan——那只是复述代码图里已有的东西。
+
+调用要点：节点 = 模块 / 类型 / trait（`id` 用你打算写的真实符号名，`plan verify` 按名字比对），
+边 = `calls` / `implements` / `uses`，约束 = `acyclic` + `layering` + `coverage`（必要时
+`no_path` / `max_fan_*`）。`known_nodes` 抓未声明的引用，`layering` / `acyclic` 抓设计错误。
+
+MCP 的 `plan_check` 是**离线**校验，不读代码图；要和已有代码对照，用 CLI：
+`codegraph plan --project <已索引的项目根> verify plan.json`（看 `unplanned_code_edges`
+和 `existing_planned_nodes`）。详细说明见 `docs/PLAN_CHECK.md`。
+
+### 部分索引与 LSP（默认关闭，按需打开）
+
+`codegraph index <scan_root>` 只更新该范围，**默认不启动语言服务器**（LSP 会加载整个工程，
+单文件更新不值得付全工程导入的代价）。
+
+需要跨文件符号 / 定义时，显式打开并固定项目根：
+
+```bash
+CODEGRAPH_LSP_ON_PARTIAL=1 codegraph index packages/happy-android \
+  --project-root . --index-tier balanced --languages kotlin
+```
+
+- `--project-root`（或 `CODEGRAPH_PROJECT_ID`）必须与索引时的项目一致；扫描路径（如
+  `packages/happy-android`）相对该根书写。
+- LSP 以**项目根**初始化，不是扫描目录；大 Android / Java / TS 仓库首次导入可能 1–5 分钟。
+  `initialize` 默认等待 180s（`CODEGRAPH_LSP_INITIALIZE_TIMEOUT_SECS`），普通请求 30s
+  （`CODEGRAPH_LSP_REQUEST_TIMEOUT_SECS`）；超时会降级为 warning，索引继续。
+- 需要的工具：Kotlin=`kotlin-language-server`，Java=`jdtls`，TS/JS=`typescript-language-server`，
+  Rust=`rust-analyzer`，Go=`gopls`。
+- 大仓建议先用全量 `codegraph index <root>` 跑一次带 LSP 的索引，之后日常编辑用不带 LSP 的部分索引。
+- **tier 决定有没有 LSP 边**：`balanced` = `SymbolsOnly`，只做 `documentSymbol`，**不解析 definition，LSP 贡献 0 条边**；
+  只有 `full` = `SymbolsAndDefinitions` 才会产生 definition 边。balanced 日志里的
+  `N nodes enriched + 0 edges resolved` 是预期行为，不是失败。需要 balanced 也有边时设
+  `CODEGRAPH_LSP_DEFINITIONS=1`（更慢）。
+
+### 共享 server 的数据库隔离
+
+共享 SurrealDB 默认**每个项目一个 database**（`<目录名>_<路径短哈希>`，如 `happy_3f9c2a1b7e40`），
+避免所有项目的 chunks 共用一个 HNSW 索引（构建会随全库增长）。首次 index/query/MCP
+连接会自动建库并应用 schema。`CODEGRAPH_DATABASE_PER_PROJECT=0` 可回退到共享
+`CODEGRAPH_SURREALDB_DATABASE`。**旧共享库的数据不会自动迁移**，需要重新索引各项目；
+确认不再需要旧库前不要删除它。嵌入式 `surrealkv://` 本身按项目一个文件，不受影响。
 

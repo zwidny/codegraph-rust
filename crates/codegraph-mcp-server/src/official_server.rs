@@ -241,50 +241,74 @@ fn default_doc_style() -> String {
     "comprehensive".to_string()
 }
 
-/// Free-form parameters for the direct graph tools.
+/// Static parameter object for a direct graph tool.
 ///
-/// The eight graph tools each accept a small, tool-specific object. Rather than
-/// duplicating eight schemas — and risking drift from `GraphToolSchemas` — this
-/// wrapper advertises an open object and passes the JSON through unchanged.
-/// `Parameters<serde_json::Value>` cannot be used directly: schemars emits no
-/// root `"type"` for `Value`, and MCP requires `inputSchema.type == "object"`.
-#[derive(Debug, Clone)]
-pub struct GraphToolParams(pub Value);
-
-impl<'de> Deserialize<'de> for GraphToolParams {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Value::deserialize(deserializer).map(GraphToolParams)
-    }
-}
-
-impl JsonSchema for GraphToolParams {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "GraphToolParams".into()
-    }
-
-    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        // Every direct graph tool accepts two shared response-size controls; tool-specific
-        // parameters stay documented in each tool's description.
-        json!({
-            "type": "object",
-            "additionalProperties": true,
-            "properties": {
-                "content_chars": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Code snippet length per node. Omit to use the server default \
-                                  (CODEGRAPH_TOOL_CONTENT_CHARS, 2000); 0 keeps the full content."
-                }
-            },
-            "description": "Tool-specific parameters; see each tool's description."
+/// Sourced from the shared `GraphToolSchemas` definitions so the MCP `inputSchema`
+/// matches what the executor actually accepts (`query`, `node_id`, `edge_type`, the
+/// `required` list and enums), instead of an open object that only mentions the
+/// shared `content_chars` control. `GraphToolSchemas::all()` already injects
+/// `content_chars` into every tool, so it stays available here too.
+fn graph_tool_parameters(tool_name: &str) -> Value {
+    codegraph_mcp_tools::GraphToolSchemas::all()
+        .into_iter()
+        .find(|schema| schema.name == tool_name)
+        .map(|schema| schema.parameters)
+        .unwrap_or_else(|| {
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Tool-specific parameters; see the tool description."
+            })
         })
-        .try_into()
-        .expect("static schema literal")
-    }
 }
+
+/// Declare a `Parameters<T>` wrapper whose JSON schema is one graph tool's
+/// documented parameters, while still deserializing the raw JSON object unchanged.
+///
+/// `Parameters<serde_json::Value>` cannot be used directly: schemars emits no root
+/// `"type"` for `Value`, and MCP requires `inputSchema.type == "object"`.
+macro_rules! graph_tool_params {
+    ($ty:ident, $tool:literal) => {
+        #[derive(Debug, Clone)]
+        pub struct $ty(pub Value);
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Value::deserialize(deserializer).map($ty)
+            }
+        }
+
+        impl JsonSchema for $ty {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($ty).into()
+            }
+
+            fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                graph_tool_parameters($tool)
+                    .try_into()
+                    .expect("graph tool schema literal is valid")
+            }
+        }
+    };
+}
+
+graph_tool_params!(SemanticCodeSearchParams, "semantic_code_search");
+graph_tool_params!(GetReverseDependenciesParams, "get_reverse_dependencies");
+graph_tool_params!(
+    GetTransitiveDependenciesParams,
+    "get_transitive_dependencies"
+);
+graph_tool_params!(TraceCallChainParams, "trace_call_chain");
+graph_tool_params!(CalculateCouplingMetricsParams, "calculate_coupling_metrics");
+graph_tool_params!(
+    DetectCircularDependenciesParams,
+    "detect_circular_dependencies"
+);
+graph_tool_params!(FindComplexityHotspotsParams, "find_complexity_hotspots");
+graph_tool_params!(GetHubNodesParams, "get_hub_nodes");
 
 /// Clean CodeGraph MCP server following official Counter pattern
 #[derive(Clone)]
@@ -470,7 +494,7 @@ impl CodeGraphMCPServer {
     )]
     async fn semantic_code_search(
         &self,
-        params: Parameters<GraphToolParams>,
+        params: Parameters<SemanticCodeSearchParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("semantic_code_search", params.0.0)
             .await
@@ -481,7 +505,7 @@ impl CodeGraphMCPServer {
     )]
     async fn get_reverse_dependencies(
         &self,
-        params: Parameters<GraphToolParams>,
+        params: Parameters<GetReverseDependenciesParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("get_reverse_dependencies", params.0.0)
             .await
@@ -492,7 +516,7 @@ impl CodeGraphMCPServer {
     )]
     async fn get_transitive_dependencies(
         &self,
-        params: Parameters<GraphToolParams>,
+        params: Parameters<GetTransitiveDependenciesParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("get_transitive_dependencies", params.0.0)
             .await
@@ -503,7 +527,7 @@ impl CodeGraphMCPServer {
     )]
     async fn trace_call_chain(
         &self,
-        params: Parameters<GraphToolParams>,
+        params: Parameters<TraceCallChainParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("trace_call_chain", params.0.0).await
     }
@@ -513,7 +537,7 @@ impl CodeGraphMCPServer {
     )]
     async fn calculate_coupling_metrics(
         &self,
-        params: Parameters<GraphToolParams>,
+        params: Parameters<CalculateCouplingMetricsParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("calculate_coupling_metrics", params.0.0)
             .await
@@ -524,7 +548,7 @@ impl CodeGraphMCPServer {
     )]
     async fn detect_circular_dependencies(
         &self,
-        params: Parameters<GraphToolParams>,
+        params: Parameters<DetectCircularDependenciesParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("detect_circular_dependencies", params.0.0)
             .await
@@ -535,7 +559,7 @@ impl CodeGraphMCPServer {
     )]
     async fn find_complexity_hotspots(
         &self,
-        params: Parameters<GraphToolParams>,
+        params: Parameters<FindComplexityHotspotsParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("find_complexity_hotspots", params.0.0)
             .await
@@ -544,13 +568,13 @@ impl CodeGraphMCPServer {
     #[tool(description = "Find high-degree hub nodes (no LLM). Params: min_degree (int).")]
     async fn get_hub_nodes(
         &self,
-        params: Parameters<GraphToolParams>,
+        params: Parameters<GetHubNodesParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_graph_tool("get_hub_nodes", params.0.0).await
     }
 
     #[tool(
-        description = "Validate a draft logic graph before code exists (no LLM, no DB). Params: plan (object with nodes, edges, constraints). Returns ok, checks, violations and warnings, using the same rules as `codegraph plan check`: known_nodes, acyclic, layering, coverage, no_path, max_fan_in, max_fan_out."
+        description = "Validate a draft logic graph before code exists (no LLM, no DB). Use it before writing a new module, a cross-layer change (e.g. cli -> core -> vector), a multi-hop dependency, or any edit to the public interfaces of 3+ files: first write the planned nodes (modules/types), edges (calls/implements) and constraints, then call this tool. known_nodes catches references you never declared; layering and acyclic catch design errors; coverage, no_path and max_fan_* check reachability and degree. Params: plan (object with nodes, edges, constraints). Returns ok, checks, violations and warnings, using the same rules as `codegraph plan check`: known_nodes, acyclic, layering, coverage, no_path, max_fan_in, max_fan_out. This tool is offline; to compare the plan with the existing code graph use the CLI `codegraph plan --project <root> verify <file>`."
     )]
     async fn plan_check(
         &self,
@@ -1217,6 +1241,110 @@ mod prompt_tests {
             initial_instructions_prompt().name,
             "codegraph:initial_instructions"
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_tool_input_schema_tests {
+    use super::*;
+
+    /// Every direct graph tool must advertise its real parameters in the MCP
+    /// `inputSchema`. A shared open-object schema that only lists `content_chars`
+    /// hides `query`/`node_id`/`edge_type` from LLM clients, so they cannot build a
+    /// valid call without guessing from prose.
+    #[test]
+    fn direct_graph_tools_advertise_their_parameters() {
+        let server = CodeGraphMCPServer::new();
+        let router = &server.tool_router;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("semantic_code_search", &["query", "limit", "threshold"]),
+            (
+                "get_reverse_dependencies",
+                &["node_id", "edge_type", "depth"],
+            ),
+            (
+                "get_transitive_dependencies",
+                &["node_id", "edge_type", "depth"],
+            ),
+            ("trace_call_chain", &["node_id", "max_depth"]),
+            ("calculate_coupling_metrics", &["node_id"]),
+            ("detect_circular_dependencies", &["edge_type"]),
+            ("find_complexity_hotspots", &["min_complexity", "limit"]),
+            ("get_hub_nodes", &["min_degree"]),
+        ];
+
+        for (name, expected) in cases {
+            let tool = router
+                .get(name)
+                .unwrap_or_else(|| panic!("router is missing `{name}`"));
+            let schema = &tool.input_schema;
+            let properties = schema
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .unwrap_or_else(|| panic!("`{name}` inputSchema has no properties: {schema:?}"));
+            for parameter in *expected {
+                assert!(
+                    properties.contains_key(*parameter),
+                    "`{name}` inputSchema is missing `{parameter}`: {schema:?}"
+                );
+            }
+            assert!(
+                properties.contains_key("content_chars"),
+                "`{name}` inputSchema dropped the shared `content_chars` control: {schema:?}"
+            );
+        }
+    }
+
+    /// `edge_type` was advertised as `"Calls"`/`"Imports"` while every other surface
+    /// (stored values, `Display`, tool descriptions, benchmark scripts) uses
+    /// lowercase. The MCP schema must agree and list the full relationship set.
+    #[test]
+    fn direct_graph_tools_advertise_lowercase_edge_types() {
+        let server = CodeGraphMCPServer::new();
+        let router = &server.tool_router;
+
+        let expected = [
+            "calls",
+            "defines",
+            "uses",
+            "imports",
+            "extends",
+            "implements",
+            "contains",
+            "references",
+        ];
+
+        let tool_names = [
+            "get_reverse_dependencies",
+            "get_transitive_dependencies",
+            "detect_circular_dependencies",
+        ];
+
+        for name in tool_names {
+            let tool = router
+                .get(name)
+                .unwrap_or_else(|| panic!("router is missing `{name}`"));
+            let edge_type = tool
+                .input_schema
+                .get("properties")
+                .and_then(|properties| properties.get("edge_type"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{name}` inputSchema has no edge_type: {:?}",
+                        tool.input_schema
+                    )
+                });
+            let values: Vec<&str> = edge_type
+                .get("enum")
+                .and_then(|value| value.as_array())
+                .unwrap_or_else(|| panic!("`{name}` edge_type has no enum: {edge_type:?}"))
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default())
+                .collect();
+
+            assert_eq!(values, expected, "`{name}` edge_type enum");
+        }
     }
 }
 

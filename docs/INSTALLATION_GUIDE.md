@@ -234,6 +234,8 @@ Options:
       --exclude <PATTERN>   Exclude patterns (gitignore format, repeatable)
       --include <PATTERN>   Include only these patterns
       --index-tier <TIER>   fast (default) | balanced | full
+                            balanced: documentSymbol only (0 LSP definition edges)
+                            full: also resolves definition edges
       --batch-size <N>      Embedding batch size (overrides env and config)
       --force               Re-index even if already indexed
       --complete-deferred   Finish embedding/semantic work deferred by an earlier run

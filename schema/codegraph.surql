@@ -103,7 +103,7 @@ DEFINE FUNCTION fn::calculate_coupling_metrics($project_id: string, $node_id: st
 -- Detect circular dependencies (A→B and B→A both exist)
 -- OPTIMIZED: Uses edge key set for O(E) instead of O(E²) correlated subqueries
 DEFINE FUNCTION fn::detect_circular_dependencies($project_id: string, $edge_type: string) {
-    LET $edge_name = string::lowercase($edge_type ?? 'Calls');
+    LET $edge_name = string::lowercase($edge_type ?? 'calls');
 
     ------------------------------------------------------------------------
     -- 1) Get all edges for project in ONE query

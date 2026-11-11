@@ -86,6 +86,10 @@ pub async fn ensure_ready(
     );
     let mut all_ready = true;
     for (table, name, sql) in definitions(dimension, tables)? {
+        let index_started = Instant::now();
+        tracing::info!(
+            "🧱 Vector index {name} on {table} (dim {dimension}): ensuring; a first build on a large shared store can take minutes"
+        );
         tokio::time::timeout(timeout, db.query(sql))
             .await
             .map_err(|_| CodeGraphError::Database("Vector index construction timed out".into()))?
@@ -93,6 +97,7 @@ pub async fn ensure_ready(
             .check()
             .map_err(|e| CodeGraphError::Database(e.to_string()))?;
         let start = Instant::now();
+        let mut last_progress = Instant::now();
         // A single INFO FOR INDEX can block far longer than the overall readiness
         // timeout (observed: >20 min on a 5 GB store). Bound each probe so a stuck
         // metadata query degrades to "not ready" instead of hanging indexing
@@ -138,13 +143,23 @@ pub async fn ensure_ready(
                 .or_else(|| info.get("status"))
                 .and_then(|v| v.as_str());
             match status {
-                Some("ready")
-                    if info
+                Some("ready") => {
+                    // HNSW background compaction does not block reads. Waiting for it can
+                    // add many minutes on a large shared store, so `ready` is enough.
+                    let compacting = info
                         .get("building")
                         .and_then(|value| value.get("compacting"))
                         .and_then(|value| value.as_bool())
-                        != Some(true) =>
-                {
+                        == Some(true);
+                    tracing::info!(
+                        "✅ Vector index {name} on {table} ready in {:.1?}{}",
+                        index_started.elapsed(),
+                        if compacting {
+                            " (background compaction continues)"
+                        } else {
+                            ""
+                        }
+                    );
                     break;
                 }
                 Some("error" | "failed") => {
@@ -157,7 +172,16 @@ pub async fn ensure_ready(
                         "Vector index {name} not ready: {info}"
                     )));
                 }
-                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+                _ => {
+                    if last_progress.elapsed() >= Duration::from_secs(5) {
+                        tracing::info!(
+                            "⏳ Vector index {name} on {table} still building ({:.1?} elapsed)",
+                            index_started.elapsed()
+                        );
+                        last_progress = Instant::now();
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     }

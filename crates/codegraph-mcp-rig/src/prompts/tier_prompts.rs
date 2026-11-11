@@ -49,7 +49,7 @@ If a tool fails or returns nothing useful, change the query, edge type, or depth
 Request: "What breaks if I change the signature of load_config?"
 
 1. semantic_code_search(query="load_config function definition") returns several nodes. One is a function named load_config in src/config.rs.
-2. get_reverse_dependencies(node_id=<that node's ID>, edge_type="Calls", depth=2) returns its direct and indirect callers.
+2. get_reverse_dependencies(node_id=<that node's ID>, edge_type="calls", depth=2) returns its direct and indirect callers.
 3. Answer: name each caller with its file and line, separate direct callers from indirect ones, and say which of them the change affects.
 
 # Limits for this run
