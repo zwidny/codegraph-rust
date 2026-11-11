@@ -186,6 +186,12 @@ impl GraphFunctions {
         edge_type: &str,
         depth: i32,
     ) -> Result<Vec<DependencyNode>> {
+        if native_analysis_enabled() {
+            return self
+                .get_transitive_dependencies_native(node_id, edge_type, depth)
+                .await;
+        }
+
         debug!(
             "Calling fn::get_transitive_dependencies({}, {}, {}, project={})",
             node_id, edge_type, depth, self.project_id
@@ -338,6 +344,10 @@ impl GraphFunctions {
         from_node: &str,
         max_depth: i32,
     ) -> Result<Vec<CallChainNode>> {
+        if native_analysis_enabled() {
+            return self.trace_call_chain_native(from_node, max_depth).await;
+        }
+
         debug!(
             "Calling fn::trace_call_chain({}, {}, project={})",
             from_node, max_depth, self.project_id
@@ -908,6 +918,12 @@ impl GraphFunctions {
         edge_type: &str,
         depth: i32,
     ) -> Result<Vec<DependencyNode>> {
+        if native_analysis_enabled() {
+            return self
+                .get_reverse_dependencies_native(node_id, edge_type, depth)
+                .await;
+        }
+
         debug!(
             "Calling fn::get_reverse_dependencies({}, {}, {}, project={})",
             node_id, edge_type, depth, self.project_id
@@ -1164,6 +1180,12 @@ impl GraphFunctions {
         min_complexity: f32,
         limit: i32,
     ) -> Result<Vec<ComplexityHotspot>> {
+        if native_analysis_enabled() {
+            return self
+                .get_complexity_hotspots_native(min_complexity, limit)
+                .await;
+        }
+
         debug!(
             "Calling fn::get_complexity_hotspots(min={}, limit={}, project={})",
             min_complexity, limit, self.project_id

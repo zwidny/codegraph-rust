@@ -5,8 +5,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-use codegraph_graph::graph_functions::NodeReference;
-use codegraph_graph::{GraphFunctions, HubNode, SurrealDbConfig, SurrealDbStorage};
+use codegraph_graph::graph_functions::{CallChainNode, DependencyNode, NodeReference};
+use codegraph_graph::{
+    ComplexityHotspot, GraphFunctions, HubNode, SurrealDbConfig, SurrealDbStorage,
+};
 
 /// `CODEGRAPH_NATIVE_ANALYSIS` is process-global, so the two new diff tests take this lock
 /// and touch the variable only inside themselves. The pre-existing hub test also toggles it
@@ -499,4 +501,396 @@ async fn circular_dependencies_match_on_real_project() {
         "no edges for calls/imports/uses; the cycle diff did not exercise real data"
     );
     assert_eq!(failures, 0, "{failures} edge types disagreed");
+}
+
+/// Fixed, reproducible sampling shared by the dependency, call-chain and hotspot diffs:
+/// the first three hubs, up to three self-loop endpoints and three ordinary nodes, deduped
+/// in that order. The queries mirror the read-only sampling used by the coupling diff.
+async fn sample_node_ids(graph: &GraphFunctions, project_id: &str) -> Vec<String> {
+    let db = graph.db();
+
+    let hub_rows: Vec<serde_json::Value> = db
+        .query("RETURN fn::get_hub_nodes($p, 1000)")
+        .bind(("p", project_id.to_string()))
+        .await
+        .expect("hub sample query")
+        .take(0)
+        .expect("decode hub sample");
+
+    let loop_rows: Vec<serde_json::Value> = db
+        .query(
+            "SELECT <string>`from` AS id FROM edges \
+             WHERE project_id = $p AND `from` = `to` LIMIT 3",
+        )
+        .bind(("p", project_id.to_string()))
+        .await
+        .expect("self-loop sample query")
+        .take(0)
+        .expect("decode self-loop sample");
+
+    let plain_rows: Vec<serde_json::Value> = db
+        .query("SELECT <string>id AS id FROM nodes WHERE project_id = $p LIMIT 3")
+        .bind(("p", project_id.to_string()))
+        .await
+        .expect("plain node sample query")
+        .take(0)
+        .expect("decode plain node sample");
+
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut push = |id: Option<String>| {
+        if let Some(id) = id.filter(|id| !id.is_empty()) {
+            if seen.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+    };
+    for row in hub_rows.iter().take(3) {
+        push(json_string(row, "node_id"));
+    }
+    for row in &loop_rows {
+        push(json_string(row, "id"));
+    }
+    for row in &plain_rows {
+        push(json_string(row, "id"));
+    }
+    ids
+}
+
+/// Print at most five elements that differ between two sorted vectors.
+fn print_set_diffs<T: Ord + std::fmt::Debug>(label: &str, sql: &[T], native: &[T]) {
+    let sql_set: BTreeSet<&T> = sql.iter().collect();
+    let native_set: BTreeSet<&T> = native.iter().collect();
+    let mut printed = 0usize;
+    for value in sql_set.difference(&native_set) {
+        if printed == 5 {
+            return;
+        }
+        println!("  {label} only surrealdb: {value:?}");
+        printed += 1;
+    }
+    for value in native_set.difference(&sql_set) {
+        if printed == 5 {
+            return;
+        }
+        println!("  {label} only native:    {value:?}");
+        printed += 1;
+    }
+}
+
+/// Differential test for `get_transitive_dependencies` on real data, over both edge
+/// types the callers use and depths that include the stored-procedure clamps (0, 11).
+#[tokio::test]
+#[ignore = "requires a live SurrealDB server with real project data"]
+async fn transitive_dependencies_match_on_real_project() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((graph, project_id)) = connect_readonly().await else {
+        return;
+    };
+    let samples = sample_node_ids(&graph, &project_id).await;
+    println!("transitive samples={} {:?}", samples.len(), samples);
+
+    let previous = std::env::var("CODEGRAPH_NATIVE_ANALYSIS").ok();
+    let mut saw_rows = false;
+    let mut failures = 0usize;
+    for id in &samples {
+        for edge_type in ["calls", "imports"] {
+            for depth in [1, 2, 3, 0, 11] {
+                pinned_surrealql_path();
+                let sql = graph
+                    .get_transitive_dependencies(id, edge_type, depth)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("surrealql transitive({id}, {edge_type}, {depth}) failed: {e}")
+                    });
+                let native = graph
+                    .get_transitive_dependencies_native(id, edge_type, depth)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("native transitive({id}, {edge_type}, {depth}) failed: {e}")
+                    });
+                saw_rows |= !sql.is_empty() || !native.is_empty();
+
+                let key = |rows: &[DependencyNode]| {
+                    let mut v: Vec<(String, Option<i32>)> = rows
+                        .iter()
+                        .map(|r| (r.id.clone(), r.dependency_depth))
+                        .collect();
+                    v.sort();
+                    v
+                };
+                let sql_key = key(&sql);
+                let native_key = key(&native);
+                if sql_key == native_key {
+                    continue;
+                }
+                failures += 1;
+                println!(
+                    "transitive mismatch id={id} edge_type={edge_type} depth={depth} \
+                     surrealdb={} native={}",
+                    sql_key.len(),
+                    native_key.len()
+                );
+                print_set_diffs("transitive", &sql_key, &native_key);
+            }
+        }
+    }
+    restore_native_flag(previous);
+
+    assert!(
+        saw_rows,
+        "both implementations returned no transitive dependencies; the diff did not \
+         exercise real data"
+    );
+    assert_eq!(
+        failures, 0,
+        "{failures} transitive depth/edge combos disagreed"
+    );
+}
+
+/// Differential test for `get_reverse_dependencies` on real data; the depth lands in
+/// `dependent_depth` rather than `dependency_depth`.
+#[tokio::test]
+#[ignore = "requires a live SurrealDB server with real project data"]
+async fn reverse_dependencies_match_on_real_project() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((graph, project_id)) = connect_readonly().await else {
+        return;
+    };
+    let samples = sample_node_ids(&graph, &project_id).await;
+    println!("reverse samples={} {:?}", samples.len(), samples);
+
+    let previous = std::env::var("CODEGRAPH_NATIVE_ANALYSIS").ok();
+    let mut saw_rows = false;
+    let mut failures = 0usize;
+    for id in &samples {
+        for edge_type in ["calls", "imports"] {
+            for depth in [1, 2, 3, 0, 11] {
+                pinned_surrealql_path();
+                let sql = graph
+                    .get_reverse_dependencies(id, edge_type, depth)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("surrealql reverse({id}, {edge_type}, {depth}) failed: {e}")
+                    });
+                let native = graph
+                    .get_reverse_dependencies_native(id, edge_type, depth)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("native reverse({id}, {edge_type}, {depth}) failed: {e}")
+                    });
+                saw_rows |= !sql.is_empty() || !native.is_empty();
+
+                let key = |rows: &[DependencyNode]| {
+                    let mut v: Vec<(String, Option<i32>)> = rows
+                        .iter()
+                        .map(|r| (r.id.clone(), r.dependent_depth))
+                        .collect();
+                    v.sort();
+                    v
+                };
+                let sql_key = key(&sql);
+                let native_key = key(&native);
+                if sql_key == native_key {
+                    continue;
+                }
+                failures += 1;
+                println!(
+                    "reverse mismatch id={id} edge_type={edge_type} depth={depth} \
+                     surrealdb={} native={}",
+                    sql_key.len(),
+                    native_key.len()
+                );
+                print_set_diffs("reverse", &sql_key, &native_key);
+            }
+        }
+    }
+    restore_native_flag(previous);
+
+    assert!(
+        saw_rows,
+        "both implementations returned no reverse dependencies; the diff did not \
+         exercise real data"
+    );
+    assert_eq!(
+        failures, 0,
+        "{failures} reverse depth/edge combos disagreed"
+    );
+}
+
+/// Differential test for `trace_call_chain` on real data. Compares the reached set
+/// `(id, call_depth, sorted called_by ids)` across depths including the clamps.
+#[tokio::test]
+#[ignore = "requires a live SurrealDB server with real project data"]
+async fn trace_call_chain_match_on_real_project() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((graph, project_id)) = connect_readonly().await else {
+        return;
+    };
+    let samples = sample_node_ids(&graph, &project_id).await;
+    println!("trace samples={} {:?}", samples.len(), samples);
+
+    let previous = std::env::var("CODEGRAPH_NATIVE_ANALYSIS").ok();
+    let mut saw_rows = false;
+    let mut failures = 0usize;
+    for id in &samples {
+        for max_depth in [1, 2, 3, 0, 11] {
+            pinned_surrealql_path();
+            let sql = graph
+                .trace_call_chain(id, max_depth)
+                .await
+                .unwrap_or_else(|e| panic!("surrealql trace({id}, {max_depth}) failed: {e}"));
+            let native = graph
+                .trace_call_chain_native(id, max_depth)
+                .await
+                .unwrap_or_else(|e| panic!("native trace({id}, {max_depth}) failed: {e}"));
+            saw_rows |= !sql.is_empty() || !native.is_empty();
+
+            let key = |rows: &[CallChainNode]| {
+                let mut v: Vec<(String, Option<i32>, Vec<String>)> = rows
+                    .iter()
+                    .map(|r| {
+                        let mut called_by: Vec<String> = r
+                            .called_by
+                            .as_ref()
+                            .map(|refs| refs.iter().map(|c| c.id.clone()).collect())
+                            .unwrap_or_default();
+                        called_by.sort();
+                        (r.id.clone(), r.call_depth, called_by)
+                    })
+                    .collect();
+                v.sort();
+                v
+            };
+            let sql_key = key(&sql);
+            let native_key = key(&native);
+            if sql_key == native_key {
+                continue;
+            }
+            failures += 1;
+            println!(
+                "trace mismatch id={id} max_depth={max_depth} surrealdb={} native={}",
+                sql_key.len(),
+                native_key.len()
+            );
+            print_set_diffs("trace", &sql_key, &native_key);
+        }
+    }
+    restore_native_flag(previous);
+
+    assert!(
+        saw_rows,
+        "both implementations returned no call chain nodes; the diff did not exercise \
+         real data"
+    );
+    assert_eq!(failures, 0, "{failures} trace depth combos disagreed");
+}
+
+/// Differential test for `get_complexity_hotspots` on real data across thresholds that
+/// keep rows, filter heavily and fall back to the defaults (limit -1/200, min -1).
+#[tokio::test]
+#[ignore = "requires a live SurrealDB server with real project data"]
+async fn complexity_hotspots_match_on_real_project() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((graph, project_id)) = connect_readonly().await else {
+        return;
+    };
+    println!("complexity project={project_id}");
+
+    let previous = std::env::var("CODEGRAPH_NATIVE_ANALYSIS").ok();
+    let mut saw_rows = false;
+    let mut failures = 0usize;
+    for (min_complexity, limit) in [(0.0f32, 20), (5.0, 20), (50.0, 10), (-1.0, 5), (0.0, 200)] {
+        pinned_surrealql_path();
+        let sql = graph
+            .get_complexity_hotspots(min_complexity, limit)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("surrealql hotspots({min_complexity}, {limit}) failed: {e}")
+            });
+        let native = graph
+            .get_complexity_hotspots_native(min_complexity, limit)
+            .await
+            .unwrap_or_else(|e| panic!("native hotspots({min_complexity}, {limit}) failed: {e}"));
+        saw_rows |= !sql.is_empty() || !native.is_empty();
+
+        // Coupling counts must match exactly; floats are compared with relative error.
+        let coupling = |rows: &[ComplexityHotspot]| {
+            let mut v: Vec<(String, i32, i32)> = rows
+                .iter()
+                .map(|r| (r.id.clone(), r.afferent_coupling, r.efferent_coupling))
+                .collect();
+            v.sort();
+            v
+        };
+        let floats = |rows: &[ComplexityHotspot]| {
+            let mut v: Vec<(String, f32, f32, f32)> = rows
+                .iter()
+                .map(|r| (r.id.clone(), r.complexity, r.instability, r.risk_score))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let sql_coupling = coupling(&sql);
+        let native_coupling = coupling(&native);
+        let sql_floats = floats(&sql);
+        let native_floats = floats(&native);
+
+        let mut diffs: Vec<String> = Vec::new();
+        if sql_coupling != native_coupling {
+            diffs.push(format!(
+                "coupling surrealdb={sql_coupling:?} native={native_coupling:?}"
+            ));
+        }
+        if sql_floats.len() != native_floats.len() {
+            diffs.push(format!(
+                "float rows surrealdb={} native={}",
+                sql_floats.len(),
+                native_floats.len()
+            ));
+        } else {
+            for (a, b) in sql_floats.iter().zip(native_floats.iter()) {
+                if a.0 != b.0 {
+                    diffs.push(format!("float id order surrealdb={a:?} native={b:?}"));
+                    continue;
+                }
+                if !approx_eq(a.1, b.1) || !approx_eq(a.2, b.2) || !approx_eq(a.3, b.3) {
+                    diffs.push(format!("float {a:?} vs {b:?}"));
+                }
+            }
+        }
+
+        println!(
+            "min_complexity={min_complexity} limit={limit}: surrealdb={} native={} \
+             mismatches={}",
+            sql.len(),
+            native.len(),
+            diffs.len()
+        );
+        if diffs.is_empty() {
+            continue;
+        }
+        failures += 1;
+        for line in diffs.iter().take(5) {
+            println!("  {line}");
+        }
+    }
+    restore_native_flag(previous);
+
+    assert!(
+        saw_rows,
+        "both implementations returned no hotspots; the diff did not exercise real data"
+    );
+    assert_eq!(failures, 0, "{failures} hotspot parameter sets disagreed");
+}
+
+/// Relative-error comparison for hotspot scores (`1e-4`).
+fn approx_eq(a: f32, b: f32) -> bool {
+    if a == b {
+        return true;
+    }
+    // Floor the scale at 1.0: instability/risk can legitimately be 0 on one side and a tiny
+    // non-zero on the other, and a purely relative tolerance would then collapse to ~0.
+    let scale = a.abs().max(b.abs()).max(1.0);
+    (a - b).abs() <= 1e-4 * scale
 }
