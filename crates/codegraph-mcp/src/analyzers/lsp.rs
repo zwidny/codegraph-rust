@@ -888,6 +888,17 @@ pub async fn enrich_async(
     let def_edges_by_file = Arc::new(def_edges_by_file); // Share across tasks
 
     // Filter files
+    //
+    // Test-like files are skipped here only, never in the indexer: their nodes and
+    // edges are still extracted and stored by the AST pass, but asking `tsc` for
+    // `documentSymbol` on thousands of test/spec/story files dominates LSP runtime
+    // in large TypeScript projects.
+    let skip_test_files = skip_test_files_for(
+        std::env::var("CODEGRAPH_LSP_SKIP_TEST_FILES")
+            .ok()
+            .as_deref(),
+    );
+    let mut skipped_test_like = 0usize;
     let mut files_to_process: Vec<PathBuf> = Vec::new();
     for file_path in files {
         let file_keys = normalized_file_keys(&project_root, file_path);
@@ -898,7 +909,18 @@ pub async fn enrich_async(
         if !has_nodes && !has_edges {
             continue;
         }
+        if skip_test_files && is_test_like_path(&file_path.to_string_lossy()) {
+            skipped_test_like += 1;
+            continue;
+        }
         files_to_process.push(file_path.clone());
+    }
+
+    if skipped_test_like > 0 {
+        info!(
+            "🧠 LSP: skipping {} test-like files (CODEGRAPH_LSP_SKIP_TEST_FILES=0 to include them)",
+            skipped_test_like
+        );
     }
 
     let total_files = files_to_process.len();
@@ -1147,6 +1169,41 @@ fn qualified_names_enabled() -> bool {
     )
 }
 
+/// `CODEGRAPH_LSP_SKIP_TEST_FILES` gates whether the LSP enrichment pass asks the
+/// language server for symbols in test-like files (tests, specs, stories, mocks,
+/// fixtures, generated sources). Defaults **on** because test files rarely
+/// originate edges that need LSP resolution and can dominate runtime on large
+/// TypeScript projects; only `0` / `false` re-enable them.
+fn skip_test_files_for(value: Option<&str>) -> bool {
+    !matches!(value, Some("0") | Some("false"))
+}
+
+/// Path-based test/generated detection used for LSP enrichment only.
+///
+/// Matching is anchored on path separators or dot-delimited filename segments so
+/// real sources such as `src/latest/foo.ts`, `src/contest/foo.ts` and
+/// `src/test-utils.ts` are **not** skipped: a bare `contains("test")` would catch
+/// them and silently drop live code from LSP enrichment.
+fn is_test_like_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_lowercase();
+    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+
+    const FILE_MARKERS: [&str; 4] = [".test.", ".spec.", ".stories.", ".generated."];
+    if FILE_MARKERS.iter().any(|marker| file_name.contains(marker)) {
+        return true;
+    }
+
+    // Pad so that a relative path's leading segment still matches, e.g. `__tests__/x.ts`.
+    let padded = format!("/{}", path.trim_start_matches('/'));
+    const DIR_MARKERS: [&str; 4] = [
+        "/__tests__/",
+        "/__mocks__/",
+        "/__fixtures__/",
+        "/generated/",
+    ];
+    DIR_MARKERS.iter().any(|marker| padded.contains(marker))
+}
+
 /// Writes the LSP symbol metadata. `write_qualified_name` is separate from the
 /// analyzer provenance fields so the measurement switch never changes
 /// `lsp_nodes_enriched` or the other attributes.
@@ -1392,6 +1449,50 @@ mod tests {
             skipped.metadata.attributes.get("analyzer_confidence"),
             Some(&"1.0".to_string())
         );
+    }
+
+    #[test]
+    fn test_like_paths_are_detected_without_false_positives() {
+        // Filename-segment markers.
+        for hit in [
+            "src/foo.test.ts",
+            "src/foo.spec.tsx",
+            "src/Button.stories.tsx",
+            "src/types.generated.ts",
+            "packages/Foo/__tests__/bar.ts",
+            "packages/Foo/__mocks__/bar.ts",
+            "packages/Foo/__fixtures__/bar.ts",
+            "packages/Foo/generated/bar.ts",
+            "__tests__/relative.ts",
+            "GENERATED/Upper.ts",
+            "src/Foo.Test.TS",
+        ] {
+            assert!(is_test_like_path(hit), "expected test-like: {hit}");
+        }
+
+        // Real sources must survive: no bare `contains("test")`, no substring match
+        // on a component of a longer directory name.
+        for miss in [
+            "src/latest/foo.ts",
+            "src/contest/foo.ts",
+            "src/test-utils.ts",
+            "src/foo.ts",
+            "src/testing/helper.ts",
+            "src/digested/foo.ts",
+            "packages/Foo/src/Bar.ts",
+        ] {
+            assert!(!is_test_like_path(miss), "expected source: {miss}");
+        }
+    }
+
+    #[test]
+    fn test_file_skip_is_on_by_default_and_disabled_only_for_0_or_false() {
+        assert!(skip_test_files_for(None));
+        assert!(skip_test_files_for(Some("1")));
+        assert!(skip_test_files_for(Some("true")));
+        assert!(skip_test_files_for(Some("")));
+        assert!(!skip_test_files_for(Some("0")));
+        assert!(!skip_test_files_for(Some("false")));
     }
 
     #[test]
