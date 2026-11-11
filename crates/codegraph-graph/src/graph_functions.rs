@@ -405,6 +405,164 @@ impl GraphFunctions {
     ///
     /// # Returns
     /// Vector of highly connected hub nodes sorted by degree (descending)
+    /// Rust implementation of `fn::calculate_coupling_metrics`.
+    ///
+    /// Accepts the id shapes the SurrealQL helper resolves (`nodes:x`, `x`, and the
+    /// backtick/bracket escaped forms). Returns `Ok(None)` when the node does not exist,
+    /// matching the `NONE` the function returns.
+    pub async fn calculate_coupling_metrics_native(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<CouplingMetricsResult>> {
+        let Some(clean) = normalize_node_id(node_id) else {
+            return Ok(None);
+        };
+
+        let nodes: Vec<NodeInfo> = self
+            .db
+            .query(
+                "SELECT <string>id AS id, name, node_type AS kind, language, content, metadata, \
+                 { end_line: end_line, file_path: file_path, start_line: start_line } AS location \
+                 FROM type::record('nodes', $clean) LIMIT 1",
+            )
+            .bind(("clean", clean.clone()))
+            .await
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native coupling node load failed: {e}"))
+            })?
+            .take(0)
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native coupling node decode failed: {e}"))
+            })?;
+        let Some(node) = nodes.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let types: Vec<String> = Self::DEPENDENCY_EDGE_TYPES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+
+        let dependents: Vec<String> = self
+            .db
+            .query(
+                "SELECT VALUE <string>`from` FROM edges WHERE project_id = $project_id \
+                 AND edge_type INSIDE $types AND `to` = type::record('nodes', $clean)",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .bind(("types", types.clone()))
+            .bind(("clean", clean.clone()))
+            .await
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native coupling dependents failed: {e}"))
+            })?
+            .take(0)
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native coupling dependent decode failed: {e}"))
+            })?;
+
+        let dependencies: Vec<String> = self
+            .db
+            .query(
+                "SELECT VALUE <string>`to` FROM edges WHERE project_id = $project_id \
+                 AND edge_type INSIDE $types AND `from` = type::record('nodes', $clean)",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .bind(("types", types))
+            .bind(("clean", clean))
+            .await
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native coupling dependencies failed: {e}"))
+            })?
+            .take(0)
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native coupling dependency decode failed: {e}"))
+            })?;
+
+        // fn::calculate_coupling_metrics distincts before counting; keep the same rule.
+        let unique = |mut ids: Vec<String>| {
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        let dependents = unique(dependents);
+        let dependencies = unique(dependencies);
+
+        let all_ids: Vec<String> = dependents
+            .iter()
+            .chain(dependencies.iter())
+            .cloned()
+            .collect();
+        let refs = self.node_references(&all_ids).await?;
+        let lookup = |id: &str| refs.iter().find(|r| r.id == id).cloned();
+
+        let dependents: Vec<NodeReference> =
+            dependents.iter().filter_map(|id| lookup(id)).collect();
+        let dependencies: Vec<NodeReference> =
+            dependencies.iter().filter_map(|id| lookup(id)).collect();
+
+        let afferent = dependents.len() as i32;
+        let efferent = dependencies.len() as i32;
+        let total = afferent + efferent;
+        // Round to six decimals like the SurrealQL `math::round(x * 1000000f) / 1000000f`.
+        let instability = if total > 0 {
+            (((efferent as f64 / total as f64) * 1_000_000.0).round()) / 1_000_000.0
+        } else {
+            0.0
+        };
+        let category = if instability < 0.3 {
+            "stable"
+        } else if instability > 0.7 {
+            "unstable"
+        } else {
+            "balanced"
+        };
+
+        Ok(Some(CouplingMetricsResult {
+            node,
+            metrics: CouplingMetrics {
+                afferent_coupling: afferent,
+                efferent_coupling: efferent,
+                total_coupling: total,
+                instability,
+                stability: 1.0 - instability,
+                is_stable: instability < 0.3,
+                is_unstable: instability > 0.7,
+                coupling_category: category.to_string(),
+            },
+            dependents,
+            dependencies,
+        }))
+    }
+
+    /// Hydrate `nodes:` record ids into the minimal reference shape used by ranked lists.
+    async fn node_references(&self, ids: &[String]) -> Result<Vec<NodeReference>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<NodeInfo> = self
+            .db
+            .query(
+                "SELECT <string>id AS id, name, node_type AS kind, language, \
+                 { end_line: end_line, file_path: file_path, start_line: start_line } AS location \
+                 FROM nodes WHERE <string>id IN $ids",
+            )
+            .bind(("ids", ids.to_vec()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("node reference load failed: {e}")))?
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("node reference decode failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|n| NodeReference {
+                id: n.id,
+                name: n.name,
+                kind: n.kind,
+                location: n.location,
+            })
+            .collect())
+    }
+
     pub async fn get_hub_nodes(&self, min_degree: i32) -> Result<Vec<HubNode>> {
         debug!(
             "Calling fn::get_hub_nodes({}, project={})",
@@ -439,6 +597,132 @@ impl GraphFunctions {
     ///
     /// # Returns
     /// Vector of nodes that depend on the target node
+    /// Edge types that count as dependencies, mirroring
+    /// `DEFINE PARAM $dependency_edge_types` in `schema/codegraph_v2.surql`.
+    pub const DEPENDENCY_EDGE_TYPES: &'static [&'static str] = &[
+        "calls",
+        "defines",
+        "imports",
+        "uses",
+        "extends",
+        "implements",
+        "references",
+        "depends_on",
+        "exports",
+        "reexports",
+        "enables",
+        "generates",
+        "flows_to",
+        "returns",
+        "captures",
+        "mutates",
+    ];
+
+    /// Rust implementation of `fn::get_hub_nodes`.
+    ///
+    /// Unlike the SurrealQL version this ranks **every** node: the stored procedure can only
+    /// score the top 500 per direction because `array::concat` output is capped at 1 MiB, so
+    /// a node with moderate in-degree and moderate out-degree can be missed on a large graph.
+    pub async fn get_hub_nodes_native(&self, min_degree: i32) -> Result<Vec<HubNode>> {
+        let threshold = if min_degree > 0 {
+            min_degree as usize
+        } else {
+            5
+        };
+        let types: Vec<String> = Self::DEPENDENCY_EDGE_TYPES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+
+        let edges: Vec<crate::analysis::EdgeRow> = self
+            .db
+            .query(
+                "SELECT <string>`from` AS `from`, <string>`to` AS `to`, edge_type \
+                 FROM edges WHERE project_id = $project_id AND edge_type INSIDE $types",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .bind(("types", types))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native hub edge load failed: {e}")))?
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("native hub edge decode failed: {e}")))?;
+
+        let mut ranked = crate::analysis::hubs(&edges, Self::DEPENDENCY_EDGE_TYPES, threshold);
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+        // fn::get_hub_nodes returns at most 50 rows.
+        ranked.truncate(50);
+
+        use std::collections::HashMap;
+        let keep: std::collections::HashSet<&str> =
+            ranked.iter().map(|(id, _)| id.as_str()).collect();
+
+        let mut incoming: HashMap<(String, String), i32> = HashMap::new();
+        let mut outgoing: HashMap<(String, String), i32> = HashMap::new();
+        for edge in &edges {
+            if edge.from == edge.to {
+                continue;
+            }
+            if keep.contains(edge.to.as_str()) {
+                *incoming
+                    .entry((edge.to.clone(), edge.edge_type.to_ascii_lowercase()))
+                    .or_default() += 1;
+            }
+            if keep.contains(edge.from.as_str()) {
+                *outgoing
+                    .entry((edge.from.clone(), edge.edge_type.to_ascii_lowercase()))
+                    .or_default() += 1;
+            }
+        }
+
+        let ids: Vec<String> = ranked.iter().map(|(id, _)| id.clone()).collect();
+        let nodes: Vec<NodeInfo> = self
+            .db
+            .query(
+                "SELECT <string>id AS id, name, node_type AS kind, language, \
+                 { end_line: end_line, file_path: file_path, start_line: start_line } AS location \
+                 FROM nodes WHERE <string>id IN $ids",
+            )
+            .bind(("ids", ids))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native hub node load failed: {e}")))?
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("native hub node decode failed: {e}")))?;
+        let by_id: HashMap<String, NodeInfo> =
+            nodes.into_iter().map(|n| (n.id.clone(), n)).collect();
+
+        let per_type = |map: &HashMap<(String, String), i32>, id: &str| -> Vec<EdgeTypeCount> {
+            let mut rows: Vec<EdgeTypeCount> = map
+                .iter()
+                .filter(|((node, _), _)| node == id)
+                .map(|((_, kind), count)| EdgeTypeCount {
+                    edge_type: kind.clone(),
+                    count: *count,
+                })
+                .collect();
+            rows.sort_by(|a, b| a.edge_type.cmp(&b.edge_type));
+            rows
+        };
+
+        let mut out = Vec::with_capacity(ranked.len());
+        for (id, degrees) in ranked {
+            let Some(node) = by_id.get(&id).cloned() else {
+                continue;
+            };
+            out.push(HubNode {
+                incoming_by_type: per_type(&incoming, &id),
+                outgoing_by_type: per_type(&outgoing, &id),
+                node_id: id,
+                node,
+                afferent_degree: degrees.afferent as i32,
+                efferent_degree: degrees.efferent as i32,
+                total_degree: degrees.total() as i32,
+            });
+        }
+        Ok(out)
+    }
+
     pub async fn get_reverse_dependencies(
         &self,
         node_id: &str,
@@ -875,6 +1159,23 @@ pub struct NodeEdgeSummary {
     pub incoming_edge_types: Vec<String>,
     #[serde(default)]
     pub outgoing_edge_types: Vec<String>,
+}
+
+/// Accept the id shapes `fn::resolve_node` accepts: `nodes:x`, `x`, and the
+/// backtick/bracket escaped forms SurrealDB prints for record ids.
+fn normalize_node_id(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let after = trimmed.strip_prefix("nodes:").unwrap_or(trimmed);
+    let clean = after
+        .trim_matches('`')
+        .trim_matches(|c| c == '⟨' || c == '⟩');
+    if clean.is_empty() {
+        return None;
+    }
+    Some(clean.to_string())
 }
 
 /// Circular dependency pair

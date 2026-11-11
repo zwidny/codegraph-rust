@@ -434,6 +434,59 @@ async fn v2_cascade_and_index_use() {
     );
 }
 
+/// Differential test for hub ranking: the Rust path must agree with `fn::get_hub_nodes`
+/// on the fixture, and must be exact rather than capped at the top-500 candidates.
+#[tokio::test]
+async fn native_hub_nodes_match_surrealdb_function() {
+    use codegraph_graph::graph_functions::{GraphFunctions, HubNode};
+    use std::sync::Arc;
+
+    let db = db_with_fixture().await;
+    let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
+
+    let key = |rows: &[HubNode]| {
+        let mut v: Vec<(String, i32, i32, i32)> = rows
+            .iter()
+            .map(|h| {
+                (
+                    h.node_id.clone(),
+                    h.afferent_degree,
+                    h.efferent_degree,
+                    h.total_degree,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    for min_degree in [2, 3, 5, 100] {
+        let expected = functions
+            .get_hub_nodes(min_degree)
+            .await
+            .expect("surrealql path");
+        let actual = functions
+            .get_hub_nodes_native(min_degree)
+            .await
+            .expect("native path");
+        assert_eq!(
+            key(&expected),
+            key(&actual),
+            "hub ranking diverged at min_degree={min_degree}"
+        );
+    }
+
+    // Fixture degrees (self-loops excluded): a 2/1, b 1/2, c 1/1, d 1/1.
+    let hubs = functions.get_hub_nodes_native(3).await.unwrap();
+    assert_eq!(
+        key(&hubs),
+        vec![
+            ("nodes:a".to_string(), 2, 1, 3),
+            ("nodes:b".to_string(), 1, 2, 3),
+        ]
+    );
+}
+
 /// Differential test for the `fn::*` -> Rust migration: the Rust cycle search must return
 /// exactly the pairs the SurrealQL function returns, for the same fixture project.
 #[tokio::test]
@@ -482,4 +535,95 @@ async fn native_cycle_detection_matches_surrealdb_function() {
     assert_eq!(actual[0].dependency_type, "calls");
     assert_eq!(actual[0].node1.name, "parse_config");
     assert_eq!(actual[0].node2.name, "load_file");
+}
+
+/// Differential test for coupling metrics: same afferent/efferent counts, same instability
+/// and the same distinct neighbour sets as `fn::calculate_coupling_metrics`.
+#[tokio::test]
+async fn native_coupling_metrics_match_surrealdb_function() {
+    use codegraph_graph::graph_functions::GraphFunctions;
+    use std::sync::Arc;
+
+    let db = db_with_fixture().await;
+    let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
+
+    let ids = |rows: &[codegraph_graph::graph_functions::NodeReference]| {
+        let mut v: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        v.sort();
+        v
+    };
+
+    // Fixture: a<-c, a<-d, a->b, b->c, b->d, c->a; e is isolated.
+    for (node, afferent, efferent) in [("a", 2, 1), ("b", 1, 2), ("c", 1, 1), ("d", 1, 1)] {
+        let expected = functions
+            .calculate_coupling_metrics(node)
+            .await
+            .expect("surrealql path");
+        let actual = functions
+            .calculate_coupling_metrics_native(node)
+            .await
+            .expect("native path")
+            .expect("node must resolve");
+
+        assert_eq!(actual.metrics.afferent_coupling, afferent, "{node}");
+        assert_eq!(actual.metrics.efferent_coupling, efferent, "{node}");
+        assert_eq!(actual.metrics.total_coupling, afferent + efferent, "{node}");
+        assert_eq!(
+            actual.metrics.afferent_coupling, expected.metrics.afferent_coupling,
+            "{node}"
+        );
+        assert_eq!(
+            actual.metrics.efferent_coupling, expected.metrics.efferent_coupling,
+            "{node}"
+        );
+        assert_eq!(
+            actual.metrics.total_coupling, expected.metrics.total_coupling,
+            "{node}"
+        );
+        assert!(
+            (actual.metrics.instability - expected.metrics.instability).abs() < 1e-9,
+            "{node}: instability {} vs {}",
+            actual.metrics.instability,
+            expected.metrics.instability
+        );
+        assert_eq!(
+            actual.metrics.coupling_category, expected.metrics.coupling_category,
+            "{node}"
+        );
+        assert_eq!(
+            ids(&actual.dependents),
+            ids(&expected.dependents),
+            "{node} dependents"
+        );
+        assert_eq!(
+            ids(&actual.dependencies),
+            ids(&expected.dependencies),
+            "{node} dependencies"
+        );
+    }
+
+    // Isolated node: no neighbours, instability 0, category "stable".
+    let isolated = functions
+        .calculate_coupling_metrics_native("e")
+        .await
+        .unwrap()
+        .expect("isolated node resolves");
+    assert_eq!(isolated.metrics.total_coupling, 0);
+    assert_eq!(isolated.metrics.instability, 0.0);
+    assert_eq!(isolated.metrics.coupling_category, "stable");
+
+    // Prefix and bare-id forms resolve to the same node, like fn::resolve_node.
+    let prefixed = functions
+        .calculate_coupling_metrics_native("nodes:a")
+        .await
+        .unwrap()
+        .expect("prefixed id resolves");
+    assert_eq!(prefixed.node.name, "parse_config");
+    assert!(
+        functions
+            .calculate_coupling_metrics_native("does_not_exist")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
