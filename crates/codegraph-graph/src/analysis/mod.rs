@@ -208,6 +208,91 @@ pub fn expand_bfs(
     reached
 }
 
+/// Depth clamp used by `fn::trace_call_chain`: values in `1..=10` are honoured, anything
+/// else falls back to 5.
+///
+/// This is deliberately separate from [`safe_depth`]: the call-chain walk defaults to 5,
+/// while the dependency walks default to 3.
+pub fn safe_depth_for_call_chain(requested: i32) -> usize {
+    if (1..=10).contains(&requested) {
+        requested as usize
+    } else {
+        5
+    }
+}
+
+/// One node reached by [`trace_bfs`], with the name path that led to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceStep {
+    pub id: String,
+    pub path: Vec<String>,
+    pub depth: usize,
+}
+
+/// Breadth-first call walk mirroring `fn::trace_call_chain`.
+///
+/// Only `calls` edges are followed, in the `out` direction. The start node is seeded into
+/// `visited`, so a cycle never re-visits it and a self-loop is dropped. A callee reached by
+/// several edges keeps the first edge encountered, which fixes its parent and therefore its
+/// path.
+///
+/// `path` starts with `start_name`; later entries are the reached node ids, because an
+/// [`EdgeRow`] carries no callee name. The native call chain never exposes the path
+/// (`CallChainNode` has no `call_path` field), so this only matters to callers of this
+/// function.
+pub fn trace_bfs(
+    edges: &[EdgeRow],
+    start: &str,
+    start_name: &str,
+    max_depth: usize,
+) -> Vec<TraceStep> {
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(start.to_string());
+    let mut frontier: Vec<(String, Vec<String>)> =
+        vec![(start.to_string(), vec![start_name.to_string()])];
+    let mut reached: Vec<TraceStep> = Vec::new();
+
+    for depth in 1..=max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+
+        let parent_paths: HashMap<&str, &[String]> = frontier
+            .iter()
+            .map(|(id, path)| (id.as_str(), path.as_slice()))
+            .collect();
+
+        let mut next: Vec<(String, Vec<String>)> = Vec::new();
+        let mut queued: HashSet<String> = HashSet::new();
+        for edge in edges {
+            if edge.edge_type.to_ascii_lowercase() != "calls" {
+                continue;
+            }
+            let Some(parent_path) = parent_paths.get(edge.from.as_str()) else {
+                continue;
+            };
+            if visited.contains(&edge.to) || !queued.insert(edge.to.clone()) {
+                continue;
+            }
+            let mut path = (*parent_path).to_vec();
+            path.push(edge.to.clone());
+            next.push((edge.to.clone(), path));
+        }
+
+        for (id, _) in &next {
+            visited.insert(id.clone());
+        }
+        reached.extend(next.iter().map(|(id, path)| TraceStep {
+            id: id.clone(),
+            path: path.clone(),
+            depth,
+        }));
+        frontier = next;
+    }
+
+    reached
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +587,140 @@ mod tests {
         assert_eq!(ranked.len(), 1201);
         assert_eq!(ranked[0].0, "nodes:centre");
         assert_eq!(ranked[0].1.efferent, 1200);
+    }
+
+    fn depths(steps: &[TraceStep]) -> Vec<(String, usize)> {
+        steps.iter().map(|s| (s.id.clone(), s.depth)).collect()
+    }
+
+    #[test]
+    fn safe_depth_for_call_chain_falls_back_to_five() {
+        assert_eq!(safe_depth_for_call_chain(1), 1);
+        assert_eq!(safe_depth_for_call_chain(10), 10);
+        for rejected in [0, -1, 11, 100] {
+            assert_eq!(safe_depth_for_call_chain(rejected), 5, "depth {rejected}");
+        }
+        // The dependency walk still defaults to 3; the call-chain walk must not share it.
+        assert_eq!(safe_depth_for_call_chain(0), 5);
+        assert_eq!(safe_depth(0), 3);
+    }
+
+    #[test]
+    fn trace_bfs_honours_the_depth_limit() {
+        let edges = chain();
+        assert_eq!(
+            depths(&trace_bfs(&edges, "nodes:a", "a", 1)),
+            vec![("nodes:b".to_string(), 1)]
+        );
+        // Depth 2 adds c (via b) and d (via b). c -> a is a cycle back to the visited start.
+        assert_eq!(
+            depths(&trace_bfs(&edges, "nodes:a", "a", 2)),
+            vec![
+                ("nodes:b".to_string(), 1),
+                ("nodes:c".to_string(), 2),
+                ("nodes:d".to_string(), 2),
+            ]
+        );
+        // Depth 3 discovers nothing new: the only remaining edge is d -> a (imports).
+        assert_eq!(
+            trace_bfs(&edges, "nodes:a", "a", 3),
+            trace_bfs(&edges, "nodes:a", "a", 2)
+        );
+    }
+
+    #[test]
+    fn trace_bfs_records_the_path_from_the_start() {
+        let edges = chain();
+        let reached = trace_bfs(&edges, "nodes:a", "parse_config", 2);
+        assert_eq!(
+            reached,
+            vec![
+                TraceStep {
+                    id: "nodes:b".into(),
+                    path: vec!["parse_config".into(), "nodes:b".into()],
+                    depth: 1,
+                },
+                TraceStep {
+                    id: "nodes:c".into(),
+                    path: vec!["parse_config".into(), "nodes:b".into(), "nodes:c".into()],
+                    depth: 2,
+                },
+                TraceStep {
+                    id: "nodes:d".into(),
+                    path: vec!["parse_config".into(), "nodes:b".into(), "nodes:d".into()],
+                    depth: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn trace_bfs_terminates_on_a_cycle() {
+        let edges = chain();
+        // c -> a -> b -> c would loop forever without the visited set.
+        assert_eq!(
+            depths(&trace_bfs(&edges, "nodes:c", "c", 10)),
+            vec![
+                ("nodes:a".to_string(), 1),
+                ("nodes:b".to_string(), 2),
+                ("nodes:d".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn trace_bfs_diamond_keeps_only_the_first_path() {
+        // a reaches d twice; the b edge is seen first, so b is d's parent.
+        let edges = vec![
+            edge("nodes:a", "nodes:b", "calls"),
+            edge("nodes:a", "nodes:c", "calls"),
+            edge("nodes:b", "nodes:d", "calls"),
+            edge("nodes:c", "nodes:d", "calls"),
+        ];
+        let reached = trace_bfs(&edges, "nodes:a", "a", 5);
+        assert_eq!(
+            depths(&reached),
+            vec![
+                ("nodes:b".to_string(), 1),
+                ("nodes:c".to_string(), 1),
+                ("nodes:d".to_string(), 2),
+            ]
+        );
+        let d = reached
+            .iter()
+            .find(|s| s.id == "nodes:d")
+            .expect("d reached");
+        assert_eq!(d.path, vec!["a", "nodes:b", "nodes:d"]);
+    }
+
+    #[test]
+    fn trace_bfs_drops_self_loops() {
+        let edges = vec![
+            edge("nodes:a", "nodes:a", "calls"),
+            edge("nodes:a", "nodes:b", "calls"),
+        ];
+        assert_eq!(
+            depths(&trace_bfs(&edges, "nodes:a", "a", 10)),
+            vec![("nodes:b".to_string(), 1)]
+        );
+        let only_loop = vec![edge("nodes:z", "nodes:z", "calls")];
+        assert!(trace_bfs(&only_loop, "nodes:z", "z", 10).is_empty());
+    }
+
+    #[test]
+    fn trace_bfs_on_an_empty_graph_returns_nothing() {
+        assert!(trace_bfs(&[], "nodes:a", "a", 5).is_empty());
+    }
+
+    #[test]
+    fn trace_bfs_ignores_other_edge_types() {
+        let edges = vec![
+            edge("nodes:a", "nodes:b", "imports"),
+            edge("nodes:a", "nodes:c", "calls"),
+        ];
+        assert_eq!(
+            depths(&trace_bfs(&edges, "nodes:a", "a", 5)),
+            vec![("nodes:c".to_string(), 1)]
+        );
     }
 }

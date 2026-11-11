@@ -44,7 +44,7 @@ scoring, dedupe, context assembly and every graph algorithm.
 | # | Functions | Risk | Status |
 |---|---|---|---|
 | 1 | `mutual_pairs` (cycles), `degrees`/`hubs`, `coupling` | low | done |
-| 2 | `expand`, `get_transitive_dependencies`, `get_reverse_dependencies` | medium | done; `trace_call_chain` pending |
+| 2 | `expand`, `get_transitive_dependencies`, `get_reverse_dependencies`, `trace_call_chain` | medium | done |
 | 3 | `get_complexity_hotspots`, `find_nodes_by_name`, `get_top_directories`, `count_nodes_for_project` | low | not started |
 | 4 | `knn_chunks`, `knn_nodes`, `semantic_search_*`, `search_snippets` | medium-high (keeps HNSW SQL) | not started |
 | 5 | `kmeans` | medium | not started |
@@ -58,6 +58,18 @@ scoring, dedupe, context assembly and every graph algorithm.
 | `requested_depth` | The SurrealQL functions return it; `DependencyNode` has no such field, and the pre-existing Rust path also drops it. | Leave as-is; changing the struct is out of scope. |
 | empty `edge_type` | `$edge_type ?? 'calls'` only defaults `NONE`/null, so `''` searches for the empty edge type. The native path treats `''` as `calls`. | Intentional: empty string is not a meaningful edge type. Documented here because it is not differentially covered. |
 | same-depth ordering | `ORDER BY depth` has no tie-break; the native path emits BFS discovery order. | Tests compare after sorting by `(id, depth)`, so ordering is not part of the contract. |
+| `trace_bfs` path elements | Path stores node ids, not names: `TraceStep` only receives `EdgeRow`, which has no callee name. | Unobservable: `CallChainNode` has no `call_path` field, so the native path never emits it. |
+| `called_by` truncation | SurrealQL slices to 10 before hydrating; the native path does the same. Group order is undefined in SurrealQL. | Tests assert the count is 10, not which ten, to stay non-flaky. |
+
+### Latent decoding hazard (pre-existing, both paths)
+
+`NodeLocation.file_path` is a `String` while the schema declares
+`DEFINE FIELD file_path ON nodes TYPE option<string>`. A node with `file_path = NONE`
+would fail to deserialize, turning the whole call into `Err`. This affects the SurrealQL
+path too (`fn::node_info` builds the same object), so it is not a migration regression.
+Measured on all four project databases: 0 nodes with a null `file_path`, so it does not
+trigger today. If a future analyzer emits location-less nodes, relax `NodeLocation` to
+`Option<String>` and update both paths.
 
 
 Each batch: pure function + unit tests, then a `*_native` method beside the existing

@@ -359,6 +359,183 @@ impl GraphFunctions {
         Ok(result)
     }
 
+    /// Rust implementation of `fn::trace_call_chain`.
+    ///
+    /// Follows `calls` edges breadth-first from `from_node`, up to `safe_depth_for_call_chain`
+    /// levels (default 5). Each reached node is hydrated with `fn::node_info`'s column set
+    /// plus its direct callers, deduplicated and capped at ten per node.
+    ///
+    /// Known difference: `CallChainNode` has no `call_path` / `requested_depth` fields, so
+    /// the native path does not produce them. The SurrealQL path goes through the same struct
+    /// and serde already ignores those two columns there.
+    pub async fn trace_call_chain_native(
+        &self,
+        from_node: &str,
+        max_depth: i32,
+    ) -> Result<Vec<CallChainNode>> {
+        let Some(clean) = normalize_node_id(from_node) else {
+            return Ok(Vec::new());
+        };
+
+        // `fn::resolve_node` + the project_id guard: unknown or foreign nodes trace to [].
+        let mut start_response = self
+            .db
+            .query(
+                "SELECT <string>id AS id, name, project_id FROM nodes \
+                 WHERE id = type::record('nodes', $clean) LIMIT 1",
+            )
+            .bind(("clean", clean.clone()))
+            .await
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native call chain start failed: {e}"))
+            })?;
+        let start_raw: Option<SurrealValue> = start_response.take(0).map_err(|e| {
+            CodeGraphError::Database(format!("native call chain start decode: {e}"))
+        })?;
+        let start_json = start_raw
+            .map(surreal_to_json)
+            .unwrap_or(serde_json::Value::Null);
+        if !start_json.is_object() {
+            return Ok(Vec::new());
+        }
+        let start = &start_json;
+        let Some(start_id) = start.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
+            return Ok(Vec::new());
+        };
+        match start.get("project_id").and_then(|v| v.as_str()) {
+            Some(project) if project == self.project_id.as_str() => {}
+            _ => return Ok(Vec::new()),
+        }
+        let start_name = start
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let edges: Vec<crate::analysis::EdgeRow> = self
+            .db
+            .query(
+                "SELECT <string>`from` AS `from`, <string>`to` AS `to`, edge_type \
+                 FROM edges WHERE project_id = $project_id AND edge_type = 'calls'",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native call chain edge load: {e}")))?
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("native call chain edge decode: {e}")))?;
+
+        let reached = crate::analysis::trace_bfs(
+            &edges,
+            &start_id,
+            &start_name,
+            crate::analysis::safe_depth_for_call_chain(max_depth),
+        );
+        if reached.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Direct callers, deduplicated and capped at ten per callee before hydration, the
+        // same order as `array::slice(array::distinct(array::group(`from`)), 0, 10)`.
+        let mut cb_response = self
+            .db
+            .query(
+                "SELECT <string>`to` AS callee, <string>`from` AS caller FROM edges \
+                 WHERE project_id = $project_id AND edge_type = 'calls' \
+                 AND <string>`to` IN $ids",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .bind((
+                "ids",
+                reached.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            ))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native call chain caller load: {e}")))?;
+        let cb_raw: SurrealValue = cb_response.take(0).map_err(|e| {
+            CodeGraphError::Database(format!("native call chain caller decode: {e}"))
+        })?;
+        let cb_json = surreal_to_json(cb_raw);
+        let cb_rows = cb_json.as_array().cloned().unwrap_or_default();
+
+        let mut callers: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in &cb_rows {
+            let (Some(callee), Some(caller)) = (
+                row.get("callee").and_then(|v| v.as_str()),
+                row.get("caller").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let entry = callers.entry(callee.to_string()).or_default();
+            if !entry.iter().any(|c| c == caller) {
+                entry.push(caller.to_string());
+            }
+        }
+        let mut caller_ids: Vec<String> = Vec::new();
+        for ids in callers.values_mut() {
+            ids.sort();
+            ids.truncate(10);
+            caller_ids.extend(ids.iter().cloned());
+        }
+        caller_ids.sort();
+        caller_ids.dedup();
+        let caller_refs = self.node_references(&caller_ids).await?;
+        let caller_by_id: std::collections::HashMap<String, NodeReference> =
+            caller_refs.into_iter().map(|r| (r.id.clone(), r)).collect();
+
+        let ids: Vec<String> = reached.iter().map(|s| s.id.clone()).collect();
+        let infos: Vec<NodeInfo> = self
+            .db
+            .query(
+                "SELECT <string>id AS id, name, node_type AS kind, language, content, metadata, \
+                 { end_line: end_line, file_path: file_path, start_line: start_line } AS location \
+                 FROM nodes WHERE <string>id IN $ids",
+            )
+            .bind(("ids", ids))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native call chain node load: {e}")))?
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("native call chain node decode: {e}")))?;
+        let by_id: std::collections::HashMap<String, NodeInfo> =
+            infos.into_iter().map(|n| (n.id.clone(), n)).collect();
+
+        let mut out = Vec::with_capacity(reached.len());
+        for step in reached {
+            let Some(node) = by_id.get(&step.id) else {
+                continue;
+            };
+            // `fn::node_reference` returns NONE for unhydratable ids; those are dropped.
+            let called_by: Vec<CallerInfo> = callers
+                .get(&step.id)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| caller_by_id.get(id))
+                        .map(|r| CallerInfo {
+                            id: r.id.clone(),
+                            name: r.name.clone(),
+                            kind: r.kind.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(CallChainNode {
+                id: node.id.clone(),
+                name: node.name.clone(),
+                kind: node.kind.clone(),
+                location: node.location.clone(),
+                language: node.language.clone(),
+                content: node.content.clone(),
+                metadata: node.metadata.clone(),
+                call_depth: Some(step.depth as i32),
+                called_by: Some(called_by),
+            });
+        }
+
+        // `trace_bfs` already walks level by level; keep the sort explicit so the contract
+        // ("ORDER BY call_depth") survives any future traversal change.
+        out.sort_by_key(|r| r.call_depth.unwrap_or_default());
+        Ok(out)
+    }
+
     /// Calculate coupling metrics for a node
     ///
     /// # Arguments

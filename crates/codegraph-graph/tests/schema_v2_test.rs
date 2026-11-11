@@ -1003,3 +1003,213 @@ async fn native_reverse_dependencies_match_surrealdb_function() {
             .is_empty()
     );
 }
+
+/// Differential test for `fn::trace_call_chain`: ids, depths and direct callers must match
+/// the stored procedure. `called_by` ordering is not part of the contract, so both sides are
+/// sorted before comparison; the result itself is sorted by id.
+#[tokio::test]
+async fn native_trace_call_chain_matches_surrealdb_function() {
+    use codegraph_graph::graph_functions::{CallChainNode, GraphFunctions};
+    use std::sync::Arc;
+
+    let db = db_with_fixture().await;
+    db.query(
+        "CREATE type::record('nodes', 'z') SET name = 'foreign_node', node_type = 'Function', \
+         project_id = 'other-project'",
+    )
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
+
+    let surreal_key = |rows: &Value| -> Vec<(String, i64, Vec<String>)> {
+        let mut v: Vec<(String, i64, Vec<String>)> = rows
+            .as_array()
+            .expect("array result")
+            .iter()
+            .map(|r| {
+                let mut called_by: Vec<String> = r["called_by"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|c| c["id"].as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                called_by.sort();
+                (
+                    r["id"].as_str().unwrap_or_default().to_string(),
+                    r["call_depth"].as_i64().unwrap_or_default(),
+                    called_by,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let native_key = |rows: &[CallChainNode]| -> Vec<(String, i64, Vec<String>)> {
+        let mut v: Vec<(String, i64, Vec<String>)> = rows
+            .iter()
+            .map(|r| {
+                let mut called_by: Vec<String> = r
+                    .called_by
+                    .as_ref()
+                    .map(|items| items.iter().map(|c| c.id.clone()).collect())
+                    .unwrap_or_default();
+                called_by.sort();
+                (
+                    r.id.clone(),
+                    r.call_depth.unwrap_or_default() as i64,
+                    called_by,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // a -> b -> c -> a and b -> d. Depths 1 and 2; nothing new after that.
+    // A callee's direct callers are the `calls` edges pointing at it (d -> a is imports).
+    let expected_from_a = |depth: i32| -> Vec<(String, i64, Vec<String>)> {
+        let mut v = vec![("nodes:b".to_string(), 1, vec!["nodes:a".to_string()])];
+        if depth != 1 {
+            v.push(("nodes:c".to_string(), 2, vec!["nodes:b".to_string()]));
+            v.push(("nodes:d".to_string(), 2, vec!["nodes:b".to_string()]));
+        }
+        v.sort();
+        v
+    };
+
+    // 0 and 11 are out of range, so both fall back to the call chain default of 5.
+    for start in ["nodes:a", "a"] {
+        for depth in [1_i32, 2, 3, 0, 11] {
+            let expected = call(
+                &db,
+                "RETURN fn::trace_call_chain($p, $n, $d)",
+                vec![
+                    ("p", json!(PROJECT)),
+                    ("n", json!(start)),
+                    ("d", json!(depth)),
+                ],
+            )
+            .await;
+            let actual = functions
+                .trace_call_chain_native(start, depth)
+                .await
+                .expect("native path");
+
+            let effective = if depth == 1 { 1 } else { 5 };
+            assert_eq!(
+                native_key(&actual),
+                expected_from_a(effective),
+                "unexpected native rows from {start} at depth {depth}"
+            );
+            assert_eq!(
+                native_key(&actual),
+                surreal_key(&expected),
+                "call chain diverged from {start} at depth {depth}"
+            );
+        }
+    }
+
+    // Hydrated fields carry the same shape as fn::node_info.
+    let rows = functions
+        .trace_call_chain_native("nodes:a", 2)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].id, "nodes:b");
+    assert_eq!(rows[0].language.as_deref(), Some("rust"));
+    assert_eq!(
+        rows[0].content.as_deref(),
+        Some("fn load_file(path: &str) -> String { read(path) }")
+    );
+    assert!(rows.iter().all(|r| r.call_depth.is_some()));
+
+    // A node with no outgoing calls traces to nothing; so does an unknown node.
+    for probe in ["nodes:does_not_exist", "does_not_exist", "nodes:z", "z"] {
+        let actual = functions.trace_call_chain_native(probe, 3).await.unwrap();
+        assert!(actual.is_empty(), "{probe} should trace to nothing");
+        let expected = call(
+            &db,
+            "RETURN fn::trace_call_chain($p, $n, 3)",
+            vec![("p", json!(PROJECT)), ("n", json!(probe))],
+        )
+        .await;
+        assert!(surreal_key(&expected).is_empty(), "{probe} (surrealql)");
+    }
+    assert!(
+        functions
+            .trace_call_chain_native("", 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        functions
+            .trace_call_chain_native("nodes:d", 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Twelve direct callers of d (plus b) exercise the ten-caller cap. `called_by` order is
+    // not part of the contract, so only the count is asserted, not which ten are kept.
+    for i in 0..12 {
+        let node = format!("c{i:02}");
+        let edge_id = format!("t{i:02}");
+        db.query(
+            "CREATE type::record('nodes', $id) SET name = $name, node_type = 'Function', \
+             language = 'rust', file_path = 'src/caller.rs', start_line = 1, end_line = 2, \
+             project_id = $project",
+        )
+        .bind(("id", node.clone()))
+        .bind(("name", format!("caller_{i}")))
+        .bind(("project", PROJECT.to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        db.query(
+            "CREATE type::record('edges', $eid) SET `from` = type::record('nodes', $from), \
+             `to` = type::record('nodes', 'd'), edge_type = 'calls', project_id = $project",
+        )
+        .bind(("eid", edge_id))
+        .bind(("from", node))
+        .bind(("project", PROJECT.to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    }
+
+    let rows = functions
+        .trace_call_chain_native("nodes:a", 2)
+        .await
+        .unwrap();
+    let d = rows.iter().find(|r| r.id == "nodes:d").expect("d reached");
+    let d_callers = d.called_by.as_ref().expect("called_by present");
+    assert_eq!(d_callers.len(), 10, "called_by must be capped at ten");
+    let unique: std::collections::HashSet<&str> = d_callers.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(unique.len(), d_callers.len(), "called_by must be distinct");
+
+    // The stored procedure caps at ten as well.
+    let expected = call(
+        &db,
+        "RETURN fn::trace_call_chain($p, $n, 2)",
+        vec![("p", json!(PROJECT)), ("n", json!("nodes:a"))],
+    )
+    .await;
+    let surreal_d = expected
+        .as_array()
+        .expect("array result")
+        .iter()
+        .find(|r| r["id"] == "nodes:d")
+        .expect("d reached (surrealql)");
+    assert_eq!(
+        surreal_d["called_by"].as_array().map(Vec::len),
+        Some(10),
+        "surrealql called_by cap"
+    );
+}
