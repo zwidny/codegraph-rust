@@ -1763,13 +1763,20 @@ impl ProjectIndexer {
                 let chunk_batch_size = batch.max(1);
 
                 // `fingerprint` serialises its input and recursively sorts every object
-                // key (canonicalisation) before hashing. Called once per chunk over the
-                // whole plan, that repeated work for the constant configuration fields
-                // dominated the embedding phase on a single thread (measured: ~100% CPU
-                // on one core while the batch pipeline starved). The hash inputs are
-                // unchanged, so cache keys — and therefore stored vectors — stay valid;
-                // only the order of evaluation changes. Results are collected with their
-                // original index to keep deterministic iteration order afterwards.
+                // key (canonicalisation) before hashing. Doing that per chunk re-encodes
+                // the whole constant configuration 169k+ times for identical bytes, so
+                // the fixed tail is encoded and canonicalised once here and each chunk
+                // only hashes `[text,<tail>]` — the exact byte stream `fingerprint`
+                // would produce. Cache keys and stored vectors stay valid; only the
+                // order of evaluation changes. Results keep their original index so
+                // iteration order stays deterministic.
+                let fingerprint_tail = codegraph_core::artifact_cache::FingerprintTail::new(&(
+                    &embedding_config,
+                    &policy,
+                    &self.embedding_model,
+                    self.vector_dim,
+                    mutable_model_epoch,
+                ))?;
                 let computed_hashes: Vec<(usize, String, String)> =
                     self.cpu_pool.install(|| {
                         chunk_plan
@@ -1783,14 +1790,7 @@ impl ProjectIndexer {
                                     &node.id.to_string(),
                                     meta.chunk_index,
                                 );
-                                let hash = fingerprint(&(
-                                    &chunk.text,
-                                    &embedding_config,
-                                    &policy,
-                                    &self.embedding_model,
-                                    self.vector_dim,
-                                    mutable_model_epoch,
-                                ))?;
+                                let hash = fingerprint_tail.hash(&chunk.text)?;
                                 Ok::<_, serde_json::Error>((index, id, hash))
                             })
                             .collect::<std::result::Result<Vec<_>, _>>()

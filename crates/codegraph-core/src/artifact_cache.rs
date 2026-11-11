@@ -11,28 +11,85 @@ pub struct ArtifactCache {
     max_entry_bytes: usize,
 }
 
-pub fn fingerprint(value: &impl Serialize) -> std::result::Result<String, serde_json::Error> {
-    fn canonicalize(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(object) => {
-                object.sort_keys();
-                for value in object.values_mut() {
-                    canonicalize(value);
-                }
+fn canonicalize(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.sort_keys();
+            for value in object.values_mut() {
+                canonicalize(value);
             }
-            serde_json::Value::Array(array) => {
-                for value in array {
-                    canonicalize(value);
-                }
-            }
-            _ => {}
         }
+        serde_json::Value::Array(array) => {
+            for value in array {
+                canonicalize(value);
+            }
+        }
+        _ => {}
     }
+}
+
+pub fn fingerprint(value: &impl Serialize) -> std::result::Result<String, serde_json::Error> {
     let mut value = serde_json::to_value(value)?;
     canonicalize(&mut value);
     Ok(blake3::hash(&serde_json::to_vec(&value)?)
         .to_hex()
         .to_string())
+}
+
+/// Hash of `(text, fixed...)` tuples with the fixed tail encoded once.
+///
+/// `fingerprint(&(text, a, b, ...))` serialises the whole tuple to a JSON
+/// array, recursively sorts every object key and hashes the encoded bytes.
+/// When a large batch varies only `text` while `a, b, ...` stay constant, that
+/// per-item serialisation and canonicalisation dominates. This type performs
+/// the fixed work once and then, for every text, feeds exactly the same byte
+/// stream to a fresh hasher:
+///
+/// ```text
+/// [ "escaped text" , <canonical fixed tail> ]
+/// ```
+///
+/// The resulting hash strings are byte-identical to `fingerprint`'s, so cache
+/// keys stay valid.
+pub struct FingerprintTail {
+    tail: Vec<u8>,
+}
+
+impl FingerprintTail {
+    /// Pre-encode the fixed tuple elements. `fixed` must be a tuple whose
+    /// `serde_json` encoding is a non-empty JSON array.
+    pub fn new<F: Serialize + ?Sized>(fixed: &F) -> std::result::Result<Self, serde_json::Error> {
+        let mut value = serde_json::to_value(fixed)?;
+        canonicalize(&mut value);
+        match &value {
+            serde_json::Value::Array(items) if !items.is_empty() => {}
+            _ => {
+                return Err(<serde_json::Error as serde::ser::Error>::custom(
+                    "fingerprint tail must serialise to a non-empty JSON array",
+                ));
+            }
+        }
+        let encoded = serde_json::to_vec(&value)?;
+        // `encoded` is `[<tail>]`; keep `<tail>]` so the caller can prepend the
+        // separating comma and reuse the closing bracket.
+        let tail = encoded
+            .split_first()
+            .map(|(_, rest)| rest.to_vec())
+            .ok_or_else(|| {
+                <serde_json::Error as serde::ser::Error>::custom("empty fingerprint encoding")
+            })?;
+        Ok(Self { tail })
+    }
+
+    /// Hash `(text, fixed...)` with the pre-encoded tail.
+    pub fn hash(&self, text: &str) -> std::result::Result<String, serde_json::Error> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"[");
+        hasher.update(&serde_json::to_vec(text)?);
+        hasher.update(b",");
+        hasher.update(&self.tail);
+        Ok(hasher.finalize().to_hex().to_string())
+    }
 }
 
 impl ArtifactCache {
@@ -230,5 +287,68 @@ mod tests {
             fingerprint,
             super::fingerprint(&("parser-v1", "model", "query", 384)).unwrap()
         );
+    }
+
+    #[test]
+    fn fingerprint_tail_matches_full_fingerprint_byte_for_byte() {
+        let config = serde_json::json!({
+            "zeta": 1,
+            "alpha": {
+                "nested": ["x", {"b": 2, "a": 1, "inner": {"z": true, "a": null}}],
+            },
+            "vector_size": 384,
+            "unicode": "配置 ✓",
+        });
+        let policy: std::collections::BTreeMap<String, String> = [
+            (
+                "CODEGRAPH_CHUNK_SPLITTER".to_string(),
+                "semantic".to_string(),
+            ),
+            ("CODEGRAPH_ONNX_EP".to_string(), "cpu".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let model = "text-embedding-3-small".to_string();
+        let vector_dim = 384usize;
+        let epoch = 12u64;
+
+        let tail = FingerprintTail::new(&(&config, &policy, &model, vector_dim, epoch)).unwrap();
+        let texts = [
+            "plain ascii chunk text",
+            "quotes \" and backslash \\ and newline \n and tab \t",
+            "unicode 你好 🚀 and escaped \\u{1F600}",
+            "",
+            "line\r\nbreak \u{0} control",
+        ];
+        for text in texts {
+            assert_eq!(
+                tail.hash(text).unwrap(),
+                fingerprint(&(text, &config, &policy, &model, vector_dim, epoch)).unwrap(),
+                "text: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_tail_canonicalises_nested_object_keys() {
+        fn fixed(reverse: bool) -> serde_json::Value {
+            let mut inner = serde_json::Map::new();
+            let mut outer = serde_json::Map::new();
+            let entries = [("b", 2), ("a", 1), ("c", 3)];
+            let mut ordered: Vec<_> = entries.to_vec();
+            if reverse {
+                ordered.reverse();
+            }
+            for (key, value) in ordered {
+                inner.insert(key.to_string(), serde_json::json!(value));
+            }
+            outer.insert("nested".to_string(), serde_json::Value::Object(inner));
+            outer.insert("model".to_string(), serde_json::json!("m"));
+            serde_json::Value::Object(outer)
+        }
+
+        let a = FingerprintTail::new(&(&fixed(true), 8usize, 0u64)).unwrap();
+        let b = FingerprintTail::new(&(&fixed(false), 8usize, 0u64)).unwrap();
+        assert_eq!(a.hash("chunk").unwrap(), b.hash("chunk").unwrap());
     }
 }
