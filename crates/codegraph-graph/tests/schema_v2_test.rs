@@ -1529,3 +1529,123 @@ async fn native_complexity_hotspots_match_surrealdb_function() {
     assert_eq!(actual[0].id, "nodes:m");
     assert_eq!(expected[0]["id"], "nodes:m");
 }
+
+/// Differential test for `fn::kmeans`: cluster count, member sets and centroids must match
+/// the stored procedure for the same rows and every parameter fallback.
+///
+/// Centroids are compared with a 1e-3 relative tolerance, because the schema averages in
+/// f64 while [`codegraph_graph::analysis::clustering::Cluster`] stores f32.
+#[tokio::test]
+async fn native_kmeans_matches_surrealdb_function() {
+    use codegraph_graph::graph_functions::GraphFunctions;
+    use std::sync::Arc;
+
+    let db = db_with_fixture().await;
+    let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
+
+    // r0-r2 sit near the origin, r3-r5 near (10, 10); the two groups are unambiguous.
+    let rows: Vec<(String, Vec<f32>)> = (0..6)
+        .map(|i| {
+            let vector = if i < 3 {
+                vec![i as f32 * 0.01, 0.0]
+            } else {
+                vec![10.0 + i as f32 * 0.01, 10.0]
+            };
+            (format!("r{i}"), vector)
+        })
+        .collect();
+
+    // Relative tolerance, with |expected| clamped to 1 so an exact zero still passes.
+    let close = |native: f32, expected: &Value| -> bool {
+        let want = expected.as_f64().expect("float centroid component");
+        (native as f64 - want).abs() <= 1e-3 * want.abs().max(1.0)
+    };
+
+    for (k, iterations) in [(2usize, 5usize), (0, 5), (99, 5), (2, 0), (2, 99)] {
+        let surreal_rows: Vec<Value> = rows
+            .iter()
+            .map(|(id, vector)| json!({ "id": id, "vector": vector }))
+            .collect();
+        let expected = call(
+            &db,
+            "RETURN fn::kmeans($rows, $k, $it)",
+            vec![
+                ("rows", json!(surreal_rows)),
+                ("k", json!(k)),
+                ("it", json!(iterations)),
+            ],
+        )
+        .await;
+        let actual = functions
+            .kmeans_native(&rows, k, iterations)
+            .await
+            .expect("native path");
+
+        let label = format!("k={k}, iterations={iterations}");
+        let expected_clusters = expected.as_array().expect("array result");
+        assert_eq!(actual.len(), expected_clusters.len(), "{label}: {expected}");
+        assert_eq!(actual.len(), 2, "{label}: the default keeps two clusters");
+
+        for cluster in &actual {
+            let want = expected_clusters
+                .iter()
+                .find(|c| c["cluster"].as_u64() == Some(cluster.cluster as u64))
+                .unwrap_or_else(|| panic!("{label}: cluster {} missing", cluster.cluster));
+
+            let mut got_members = cluster.members.clone();
+            got_members.sort();
+            let mut want_members: Vec<String> = want["members"]
+                .as_array()
+                .expect("members array")
+                .iter()
+                .map(|m| m.as_str().expect("member id").to_string())
+                .collect();
+            want_members.sort();
+            assert_eq!(got_members, want_members, "{label}: members");
+
+            let want_centroid = want["centroid"].as_array().expect("centroid array");
+            assert_eq!(
+                cluster.centroid.len(),
+                want_centroid.len(),
+                "{label}: centroid dimensions"
+            );
+            for (native, expected) in cluster.centroid.iter().zip(want_centroid) {
+                assert!(
+                    close(*native, expected),
+                    "{label}: cluster {} centroid {native} vs {expected}",
+                    cluster.cluster
+                );
+            }
+        }
+
+        // The fixture always splits into the same two groups.
+        let groups: Vec<Vec<String>> = actual.iter().map(|c| c.members.clone()).collect();
+        assert!(
+            groups.iter().any(|g| g == &["r0", "r1", "r2"]),
+            "{label}: {groups:?}"
+        );
+        assert!(
+            groups.iter().any(|g| g == &["r3", "r4", "r5"]),
+            "{label}: {groups:?}"
+        );
+    }
+
+    // Empty rows short-circuit to [] on both paths.
+    let expected = call(
+        &db,
+        "RETURN fn::kmeans($rows, 2, 5)",
+        vec![("rows", json!([]))],
+    )
+    .await;
+    assert!(
+        expected.as_array().expect("array result").is_empty(),
+        "{expected}"
+    );
+    assert!(
+        functions
+            .kmeans_native(&[], 2, 5)
+            .await
+            .expect("native path")
+            .is_empty()
+    );
+}

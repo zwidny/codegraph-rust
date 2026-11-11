@@ -1288,6 +1288,28 @@ impl GraphFunctions {
         Ok(out)
     }
 
+    /// Rust implementation of `fn::kmeans`.
+    ///
+    /// This does **no datastore round-trip**: it adapts the caller's rows to
+    /// [`crate::analysis::clustering::ClusterInput`] and calls
+    /// [`crate::analysis::clustering::kmeans`] directly. The method exists so every migrated
+    /// `fn::*` has a uniformly named `*_native` counterpart.
+    pub async fn kmeans_native(
+        &self,
+        rows: &[(String, Vec<f32>)],
+        k: usize,
+        iterations: usize,
+    ) -> Result<Vec<crate::analysis::clustering::Cluster>> {
+        let inputs: Vec<crate::analysis::clustering::ClusterInput> = rows
+            .iter()
+            .map(|(id, vector)| crate::analysis::clustering::ClusterInput {
+                id: id.clone(),
+                vector: vector.clone(),
+            })
+            .collect();
+        Ok(crate::analysis::clustering::kmeans(&inputs, k, iterations))
+    }
+
     /// Count nodes for the current project (used for health checks)
     pub async fn count_nodes_for_project(&self) -> Result<usize> {
         let mut response = self

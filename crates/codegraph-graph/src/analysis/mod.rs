@@ -20,6 +20,8 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+pub mod clustering;
+
 /// Edge types that count as dependencies, mirroring
 /// `DEFINE PARAM $dependency_edge_types` in `schema/codegraph_v2.surql`.
 ///
