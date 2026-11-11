@@ -627,3 +627,379 @@ async fn native_coupling_metrics_match_surrealdb_function() {
             .is_none()
     );
 }
+
+/// Differential test for `fn::expand` in the `out` direction: the Rust BFS must return the
+/// same node ids, depths and hydrated fields as `fn::get_transitive_dependencies`.
+#[tokio::test]
+async fn native_transitive_dependencies_match_surrealdb_function() {
+    use codegraph_graph::graph_functions::{DependencyNode, GraphFunctions};
+    use std::sync::Arc;
+
+    let db = db_with_fixture().await;
+    db.query(
+        "CREATE type::record('nodes', 'z') SET name = 'foreign_node', node_type = 'Function', \
+         project_id = 'other-project'",
+    )
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
+
+    let surreal_key = |rows: &Value| -> Vec<(String, i64, String, String)> {
+        let mut v: Vec<(String, i64, String, String)> = rows
+            .as_array()
+            .expect("array result")
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap_or_default().to_string(),
+                    r["dependency_depth"].as_i64().unwrap_or_default(),
+                    r["name"].as_str().unwrap_or_default().to_string(),
+                    r["location"]["file_path"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let native_key = |rows: &[DependencyNode]| -> Vec<(String, i64, String, String)> {
+        let mut v: Vec<(String, i64, String, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    r.dependency_depth.unwrap_or_default() as i64,
+                    r.name.clone(),
+                    r.location
+                        .as_ref()
+                        .map(|l| l.file_path.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // a -> b -> c -> a and b -> d means: b@1, c@2, d@2. Depths above 2 add nothing.
+    let calls_from_a = |depth: i64| -> Vec<(String, i64, String, String)> {
+        if depth == 1 {
+            vec![("nodes:b".into(), 1, "load_file".into(), "src/io.rs".into())]
+        } else {
+            vec![
+                ("nodes:b".into(), 1, "load_file".into(), "src/io.rs".into()),
+                ("nodes:c".into(), 2, "read".into(), "src/io.rs".into()),
+                (
+                    "nodes:d".into(),
+                    2,
+                    "ConfigLoader".into(),
+                    "src/loader.rs".into(),
+                ),
+            ]
+        }
+    };
+
+    for depth in [1_i32, 2, 3, 5, 0, 11] {
+        let expected = call(
+            &db,
+            "RETURN fn::get_transitive_dependencies($p, $n, 'calls', $d)",
+            vec![
+                ("p", json!(PROJECT)),
+                ("n", json!("nodes:a")),
+                ("d", json!(depth)),
+            ],
+        )
+        .await;
+        let actual = functions
+            .get_transitive_dependencies_native("nodes:a", "calls", depth)
+            .await
+            .expect("native path");
+
+        // dep 0 and dep 11 are both out of range, so they must behave like the default of 3.
+        let effective = if (1..=10).contains(&depth) {
+            depth as i64
+        } else {
+            3
+        };
+        assert_eq!(
+            native_key(&actual),
+            calls_from_a(effective),
+            "unexpected native rows at depth {depth}"
+        );
+        assert_eq!(
+            native_key(&actual),
+            surreal_key(&expected),
+            "transitive dependencies diverged at depth {depth}"
+        );
+    }
+
+    // Hydrated fields carry the same shape as fn::node_info.
+    let rows = functions
+        .get_transitive_dependencies_native("nodes:a", "calls", 3)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].language.as_deref(), Some("rust"));
+    assert_eq!(
+        rows[0].content.as_deref(),
+        Some("fn load_file(path: &str) -> String { read(path) }")
+    );
+    assert!(rows.iter().all(|r| r.dependent_depth.is_none()));
+
+    // edge_type filtering: d imports a, and d has no outgoing calls.
+    let imports = functions
+        .get_transitive_dependencies_native("nodes:d", "imports", 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        native_key(&imports),
+        vec![(
+            "nodes:a".into(),
+            1,
+            "parse_config".into(),
+            "src/config.rs".into()
+        )]
+    );
+    let expected = call(
+        &db,
+        "RETURN fn::get_transitive_dependencies($p, $n, 'imports', 3)",
+        vec![("p", json!(PROJECT)), ("n", json!("nodes:d"))],
+    )
+    .await;
+    assert_eq!(native_key(&imports), surreal_key(&expected));
+
+    let no_calls = functions
+        .get_transitive_dependencies_native("nodes:d", "calls", 3)
+        .await
+        .unwrap();
+    assert!(no_calls.is_empty(), "{no_calls:?}");
+
+    // Unknown node, foreign project node, and empty id all yield [] like the stored procedure.
+    for probe in ["nodes:does_not_exist", "does_not_exist", "nodes:z", "z"] {
+        let actual = functions
+            .get_transitive_dependencies_native(probe, "calls", 3)
+            .await
+            .unwrap();
+        assert!(actual.is_empty(), "{probe} should expand to nothing");
+        let expected = call(
+            &db,
+            "RETURN fn::get_transitive_dependencies($p, $n, 'calls', 3)",
+            vec![("p", json!(PROJECT)), ("n", json!(probe))],
+        )
+        .await;
+        assert!(surreal_key(&expected).is_empty(), "{probe} (surrealql)");
+    }
+
+    // fn::resolve_node accepts the bare and escaped id shapes too.
+    for alternate in ["a", "nodes:`a`"] {
+        let actual = functions
+            .get_transitive_dependencies_native(alternate, "calls", 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            native_key(&actual),
+            calls_from_a(3),
+            "id shape {alternate} must resolve to node a"
+        );
+    }
+
+    // An empty edge name falls back to `calls`, matching `$edge_type ?? 'calls'` intent.
+    let defaulted = functions
+        .get_transitive_dependencies_native("nodes:a", "", 3)
+        .await
+        .unwrap();
+    assert_eq!(native_key(&defaulted), calls_from_a(3));
+
+    // An empty id has no node to resolve and must not query the datastore.
+    assert!(
+        functions
+            .get_transitive_dependencies_native("", "calls", 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Differential test for `fn::expand` in the `in` direction: the reverse walk must match
+/// `fn::get_reverse_dependencies` and report depth through `dependent_depth`.
+#[tokio::test]
+async fn native_reverse_dependencies_match_surrealdb_function() {
+    use codegraph_graph::graph_functions::{DependencyNode, GraphFunctions};
+    use std::sync::Arc;
+
+    let db = db_with_fixture().await;
+    db.query(
+        "CREATE type::record('nodes', 'z') SET name = 'foreign_node', node_type = 'Function', \
+         project_id = 'other-project'",
+    )
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    let functions = GraphFunctions::new_with_project_id(Arc::new(db.clone()), PROJECT);
+
+    let surreal_key = |rows: &Value| -> Vec<(String, i64, String)> {
+        let mut v: Vec<(String, i64, String)> = rows
+            .as_array()
+            .expect("array result")
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap_or_default().to_string(),
+                    r["dependent_depth"].as_i64().unwrap_or_default(),
+                    r["name"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let native_key = |rows: &[DependencyNode]| -> Vec<(String, i64, String)> {
+        let mut v: Vec<(String, i64, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    r.dependent_depth.unwrap_or_default() as i64,
+                    r.name.clone(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // Reverse calls from c: b calls c (@1), a calls b (@2). The cycle stops there.
+    let expected_c = vec![
+        ("nodes:a".into(), 2, "parse_config".into()),
+        ("nodes:b".into(), 1, "load_file".into()),
+    ];
+    // Reverse calls from d: b (@1), a (@2), c (@3).
+    let expected_d = vec![
+        ("nodes:a".into(), 2, "parse_config".into()),
+        ("nodes:b".into(), 1, "load_file".into()),
+        ("nodes:c".into(), 3, "read".into()),
+    ];
+
+    for (node, depth) in [("c", 1_i32), ("c", 2), ("c", 3), ("c", 0), ("c", 11)] {
+        let expected = call(
+            &db,
+            "RETURN fn::get_reverse_dependencies($p, $n, 'calls', $d)",
+            vec![
+                ("p", json!(PROJECT)),
+                ("n", json!(format!("nodes:{node}"))),
+                ("d", json!(depth)),
+            ],
+        )
+        .await;
+        let actual = functions
+            .get_reverse_dependencies_native(node, "calls", depth)
+            .await
+            .expect("native path");
+
+        let want = if depth == 1 {
+            vec![("nodes:b".into(), 1, "load_file".into())]
+        } else {
+            expected_c.clone()
+        };
+        assert_eq!(
+            native_key(&actual),
+            want,
+            "reverse of {node} at depth {depth}"
+        );
+        assert_eq!(
+            native_key(&actual),
+            surreal_key(&expected),
+            "reverse dependencies diverged for {node} at depth {depth}"
+        );
+    }
+
+    for depth in [2_i32, 3, 10] {
+        let expected = call(
+            &db,
+            "RETURN fn::get_reverse_dependencies($p, $n, 'calls', $d)",
+            vec![
+                ("p", json!(PROJECT)),
+                ("n", json!("nodes:d")),
+                ("d", json!(depth)),
+            ],
+        )
+        .await;
+        let actual = functions
+            .get_reverse_dependencies_native("d", "calls", depth)
+            .await
+            .unwrap();
+        let want = if depth == 2 {
+            expected_d[..2].to_vec()
+        } else {
+            expected_d.clone()
+        };
+        assert_eq!(native_key(&actual), want, "reverse of d at depth {depth}");
+        assert_eq!(native_key(&actual), surreal_key(&expected));
+    }
+
+    // Reverse of the cycle start only sees one level back before the visited set closes it.
+    let from_a = functions
+        .get_reverse_dependencies_native("a", "calls", 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        native_key(&from_a),
+        vec![
+            ("nodes:b".into(), 2, "load_file".into()),
+            ("nodes:c".into(), 1, "read".into()),
+        ]
+    );
+
+    // The reverse path stores its level in dependent_depth only.
+    let rows = functions
+        .get_reverse_dependencies_native("c", "calls", 3)
+        .await
+        .unwrap();
+    assert!(rows.iter().all(|r| r.dependency_depth.is_none()));
+    assert!(rows.iter().all(|r| r.dependent_depth.is_some()));
+
+    // Imports edge runs d -> a, so reverse-imports from a reaches d.
+    let imports = functions
+        .get_reverse_dependencies_native("a", "imports", 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        native_key(&imports),
+        vec![("nodes:d".into(), 1, "ConfigLoader".into())]
+    );
+    let expected = call(
+        &db,
+        "RETURN fn::get_reverse_dependencies($p, $n, 'imports', 1)",
+        vec![("p", json!(PROJECT)), ("n", json!("nodes:a"))],
+    )
+    .await;
+    assert_eq!(native_key(&imports), surreal_key(&expected));
+
+    // Unknown / foreign start nodes return [].
+    for probe in ["nodes:does_not_exist", "does_not_exist", "nodes:z", "z"] {
+        let actual = functions
+            .get_reverse_dependencies_native(probe, "calls", 3)
+            .await
+            .unwrap();
+        assert!(actual.is_empty(), "{probe} should expand to nothing");
+        let expected = call(
+            &db,
+            "RETURN fn::get_reverse_dependencies($p, $n, 'calls', 3)",
+            vec![("p", json!(PROJECT)), ("n", json!(probe))],
+        )
+        .await;
+        assert!(surreal_key(&expected).is_empty(), "{probe} (surrealql)");
+    }
+
+    assert!(
+        functions
+            .get_reverse_dependencies_native("", "calls", 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

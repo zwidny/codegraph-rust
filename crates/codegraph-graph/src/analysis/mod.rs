@@ -128,12 +128,258 @@ pub fn hubs(edges: &[EdgeRow], edge_types: &[&str], min_degree: usize) -> Vec<(S
     ranked
 }
 
+/// Traversal direction for [`expand_bfs`].
+///
+/// `fn::expand($project_id, $start, $edge_name, $direction, $max_depth)` accepts `'out'`
+/// for dependencies and `'in'` for dependents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Follow edges backwards (`to` -> `from`), i.e. dependents.
+    In,
+    /// Follow edges forwards (`from` -> `to`), i.e. dependencies.
+    Out,
+}
+
+/// Depth clamp used by `fn::get_transitive_dependencies` and `fn::get_reverse_dependencies`:
+/// values in `1..=10` are honoured, anything else falls back to 3.
+pub fn safe_depth(requested: i32) -> usize {
+    if (1..=10).contains(&requested) {
+        requested as usize
+    } else {
+        3
+    }
+}
+
+/// Breadth-first expansion over one edge type, mirroring `fn::expand`.
+///
+/// Returns `(node_id, depth)` pairs with the first depth each node was reached at, in
+/// discovery order. The start node is seeded into `visited`, so a cycle never re-visits it
+/// and a self-loop is dropped.
+///
+/// Unlike the SurrealQL fold this walks every edge row once per level; filtering by
+/// `edge_type` happens here rather than in the query so the function stays pure.
+pub fn expand_bfs(
+    edges: &[EdgeRow],
+    start: &str,
+    edge_type: &str,
+    direction: Direction,
+    max_depth: usize,
+) -> Vec<(String, usize)> {
+    let wanted = edge_type.to_ascii_lowercase();
+
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(start.to_string());
+    let mut frontier: Vec<String> = vec![start.to_string()];
+    let mut reached: Vec<(String, usize)> = Vec::new();
+
+    for depth in 1..=max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+        let current: HashSet<&str> = frontier.iter().map(String::as_str).collect();
+
+        let mut next: Vec<String> = Vec::new();
+        let mut queued: HashSet<String> = HashSet::new();
+        for edge in edges {
+            if edge.edge_type.to_ascii_lowercase() != wanted {
+                continue;
+            }
+            // `in` walks `to` -> `from`; `out` walks `from` -> `to`.
+            let (anchor, candidate) = match direction {
+                Direction::In => (&edge.to, &edge.from),
+                Direction::Out => (&edge.from, &edge.to),
+            };
+            if !current.contains(anchor.as_str()) {
+                continue;
+            }
+            if visited.contains(candidate) || !queued.insert(candidate.clone()) {
+                continue;
+            }
+            next.push(candidate.clone());
+        }
+
+        for id in &next {
+            visited.insert(id.clone());
+        }
+        reached.extend(next.iter().map(|id| (id.clone(), depth)));
+        frontier = next;
+    }
+
+    reached
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn edge(from: &str, to: &str, kind: &str) -> EdgeRow {
         EdgeRow::new(from, to, kind)
+    }
+
+    fn expand(
+        edges: &[EdgeRow],
+        start: &str,
+        kind: &str,
+        direction: Direction,
+        depth: i32,
+    ) -> Vec<(String, usize)> {
+        expand_bfs(edges, start, kind, direction, safe_depth(depth))
+    }
+
+    /// Fixture mirroring the differential test: a -> b -> c -> a (calls), b -> d (calls),
+    /// d -> a (imports).
+    fn chain() -> Vec<EdgeRow> {
+        vec![
+            edge("nodes:a", "nodes:b", "calls"),
+            edge("nodes:b", "nodes:c", "calls"),
+            edge("nodes:c", "nodes:a", "calls"),
+            edge("nodes:b", "nodes:d", "calls"),
+            edge("nodes:d", "nodes:a", "imports"),
+        ]
+    }
+
+    #[test]
+    fn expand_bfs_honours_the_depth_limit() {
+        let edges = chain();
+        assert_eq!(
+            expand(&edges, "nodes:a", "calls", Direction::Out, 1),
+            vec![("nodes:b".to_string(), 1)]
+        );
+        assert_eq!(
+            expand(&edges, "nodes:a", "calls", Direction::Out, 2),
+            vec![
+                ("nodes:b".to_string(), 1),
+                ("nodes:c".to_string(), 2),
+                ("nodes:d".to_string(), 2)
+            ]
+        );
+        // Nothing new appears at depth 3, so it matches depth 2 rather than repeating.
+        assert_eq!(
+            expand(&edges, "nodes:a", "calls", Direction::Out, 3),
+            expand(&edges, "nodes:a", "calls", Direction::Out, 2)
+        );
+    }
+
+    #[test]
+    fn safe_depth_falls_back_to_three() {
+        assert_eq!(safe_depth(1), 1);
+        assert_eq!(safe_depth(10), 10);
+        for rejected in [0, -1, 11, 100] {
+            assert_eq!(safe_depth(rejected), 3, "depth {rejected}");
+        }
+        // The default is what the stored procedure actually walks.
+        let edges = chain();
+        assert_eq!(
+            expand(&edges, "nodes:a", "calls", Direction::Out, 0),
+            expand(&edges, "nodes:a", "calls", Direction::Out, 3)
+        );
+        assert_eq!(
+            expand(&edges, "nodes:a", "calls", Direction::Out, 11),
+            expand(&edges, "nodes:a", "calls", Direction::Out, 3)
+        );
+    }
+
+    #[test]
+    fn expand_bfs_does_not_revisit_nodes_in_a_cycle() {
+        let edges = chain();
+        let reached = expand(&edges, "nodes:c", "calls", Direction::Out, 10);
+        // c -> a -> b -> c would loop forever without the visited set.
+        assert_eq!(
+            reached,
+            vec![
+                ("nodes:a".to_string(), 1),
+                ("nodes:b".to_string(), 2),
+                ("nodes:d".to_string(), 3),
+            ]
+        );
+        let ids: Vec<&str> = reached.iter().map(|(id, _)| id.as_str()).collect();
+        let unique: HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len(), "each node is reached once");
+        assert!(
+            !ids.contains(&"nodes:c"),
+            "the start node must stay excluded"
+        );
+    }
+
+    #[test]
+    fn expand_bfs_direction_in_and_out_differ() {
+        let edges = chain();
+        let out = expand(&edges, "nodes:c", "calls", Direction::Out, 3);
+        let incoming = expand(&edges, "nodes:c", "calls", Direction::In, 3);
+        assert_eq!(
+            out,
+            vec![
+                ("nodes:a".to_string(), 1),
+                ("nodes:b".to_string(), 2),
+                ("nodes:d".to_string(), 3),
+            ]
+        );
+        assert_eq!(
+            incoming,
+            vec![("nodes:b".to_string(), 1), ("nodes:a".to_string(), 2),]
+        );
+    }
+
+    #[test]
+    fn expand_bfs_filters_by_edge_type() {
+        let edges = chain();
+        assert!(expand(&edges, "nodes:a", "imports", Direction::Out, 3).is_empty());
+        assert_eq!(
+            expand(&edges, "nodes:d", "imports", Direction::Out, 1),
+            vec![("nodes:a".to_string(), 1)]
+        );
+        // The imports edge must not leak into a calls walk.
+        assert!(expand(&edges, "nodes:d", "calls", Direction::Out, 3).is_empty());
+        // Type matching is case-insensitive, like `string::lowercase($edge_type)`.
+        assert_eq!(
+            expand(&edges, "nodes:d", "IMPORTS", Direction::Out, 1),
+            vec![("nodes:a".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn expand_bfs_drops_self_loops() {
+        let edges = vec![
+            edge("nodes:a", "nodes:a", "calls"),
+            edge("nodes:a", "nodes:b", "calls"),
+        ];
+        assert_eq!(
+            expand(&edges, "nodes:a", "calls", Direction::Out, 10),
+            vec![("nodes:b".to_string(), 1)]
+        );
+        // A start node with only a self-loop reaches nothing at all.
+        let only_loop = vec![edge("nodes:z", "nodes:z", "calls")];
+        assert!(expand(&only_loop, "nodes:z", "calls", Direction::Out, 10).is_empty());
+        assert!(expand(&only_loop, "nodes:z", "calls", Direction::In, 10).is_empty());
+    }
+
+    #[test]
+    fn expand_bfs_on_an_empty_graph_returns_nothing() {
+        assert!(expand(&[], "nodes:a", "calls", Direction::Out, 3).is_empty());
+        assert!(expand(&[], "nodes:a", "calls", Direction::In, 3).is_empty());
+    }
+
+    #[test]
+    fn expand_bfs_records_the_first_depth_a_node_is_reached_at() {
+        // a reaches b directly at depth 1 and again through x at depth 2.
+        let edges = vec![
+            edge("nodes:a", "nodes:b", "calls"),
+            edge("nodes:a", "nodes:x", "calls"),
+            edge("nodes:x", "nodes:b", "calls"),
+        ];
+        assert_eq!(
+            expand(&edges, "nodes:a", "calls", Direction::Out, 3),
+            vec![("nodes:b".to_string(), 1), ("nodes:x".to_string(), 1),]
+        );
+    }
+
+    #[test]
+    fn expand_bfs_stops_when_the_frontier_runs_dry() {
+        let edges = vec![edge("nodes:a", "nodes:b", "calls")];
+        assert_eq!(
+            expand(&edges, "nodes:a", "calls", Direction::Out, 10),
+            vec![("nodes:b".to_string(), 1)]
+        );
     }
 
     #[test]

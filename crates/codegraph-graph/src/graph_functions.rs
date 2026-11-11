@@ -755,6 +755,149 @@ impl GraphFunctions {
         Ok(result)
     }
 
+    /// Rust implementation of `fn::get_transitive_dependencies`.
+    ///
+    /// Walks the same BFS as `fn::expand` in the `out` direction and hydrates the reached
+    /// nodes with `fn::node_info`'s column set. Returns rows ordered by `dependency_depth`,
+    /// dropping any id that cannot be hydrated, exactly like the stored procedure.
+    pub async fn get_transitive_dependencies_native(
+        &self,
+        node_id: &str,
+        edge_type: &str,
+        depth: i32,
+    ) -> Result<Vec<DependencyNode>> {
+        self.expand_dependencies_native(node_id, edge_type, depth, crate::analysis::Direction::Out)
+            .await
+    }
+
+    /// Rust implementation of `fn::get_reverse_dependencies`.
+    ///
+    /// Same walk as [`Self::get_transitive_dependencies_native`] in the `in` direction; the
+    /// depth lands in `dependent_depth` rather than `dependency_depth`.
+    pub async fn get_reverse_dependencies_native(
+        &self,
+        node_id: &str,
+        edge_type: &str,
+        depth: i32,
+    ) -> Result<Vec<DependencyNode>> {
+        self.expand_dependencies_native(node_id, edge_type, depth, crate::analysis::Direction::In)
+            .await
+    }
+
+    /// Shared body of the two native dependency walks.
+    async fn expand_dependencies_native(
+        &self,
+        node_id: &str,
+        edge_type: &str,
+        depth: i32,
+        direction: crate::analysis::Direction,
+    ) -> Result<Vec<DependencyNode>> {
+        let Some(clean) = normalize_node_id(node_id) else {
+            return Ok(Vec::new());
+        };
+
+        // fn::resolve_node + the project_id guard: a node from another project expands to [].
+        let mut start_response = self
+            .db
+            .query(
+                "SELECT <string>id AS id, project_id FROM nodes \
+                 WHERE id = type::record('nodes', $clean) LIMIT 1",
+            )
+            .bind(("clean", clean.clone()))
+            .await
+            .map_err(|e| {
+                CodeGraphError::Database(format!("native dependency start failed: {e}"))
+            })?;
+        let start_raw: Option<SurrealValue> = start_response.take(0).map_err(|e| {
+            CodeGraphError::Database(format!("native dependency start decode: {e}"))
+        })?;
+        let start_json = start_raw
+            .map(surreal_to_json)
+            .unwrap_or(serde_json::Value::Null);
+        // `LIMIT 1` hands back the single row (the SDK unwraps the one-element array); a
+        // missing node arrives as null / `None`.
+        if !start_json.is_object() {
+            return Ok(Vec::new());
+        }
+        let start = &start_json;
+        let Some(start_id) = start.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
+            return Ok(Vec::new());
+        };
+        match start.get("project_id").and_then(|v| v.as_str()) {
+            Some(project) if project == self.project_id.as_str() => {}
+            _ => return Ok(Vec::new()),
+        }
+
+        // `string::lowercase($edge_type ?? 'calls')`; an empty name also means the default.
+        let edge_name = if edge_type.trim().is_empty() {
+            "calls".to_string()
+        } else {
+            edge_type.to_ascii_lowercase()
+        };
+
+        let edges: Vec<crate::analysis::EdgeRow> = self
+            .db
+            .query(
+                "SELECT <string>`from` AS `from`, <string>`to` AS `to`, edge_type \
+                 FROM edges WHERE project_id = $project_id AND edge_type = $edge_type",
+            )
+            .bind(("project_id", self.project_id.clone()))
+            .bind(("edge_type", edge_name.clone()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native dependency edge load: {e}")))?
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("native dependency edge decode: {e}")))?;
+
+        let reached = crate::analysis::expand_bfs(
+            &edges,
+            &start_id,
+            &edge_name,
+            direction,
+            crate::analysis::safe_depth(depth),
+        );
+        if reached.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<String> = reached.iter().map(|(id, _)| id.clone()).collect();
+        let infos: Vec<NodeInfo> = self
+            .db
+            .query(
+                "SELECT <string>id AS id, name, node_type AS kind, language, content, metadata, \
+                 { end_line: end_line, file_path: file_path, start_line: start_line } AS location \
+                 FROM nodes WHERE <string>id IN $ids",
+            )
+            .bind(("ids", ids))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("native dependency node load: {e}")))?
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("native dependency node decode: {e}")))?;
+        let by_id: std::collections::HashMap<String, NodeInfo> =
+            infos.into_iter().map(|n| (n.id.clone(), n)).collect();
+
+        // `reached` is already ordered by depth; `fn::node_info` failures are dropped.
+        let is_reverse = direction == crate::analysis::Direction::In;
+        let mut out = Vec::with_capacity(reached.len());
+        for (id, level) in reached {
+            let Some(node) = by_id.get(&id) else {
+                continue;
+            };
+            let level = Some(level as i32);
+            out.push(DependencyNode {
+                id: node.id.clone(),
+                name: node.name.clone(),
+                kind: node.kind.clone(),
+                location: node.location.clone(),
+                language: node.language.clone(),
+                content: node.content.clone(),
+                metadata: node.metadata.clone(),
+                dependency_depth: if is_reverse { None } else { level },
+                dependent_depth: if is_reverse { level } else { None },
+            });
+        }
+        Ok(out)
+    }
+
     /// Summarize a node and the relationship types that touch it.
     ///
     /// Diagnostic helper: when a dependency query returns nothing, callers need to tell

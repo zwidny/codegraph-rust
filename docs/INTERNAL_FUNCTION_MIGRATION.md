@@ -43,12 +43,22 @@ scoring, dedupe, context assembly and every graph algorithm.
 
 | # | Functions | Risk | Status |
 |---|---|---|---|
-| 1 | `mutual_pairs` (cycles), `degrees`/`hubs`, `coupling` | low | cycles + hubs算法 done in `analysis`; DB wiring pending |
-| 2 | `expand`, `get_transitive_dependencies`, `get_reverse_dependencies`, `trace_call_chain` | medium | not started |
+| 1 | `mutual_pairs` (cycles), `degrees`/`hubs`, `coupling` | low | done |
+| 2 | `expand`, `get_transitive_dependencies`, `get_reverse_dependencies` | medium | done; `trace_call_chain` pending |
 | 3 | `get_complexity_hotspots`, `find_nodes_by_name`, `get_top_directories`, `count_nodes_for_project` | low | not started |
 | 4 | `knn_chunks`, `knn_nodes`, `semantic_search_*`, `search_snippets` | medium-high (keeps HNSW SQL) | not started |
 | 5 | `kmeans` | medium | not started |
 | 6 | helpers: `edge_types`, `parse_record_id`, `resolve_node`, `node_info`, `edge_context` | low | not started |
+
+### Known differences for batch 2 (deliberate, do not "fix" silently)
+
+| Difference | Detail | Action |
+|---|---|---|
+| `chunks:` start ids | `fn::resolve_node` maps `chunks:x` to its `parent_node`; the native walk only resolves `nodes:`. | Add a follow-up task; the native methods have no caller yet, so this is not a regression. |
+| `requested_depth` | The SurrealQL functions return it; `DependencyNode` has no such field, and the pre-existing Rust path also drops it. | Leave as-is; changing the struct is out of scope. |
+| empty `edge_type` | `$edge_type ?? 'calls'` only defaults `NONE`/null, so `''` searches for the empty edge type. The native path treats `''` as `calls`. | Intentional: empty string is not a meaningful edge type. Documented here because it is not differentially covered. |
+| same-depth ordering | `ORDER BY depth` has no tie-break; the native path emits BFS discovery order. | Tests compare after sorting by `(id, depth)`, so ordering is not part of the contract. |
+
 
 Each batch: pure function + unit tests, then a `*_native` method beside the existing
 call, then the differential test below, then remove the SurrealQL function.
