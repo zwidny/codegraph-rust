@@ -39,9 +39,8 @@ services:
       - 0.0.0.0:8000
       - --log
       - ${SURREALDB_LOG:-info}
-      # Switch backends with SURREALDB_STORAGE, e.g. `rocksdb:/data`.
-      # RocksDB needs an EMPTY volume: it cannot open a SurrealKV directory, so a
-      # backend switch also means re-indexing every project into the new store.
+      # SurrealDB 4.x removed the RocksDB engine, so this stays surrealkv. A major
+      # version change (or a backend change) needs an EMPTY volume and a full re-index.
       - ${SURREALDB_STORAGE:-surrealkv:/data}
     ports:
       # Bound to the host loopback by default; widen to 0.0.0.0 only if remote

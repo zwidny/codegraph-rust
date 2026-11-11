@@ -89,19 +89,39 @@ CODEGRAPH_SURREALDB_USERNAME=root
 CODEGRAPH_SURREALDB_PASSWORD=...
 ```
 
-## Switching to RocksDB
+## Pin SurrealDB 4.x, not 3.x
 
-RocksDB exposes its own memtable/cache knobs and has different flush behaviour. It may
-work around the SurrealKV stall, but this has **not** been validated against the
-incident yet — treat it as an experiment:
+**4.x is not optional for large projects.** The 3.x datastore bounds memtable residency
+by entry count instead of bytes, so a first-time index of a large project grows the
+memtable past the container limit and the kernel OOM-kills the server. Measured on the
+same EasyTier tree (38057 nodes / 72940 edges) with the same 12g cap:
+
+| Version | Peak RSS | Result |
+|---|---|---|
+| 3.3 | 11.95 GiB | OOM-killed, 39 `Transaction write conflict`, 5 restarts |
+| **4.0.1** | **0.86 GiB** | exit 0, 0 conflicts, 0 WAL rotations |
+
+4.x also makes the block cache demand-allocated, so a 5 GB configured cache does not
+mean 5 GB resident.
+
+RocksDB is **no longer an option**: 4.x removed the RocksDB and IndxDB engines
+(`surrealdb` commit `aa5a4fea0`); `rocksdb:*` settings are ignored with a warning.
+
+### Data directories are not compatible across the major version
+
+A 4.x server refuses to open a directory written by 3.x unless
+`SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X=true` is set, and the conversion is one-way — a
+3.x release cannot open the result afterwards. The supported path is a **fresh volume
+plus re-indexing**:
 
 ```bash
-docker volume create cg-rocksdb-data
-SURREALDB_STORAGE=rocksdb:/data SURREALDB_DATA_VOLUME=cg-rocksdb-data docker compose up -d
+docker volume create cg-server-data-v4
+SURREALDB_IMAGE_TAG=v4 SURREALDB_DATA_VOLUME=cg-server-data-v4 docker compose up -d
+# per project database, apply schema/codegraph_v2.surql, then:
+cd /path/to/project && codegraph index . --index-tier balanced
 ```
 
-RocksDB cannot open a SurrealKV directory, so the new volume starts empty and every
-project must be re-indexed.
+Keep the old volume until the new one is verified; it is the only rollback path.
 
 ## Notes
 
