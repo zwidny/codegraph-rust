@@ -741,6 +741,10 @@ impl GraphFunctions {
     }
 
     pub async fn get_hub_nodes(&self, min_degree: i32) -> Result<Vec<HubNode>> {
+        if native_analysis_enabled() {
+            return self.get_hub_nodes_native(min_degree).await;
+        }
+
         debug!(
             "Calling fn::get_hub_nodes({}, project={})",
             min_degree, self.project_id
@@ -1602,6 +1606,16 @@ pub struct NodeEdgeSummary {
     pub incoming_edge_types: Vec<String>,
     #[serde(default)]
     pub outgoing_edge_types: Vec<String>,
+}
+
+/// `CODEGRAPH_NATIVE_ANALYSIS` selects the Rust implementation for switched-over
+/// analysis methods. Default off: SurrealQL stays authoritative until each method is
+/// proven equal on real data.
+fn native_analysis_enabled() -> bool {
+    matches!(
+        std::env::var("CODEGRAPH_NATIVE_ANALYSIS").as_deref(),
+        Ok("1") | Ok("true") | Ok("native")
+    )
 }
 
 /// Accept the id shapes `fn::resolve_node` accepts: `nodes:x`, `x`, and the
