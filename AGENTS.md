@@ -250,6 +250,23 @@ Rust LSP preflight must verify `rust-analyzer --version` in the target project, 
 
 Useful offline regressions: `cargo test -p codegraph-mcp --lib`, `cargo test -p codegraph-mcp --test reconciliation_test --test daemon_watch`, `cargo test -p codegraph-mcp --features embeddings --test deferred_policy_test`, `cargo test -p codegraph-graph --features surrealdb --test ingestion_write_test`, and `python3 -m unittest discover -s scripts/benchmarks -p 'test_*.py'`. Check the full CLI features after provider/runtime changes. Strict workspace Clippy currently reports existing core/zerocopy diagnostics; disclose that limitation instead of calling a non-strict run lint-clean.
 
+### Generate SCIP before indexing (do not just run `codegraph index`)
+
+`codegraph index` drives one language-server request per file by default: ~21 minutes on a
+10k-file project. Generate a SCIP index first and import it instead:
+
+```bash
+export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"   # rust / TS / Go, per language
+codegraph index . --index-tier balanced
+```
+
+Measured on a 10k-file TypeScript project: analysis 21 min → **2.4 s + 3.9 s import**, plus
+62,711 definition edges the LSP path never produced. `scripts/scip-index.sh` picks the
+indexer per language and writes `.codegraph/scip/`; for an index built inside a
+subdirectory, use the `@subdir` form (`go.scip@easytier-go`). A missing index for a language
+means that language gets **no** enrichment, because setting `CODEGRAPH_SCIP_INDEX` disables
+language servers for the whole run. See `docs/INDEXING_PIPELINE.md` and `TODO.md`.
+
 ## Commit & Pull Request Guidelines
 
 Follow the history's Conventional Commit pattern, e.g. `fix(lsp): prevent premature process kill`. Use semantic PR titles and `.github/PULL_REQUEST_TEMPLATE.md`. Explain motivation, link issues, report validation and performance impact, and update affected documentation. Include screenshots when relevant.

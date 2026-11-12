@@ -44,6 +44,24 @@ Project databases: `EasyTier_8a11a0febb5c`, `codegraph_rust_1954fc594668`,
 
 ## TODO
 
+### 0. Let `codegraph index` generate SCIP itself (today: manual script only)
+
+Current workflow is manual: run `scripts/scip-index.sh`, export
+`CODEGRAPH_SCIP_INDEX`, then index. A fresh session that just runs `codegraph index .`
+silently takes the LSP path (21 min on a 10k-file project instead of ~6 s).
+
+`codegraph index --scip-auto` should:
+
+- detect languages (`Cargo.toml` / `package.json` / `go.mod`)
+- run the matching indexer into `.codegraph/scip/`, cached by content fingerprint
+  (regenerate only when sources or the indexer version change)
+- fall back to LSP with a warning when an indexer is missing or fails
+- offer `--scip-strict` to fail instead of falling back
+
+Acceptance: on a fresh clone with `rust-analyzer` installed, plain `codegraph index .`
+produces a SCIP-backed run with no environment variables set. Until then, `AGENTS.md`
+tells agents to run `scripts/scip-index.sh` first.
+
 ### 1. Per-language analyzer selection (highest priority)
 
 Today `CODEGRAPH_SCIP_INDEX` disables LSP **globally**:
