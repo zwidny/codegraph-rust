@@ -78,6 +78,15 @@ SCIP measured on the same project: **260 s for the whole index** versus 16 min o
 round-trips, 12.3 GB peak (needs `NODE_OPTIONS=--max-old-space-size=16384`; the default
 4 GB heap OOMs in 38 s), producing a 525 MB `index.scip`.
 
+`scip-typescript` embeds no document text and writes no `index.sources.json`. Documents
+without a manifest entry are accepted with a single warning that reports the count;
+an entry that exists but disagrees with the captured source is rejected as stale, and
+`CODEGRAPH_SCIP_TRUST_SOURCE=1` opts out of hash validation entirely. SCIP paths are
+normalised to the same project-relative posix keys as nodes, so indexes built from `.`,
+an absolute root or Windows separators all bind. Import fails loudly when zero documents
+decode or zero documents match an indexed source instead of reporting success with no
+enrichment.
+
 ### Stage 10 — embedding and chunk writes
 
 | control | effect |

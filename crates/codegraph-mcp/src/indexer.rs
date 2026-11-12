@@ -1258,7 +1258,8 @@ impl ProjectIndexer {
             if let Some(path) = &scip_path
                 && analyzer_settings.lsp_enabled()
             {
-                lsp_enrichment_stats.edges_resolved = crate::analyzers::scip::import(
+                let start = std::time::Instant::now();
+                let scip_stats = crate::analyzers::scip::import(
                     path,
                     &self.project_root,
                     &source_snapshots,
@@ -1266,6 +1267,17 @@ impl ProjectIndexer {
                     &mut edges,
                     analyzer_settings.lsp_definitions_enabled(),
                 )?;
+                lsp_enrichment_stats.nodes_enriched = scip_stats.nodes_enriched;
+                lsp_enrichment_stats.edges_resolved = scip_stats.edges_resolved;
+                info!(
+                    "🧠 SCIP import complete: {} nodes enriched + {} edges resolved from {} of {} documents ({} documents had indexed nodes) in {:.1?}",
+                    scip_stats.nodes_enriched,
+                    scip_stats.edges_resolved,
+                    scip_stats.documents_matched,
+                    scip_stats.documents,
+                    scip_stats.documents_with_nodes,
+                    start.elapsed()
+                );
             }
             let mut enrichment_stats = crate::analyzers::enrichment::EnrichmentStats::default();
             if analyzer_settings.enrichment {

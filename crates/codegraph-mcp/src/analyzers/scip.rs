@@ -2,12 +2,41 @@
 // ABOUTME: Streams documents in two passes and validates source identity and position encoding.
 use anyhow::{Result, anyhow, bail};
 use codegraph_core::{CodeNode, EdgeRelationship, EdgeType, NodeId, Span};
-use codegraph_parser::SourceSnapshots;
+use codegraph_parser::{SourceSnapshot, SourceSnapshots};
 use scip::types::{Document, Occurrence};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path},
 };
+use tracing::{debug, warn};
+
+/// Outcome of one SCIP import. `edges_resolved` counts bindings that either
+/// re-pointed an existing edge or materialised a `References` edge; `nodes_enriched`
+/// counts distinct nodes that received compiler symbol/doc metadata.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ImportStats {
+    pub documents: usize,
+    pub documents_matched: usize,
+    pub documents_with_nodes: usize,
+    pub nodes_enriched: usize,
+    pub edges_resolved: usize,
+}
+
+/// Project-relative posix key, identical to `CodeNode::location.file_path`.
+/// SCIP `relative_path` values and captured snapshot paths use different shapes
+/// (`src/a.ts`, `./src/a.ts`, absolute, Windows separators), so every lookup goes
+/// through the same normalisation instead of comparing raw `PathBuf`s.
+fn relative_key(root: &Path, path: &Path) -> String {
+    crate::indexer::normalize_file_path(root, &path.to_string_lossy())
+}
+
+fn document_key(relative_path: &str) -> String {
+    let mut key = relative_path.replace('\\', "/");
+    while let Some(stripped) = key.strip_prefix("./") {
+        key = stripped.to_string();
+    }
+    key
+}
 
 fn documents(path: &Path, mut visit: impl FnMut(Document) -> Result<()>) -> Result<()> {
     let mut file = std::fs::File::open(path)?;
@@ -101,11 +130,12 @@ fn byte_position(
     bail!("SCIP column is invalid or document position encoding is unspecified")
 }
 fn source<'a>(
-    root: &Path,
     document: &Document,
-    sources: &'a SourceSnapshots,
+    by_relative: &'a BTreeMap<String, &'a SourceSnapshot>,
     manifest: &BTreeMap<String, String>,
-) -> Result<Option<&'a codegraph_parser::SourceSnapshot>> {
+    trust_source: bool,
+    missing_manifest: &mut usize,
+) -> Result<Option<&'a SourceSnapshot>> {
     let path = Path::new(&document.relative_path);
     if path.is_absolute()
         || path
@@ -114,20 +144,33 @@ fn source<'a>(
     {
         bail!("SCIP document path escapes the project");
     }
-    let Some(source) = sources.get(root.join(path)) else {
+    let key = document_key(&document.relative_path);
+    let Some(source) = by_relative.get(&key) else {
         return Ok(None);
     };
     if !document.text.is_empty() {
         if document.text.as_str() != source.contents()?.as_ref() {
             bail!("SCIP source is stale: {}", document.relative_path);
         }
-    } else if manifest.get(&document.relative_path) != Some(&source.content_hash)
-        && std::env::var("CODEGRAPH_SCIP_TRUST_SOURCE").as_deref() != Ok("1")
-    {
-        bail!(
-            "SCIP source hash missing or stale for {}; supply index.sources.json captured with the compiler index, or explicitly set CODEGRAPH_SCIP_TRUST_SOURCE=1",
-            document.relative_path
-        );
+    } else if !trust_source {
+        match manifest
+            .get(&document.relative_path)
+            .or_else(|| manifest.get(&key))
+        {
+            Some(expected) if *expected != source.content_hash => bail!(
+                "SCIP source hash is stale for {}: index.sources.json records {}, source is {}; regenerate the compiler index or set CODEGRAPH_SCIP_TRUST_SOURCE=1",
+                document.relative_path,
+                expected,
+                source.content_hash
+            ),
+            Some(_) => {}
+            None => {
+                // scip-typescript never writes index.sources.json and leaves
+                // Document.text empty, so cannot be hash-validated. Trust the
+                // compiler index for missing entries but report it, never silently.
+                *missing_manifest += 1;
+            }
+        }
     }
     Ok(Some(source))
 }
@@ -166,32 +209,63 @@ pub fn import(
     nodes: &mut [CodeNode],
     edges: &mut Vec<EdgeRelationship>,
     references: bool,
-) -> Result<usize> {
+) -> Result<ImportStats> {
     let manifest: BTreeMap<String, String> =
         match std::fs::read(path.with_extension("sources.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => return Err(error.into()),
         };
+    let trust_source = std::env::var("CODEGRAPH_SCIP_TRUST_SOURCE").as_deref() == Ok("1");
+    // Index snapshots by the same project-relative posix key used for nodes. Raw
+    // `sources.get(root.join(relative_path))` silently missed every document when the
+    // indexer walked `.` (snapshot keys `./src/a.ts`) or when SCIP paths used `\`.
+    let mut by_relative = BTreeMap::<String, &SourceSnapshot>::new();
+    for snapshot in sources.iter() {
+        by_relative
+            .entry(relative_key(root, &snapshot.path))
+            .or_insert(snapshot);
+    }
     let mut by_file = BTreeMap::<String, Vec<usize>>::new();
     for (index, node) in nodes.iter().enumerate() {
         by_file
-            .entry(node.location.file_path.clone())
+            .entry(relative_key(root, Path::new(&node.location.file_path)))
             .or_default()
             .push(index);
     }
+    let mut stats = ImportStats {
+        documents: 0,
+        ..Default::default()
+    };
+    let mut missing_manifest = 0usize;
+    let mut unmatched = 0usize;
+    let mut unmatched_example: Option<String> = None;
+    let mut enriched = BTreeSet::<usize>::new();
     let mut definitions = BTreeMap::<String, BTreeSet<NodeId>>::new();
     documents(path, |document| {
-        let Some(snapshot) = source(root, &document, sources, &manifest)? else {
+        stats.documents += 1;
+        let Some(snapshot) = source(
+            &document,
+            &by_relative,
+            &manifest,
+            trust_source,
+            &mut missing_manifest,
+        )?
+        else {
+            unmatched += 1;
+            unmatched_example.get_or_insert_with(|| document.relative_path.clone());
             return Ok(());
         };
+        stats.documents_matched += 1;
         let text = snapshot.contents()?;
         let starts: Vec<_> = std::iter::once(0)
             .chain(text.match_indices('\n').map(|(offset, _)| offset + 1))
             .collect();
-        let Some(indices) = by_file.get(&snapshot.path.to_string_lossy().into_owned()) else {
+        let file_key = relative_key(root, &snapshot.path);
+        let Some(indices) = by_file.get(&file_key) else {
             return Ok(());
         };
+        stats.documents_with_nodes += 1;
         let docs: BTreeMap<_, _> = document
             .symbols
             .iter()
@@ -231,6 +305,7 @@ pub fn import(
                     .metadata
                     .attributes
                     .insert("scip_symbol".into(), occurrence.symbol.clone());
+                enriched.insert(index);
                 if let Some(documentation) = docs.get(occurrence.symbol.as_str())
                     && !documentation.is_empty()
                 {
@@ -243,16 +318,38 @@ pub fn import(
         }
         Ok(())
     })?;
+    // Index existing edges by (caller, start byte): SCIP emits millions of reference
+    // occurrences, and rescanning every edge per occurrence is quadratic.
+    let mut edges_by_caller_start = BTreeMap::<(NodeId, u32), Vec<usize>>::new();
+    let mut edges_by_caller = BTreeMap::<NodeId, Vec<usize>>::new();
+    for (index, edge) in edges.iter().enumerate() {
+        edges_by_caller.entry(edge.from).or_default().push(index);
+        if let Some(span) = &edge.span {
+            edges_by_caller_start
+                .entry((edge.from, span.start_byte))
+                .or_default()
+                .push(index);
+        }
+    }
     let mut resolved = 0;
+    let mut second_pass_missing_manifest = 0usize;
     documents(path, |document| {
-        let Some(snapshot) = source(root, &document, sources, &manifest)? else {
+        let Some(snapshot) = source(
+            &document,
+            &by_relative,
+            &manifest,
+            trust_source,
+            &mut second_pass_missing_manifest,
+        )?
+        else {
             return Ok(());
         };
         let text = snapshot.contents()?;
         let starts: Vec<_> = std::iter::once(0)
             .chain(text.match_indices('\n').map(|(offset, _)| offset + 1))
             .collect();
-        let Some(indices) = by_file.get(&snapshot.path.to_string_lossy().into_owned()) else {
+        let file_key = relative_key(root, &snapshot.path);
+        let Some(indices) = by_file.get(&file_key) else {
             return Ok(());
         };
         for occurrence in &document.occurrences {
@@ -287,18 +384,26 @@ pub fn import(
                 continue;
             };
             let mut matched = false;
-            for edge in edges.iter_mut().filter(|edge| {
-                edge.from == nodes[caller].id
-                    && edge
-                        .to
-                        .rsplit([':', '.'])
-                        .next()
-                        .map(|name| name.trim_start_matches("r#"))
-                        == Some(text[start..end].trim_start_matches("r#"))
-                    && edge.span.as_ref().is_some_and(|span| {
-                        span.start_byte as usize == start && end <= span.end_byte as usize
-                    })
-            }) {
+            let name = text[start..end].trim_start_matches("r#");
+            let candidates = edges_by_caller_start
+                .get(&(nodes[caller].id, start as u32))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for &index in candidates {
+                let edge = &mut edges[index];
+                if edge
+                    .to
+                    .rsplit([':', '.'])
+                    .next()
+                    .map(|name| name.trim_start_matches("r#"))
+                    != Some(name)
+                    || !edge
+                        .span
+                        .as_ref()
+                        .is_some_and(|span| end <= span.end_byte as usize)
+                {
+                    continue;
+                }
                 edge.metadata
                     .insert("target_node_id".into(), target.to_string());
                 edge.metadata.insert("analyzer".into(), "scip".into());
@@ -306,6 +411,42 @@ pub fn import(
                     .insert("analyzer_confidence".into(), "1.0".into());
                 matched = true;
                 resolved += 1;
+            }
+            // Member/receiver calls record the callee identifier inside a wider span that
+            // starts at the receiver (`obj.method()`), so the exact start-byte index misses
+            // them. Fall back to the narrowest same-name span containing the identifier.
+            if !matched && let Some(candidates) = edges_by_caller.get(&nodes[caller].id) {
+                let mut ranked: Vec<usize> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        let edge = &edges[index];
+                        edge.to
+                            .rsplit([':', '.'])
+                            .next()
+                            .map(|value| value.trim_start_matches("r#"))
+                            == Some(name)
+                            && edge.span.as_ref().is_some_and(|span| {
+                                span.start_byte as usize <= start && end <= span.end_byte as usize
+                            })
+                    })
+                    .collect();
+                ranked.sort_by_key(|&index| {
+                    edges[index]
+                        .span
+                        .as_ref()
+                        .map_or(u32::MAX, |span| span.end_byte - span.start_byte)
+                });
+                if let Some(&index) = ranked.first() {
+                    let edge = &mut edges[index];
+                    edge.metadata
+                        .insert("target_node_id".into(), target.to_string());
+                    edge.metadata.insert("analyzer".into(), "scip".into());
+                    edge.metadata
+                        .insert("analyzer_confidence".into(), "1.0".into());
+                    matched = true;
+                    resolved += 1;
+                }
             }
             if !matched && references {
                 edges.push(EdgeRelationship {
@@ -330,7 +471,44 @@ pub fn import(
         }
         Ok(())
     })?;
-    Ok(resolved)
+    stats.nodes_enriched = enriched.len();
+    stats.edges_resolved = resolved;
+    if stats.documents == 0 {
+        bail!(
+            "SCIP index {} contains no documents; regenerate it with a supported SCIP indexer",
+            path.display()
+        );
+    }
+    if stats.documents_matched == 0 {
+        bail!(
+            "SCIP index {} matched 0 of {} documents to indexed sources; the artifact was built against a different project root or path layout",
+            path.display(),
+            stats.documents
+        );
+    }
+    if missing_manifest > 0 {
+        warn!(
+            "SCIP: {} of {} documents have no index.sources.json hash; trusting the compiler index for them (set CODEGRAPH_SCIP_TRUST_SOURCE=1 to silence)",
+            missing_manifest, stats.documents
+        );
+    }
+    if unmatched > 0 {
+        warn!(
+            "SCIP: {} of {} documents had no indexed source snapshot and were skipped (first: {})",
+            unmatched,
+            stats.documents,
+            unmatched_example.as_deref().unwrap_or("<unknown>")
+        );
+    }
+    debug!(
+        "SCIP import: documents={} matched={} with_nodes={} nodes_enriched={} edges_resolved={}",
+        stats.documents,
+        stats.documents_matched,
+        stats.documents_with_nodes,
+        stats.nodes_enriched,
+        stats.edges_resolved
+    );
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -425,11 +603,135 @@ mod tests {
                 &mut edges,
                 false
             )?,
-            1
+            ImportStats {
+                documents: 1,
+                documents_matched: 1,
+                documents_with_nodes: 1,
+                nodes_enriched: 1,
+                edges_resolved: 1,
+            }
         );
         assert_eq!(edges[0].metadata["target_node_id"], nodes[0].id.to_string());
         index.documents[0].text = "old source".into();
         std::fs::write(&artifact, index.write_to_bytes()?)?;
+        assert!(
+            import(
+                &artifact,
+                root.path(),
+                &sources,
+                &mut nodes,
+                &mut edges,
+                false
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    /// scip-typescript writes empty `Document.text` and no `index.sources.json`, while
+    /// nodes carry project-relative paths. The importer must still bind against the
+    /// captured snapshots instead of silently returning zero.
+    #[tokio::test]
+    async fn project_relative_paths_without_manifest_still_import() -> Result<()> {
+        use codegraph_core::{Language, Location, NodeType};
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("src"))?;
+        let path = root.path().join("src/a.ts");
+        let text = "export function target() {}\nexport function caller() { target(); }\n";
+        std::fs::write(&path, text)?;
+        let sources =
+            SourceSnapshots::capture(&[(path.clone(), text.len() as u64)], 1024, 1).await?;
+        let make_node = |name: &str, start, end| {
+            let mut node = CodeNode::new(
+                name,
+                Some(NodeType::Function),
+                Some(Language::TypeScript),
+                Location {
+                    file_path: "src/a.ts".into(),
+                    line: 1,
+                    column: 0,
+                    end_line: Some(1),
+                    end_column: None,
+                },
+            );
+            node.span = Some(Span {
+                start_byte: start,
+                end_byte: end,
+            });
+            node
+        };
+        let target_start = text.find("target").unwrap() as u32;
+        let call_start = text.rfind("target").unwrap() as u32;
+        let second_line = text.find('\n').unwrap() as u32 + 1;
+        let mut nodes = vec![
+            make_node("target", target_start, target_start + 6),
+            make_node("caller", second_line, text.len() as u32),
+        ];
+        // The span starts at the line, not at the identifier, mirroring receiver calls.
+        let mut edges = vec![EdgeRelationship {
+            from: nodes[1].id,
+            to: "target".into(),
+            edge_type: EdgeType::Calls,
+            metadata: Default::default(),
+            span: Some(Span {
+                start_byte: second_line,
+                end_byte: text.len() as u32,
+            }),
+        }];
+        let line = text[..call_start as usize].matches('\n').count() as i32;
+        let column =
+            (call_start as usize) - text[..call_start as usize].rfind('\n').map_or(0, |i| i + 1);
+        let document = Document {
+            relative_path: "src/a.ts".into(),
+            position_encoding: scip::types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart
+                .into(),
+            occurrences: vec![
+                Occurrence {
+                    symbol: "scip typescript . src/a.ts target".into(),
+                    symbol_roles: 1,
+                    range: vec![
+                        0,
+                        text.find("target").unwrap() as i32,
+                        text.find("target").unwrap() as i32 + 6,
+                    ],
+                    ..Default::default()
+                },
+                Occurrence {
+                    symbol: "scip typescript . src/a.ts target".into(),
+                    range: vec![line, column as i32, column as i32 + 6],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let artifact = root.path().join("index.scip");
+        let index = scip::types::Index {
+            documents: vec![document],
+            ..Default::default()
+        };
+        std::fs::write(&artifact, index.write_to_bytes()?)?;
+        let stats = import(
+            &artifact,
+            root.path(),
+            &sources,
+            &mut nodes,
+            &mut edges,
+            false,
+        )?;
+        assert_eq!(stats.documents, 1);
+        assert_eq!(stats.documents_matched, 1);
+        assert_eq!(stats.documents_with_nodes, 1);
+        assert_eq!(stats.edges_resolved, 1);
+        assert_eq!(edges[0].metadata["target_node_id"], nodes[0].id.to_string());
+
+        // A manifest that exists but disagrees with the captured source is stale.
+        std::fs::write(
+            root.path().join("index.sources.json"),
+            serde_json::to_vec(&BTreeMap::from([(
+                "src/a.ts".to_string(),
+                "deadbeef".to_string(),
+            )]))?,
+        )?;
         assert!(
             import(
                 &artifact,

@@ -217,8 +217,13 @@ Unicode overlap, truncating tokenizers, impossible budgets and warm-cache skip e
    ambiguous definitions, invalid positions and stale source. Balanced enriches existing
    links; Full also adds compiler references. SCIP documents with embedded text need no
    sidecar; otherwise generate `index.sources.json` with
-   `scripts/benchmarks/scip-source-manifest.py` alongside fresh compiler output.
-   `CODEGRAPH_SCIP_TRUST_SOURCE=1` explicitly accepts unverified source identity.
+   `scripts/benchmarks/scip-source-manifest.py` alongside fresh compiler output. Missing
+   entries (always the case for `scip-typescript`) are trusted with one aggregated warning,
+   while an entry that disagrees with the captured source still fails as stale;
+   `CODEGRAPH_SCIP_TRUST_SOURCE=1` explicitly accepts unverified source identity. Document
+   paths normalise to project-relative posix keys before snapshot and node lookup, so
+   relative roots and Windows separators bind, and an import matching no document fails
+   instead of reporting zero enrichment.
    Token-budget and compiler-link/stale-source regressions run without external services.
 
 9. Independent `CODEGRAPH_EMBEDDING_POLICY` and `CODEGRAPH_SEMANTIC_RESOLUTION`
