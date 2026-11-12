@@ -297,7 +297,7 @@ mod per_file_reconciliation {
         );
         fresh.insert("b.rs".to_string(), vec![b1.id.to_string()]);
         store
-            .reconcile_catalog_by_file(project, &fresh, &BTreeSet::new(), None)
+            .reconcile_catalog_by_file(project, &fresh, &BTreeSet::new(), &BTreeSet::new(), None)
             .await
             .unwrap();
         assert_eq!(table_len(&store, "nodes", project).await, 3, "no-op pass");
@@ -307,7 +307,7 @@ mod per_file_reconciliation {
         let mut shrunk = BTreeMap::new();
         shrunk.insert("a.rs".to_string(), vec![a1.id.to_string()]);
         store
-            .reconcile_catalog_by_file(project, &shrunk, &BTreeSet::new(), None)
+            .reconcile_catalog_by_file(project, &shrunk, &BTreeSet::new(), &BTreeSet::new(), None)
             .await
             .unwrap();
 
@@ -358,7 +358,13 @@ mod per_file_reconciliation {
             scan_root: std::path::PathBuf::from("/repo/packages/core"),
         };
         store
-            .reconcile_catalog_by_file(project, &fresh, &BTreeSet::new(), Some(&scope))
+            .reconcile_catalog_by_file(
+                project,
+                &fresh,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Some(&scope),
+            )
             .await
             .unwrap();
 
@@ -384,7 +390,13 @@ mod per_file_reconciliation {
             scan_root: std::path::PathBuf::from("/repo/packages/core"),
         };
         store
-            .reconcile_catalog_by_file(project, &BTreeMap::new(), &BTreeSet::new(), Some(&scope))
+            .reconcile_catalog_by_file(
+                project,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Some(&scope),
+            )
             .await
             .unwrap();
 
@@ -437,7 +449,7 @@ mod per_file_reconciliation {
         fresh_chunks.insert(keep.id.clone());
 
         store
-            .reconcile_catalog_by_file(project, &fresh, &fresh_chunks, None)
+            .reconcile_catalog_by_file(project, &fresh, &fresh_chunks, &BTreeSet::new(), None)
             .await
             .unwrap();
 
@@ -450,6 +462,150 @@ mod per_file_reconciliation {
             table_len(&store, "nodes", project).await,
             1,
             "node untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_edges_with_live_endpoints_are_removed() {
+        let mut store = storage(include_str!("../../../schema/codegraph_v2.surql")).await;
+        let project = "recon_stale_edges";
+
+        let alpha = node_in(project, "a.rs", "alpha", 1);
+        let beta = node_in(project, "a.rs", "beta", 5);
+        store
+            .upsert_nodes_batch(&[alpha.clone(), beta.clone()])
+            .await
+            .unwrap();
+
+        // Same endpoints and type, different source spans: switching index tiers
+        // changes the span metadata, hence the edge id, while both nodes keep
+        // their ids. Only the first edge is re-emitted by this run.
+        let mut old_edge = CodeEdge::new(alpha.id, beta.id, EdgeType::Calls)
+            .with_metadata("source_span".into(), "1:4".into());
+        old_edge.set_deterministic_id(project);
+        let mut new_edge = CodeEdge::new(alpha.id, beta.id, EdgeType::Calls)
+            .with_metadata("source_span".into(), "10:14".into());
+        new_edge.set_deterministic_id(project);
+        assert_ne!(old_edge.id, new_edge.id, "spans must yield distinct ids");
+        store
+            .upsert_edges_batch(&[old_edge.clone(), new_edge.clone()])
+            .await
+            .unwrap();
+        assert_eq!(table_len(&store, "edges", project).await, 2);
+
+        let mut fresh = BTreeMap::new();
+        fresh.insert(
+            "a.rs".to_string(),
+            vec![alpha.id.to_string(), beta.id.to_string()],
+        );
+        let mut fresh_edges = BTreeSet::new();
+        fresh_edges.insert(old_edge.id.to_string());
+        store
+            .reconcile_catalog_by_file(project, &fresh, &BTreeSet::new(), &fresh_edges, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table_len(&store, "edges", project).await,
+            1,
+            "a stale edge whose endpoints both survive must still be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn edges_on_files_outside_the_scope_are_kept() {
+        let mut store = storage(include_str!("../../../schema/codegraph_v2.surql")).await;
+        let project = "recon_stale_scope";
+
+        let alpha = node_in(project, "packages/core/a.rs", "alpha", 1);
+        let beta = node_in(project, "packages/core/a.rs", "beta", 5);
+        let gamma = node_in(project, "packages/app/b.rs", "gamma", 1);
+        let delta = node_in(project, "packages/app/b.rs", "delta", 5);
+        store
+            .upsert_nodes_batch(&[alpha.clone(), beta.clone(), gamma.clone(), delta.clone()])
+            .await
+            .unwrap();
+
+        let mut core_edge = CodeEdge::new(alpha.id, beta.id, EdgeType::Calls)
+            .with_metadata("source_span".into(), "1:4".into());
+        core_edge.set_deterministic_id(project);
+        let mut app_edge = CodeEdge::new(gamma.id, delta.id, EdgeType::Calls)
+            .with_metadata("source_span".into(), "10:14".into());
+        app_edge.set_deterministic_id(project);
+        store
+            .upsert_edges_batch(&[core_edge.clone(), app_edge.clone()])
+            .await
+            .unwrap();
+        assert_eq!(table_len(&store, "edges", project).await, 2);
+
+        // Only packages/core was scanned, and this run emitted no edge at all:
+        // the caller still supplies a non-empty set (a fresh id that matches no
+        // stored edge) so the empty-set guard does not mask the scope check.
+        let mut fresh = BTreeMap::new();
+        fresh.insert(
+            "packages/core/a.rs".to_string(),
+            vec![alpha.id.to_string(), beta.id.to_string()],
+        );
+        let mut fresh_edges = BTreeSet::new();
+        fresh_edges.insert(codegraph_core::EdgeId::new_v4().to_string());
+        let scope = ReconcileScope {
+            project_root: std::path::PathBuf::from("/repo"),
+            scan_root: std::path::PathBuf::from("/repo/packages/core"),
+        };
+        store
+            .reconcile_catalog_by_file(
+                project,
+                &fresh,
+                &BTreeSet::new(),
+                &fresh_edges,
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table_len(&store, "edges", project).await,
+            1,
+            "an edge inside the scope that this run did not re-emit is deleted; \
+             an edge on a file outside the scope is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_fresh_edge_ids_preserves_edges() {
+        let mut store = storage(include_str!("../../../schema/codegraph_v2.surql")).await;
+        let project = "recon_stale_empty";
+
+        let alpha = node_in(project, "a.rs", "alpha", 1);
+        let beta = node_in(project, "a.rs", "beta", 5);
+        store
+            .upsert_nodes_batch(&[alpha.clone(), beta.clone()])
+            .await
+            .unwrap();
+
+        let mut edge = CodeEdge::new(alpha.id, beta.id, EdgeType::Calls)
+            .with_metadata("source_span".into(), "1:4".into());
+        edge.set_deterministic_id(project);
+        store
+            .upsert_edges_batch(std::slice::from_ref(&edge))
+            .await
+            .unwrap();
+        assert_eq!(table_len(&store, "edges", project).await, 1);
+
+        let mut fresh = BTreeMap::new();
+        fresh.insert(
+            "a.rs".to_string(),
+            vec![alpha.id.to_string(), beta.id.to_string()],
+        );
+        store
+            .reconcile_catalog_by_file(project, &fresh, &BTreeSet::new(), &BTreeSet::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table_len(&store, "edges", project).await,
+            1,
+            "no fresh edge ids means the caller supplied no information; no edge may be deleted"
         );
     }
 }

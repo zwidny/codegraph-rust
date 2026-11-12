@@ -353,6 +353,7 @@ impl SurrealDbStorage {
         project: &str,
         fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
         fresh_chunks: &BTreeSet<String>,
+        fresh_edge_ids: &BTreeSet<String>,
         scope: Option<&ReconcileScope>,
     ) -> Result<()> {
         let decode_id = |raw: &str| {
@@ -485,19 +486,80 @@ impl SurrealDbStorage {
             }
         }
 
-        if stale_nodes.is_empty() && stale_chunks.is_empty() {
+        // --- Single scan over edges: (raw id, from raw id, to raw id) --------
+        // Every edge in the project is read once (`project_id` is indexed) and
+        // diffed against `fresh_edge_ids` in Rust. `id NOT IN $fresh` would inline
+        // ~96k ids and push the project-level reconcile past 10 minutes (see the
+        // "Per-file reconciliation" comment in indexer.rs), which is exactly why
+        // this per-file variant exists. An edge whose endpoint lives in a file
+        // this run scanned, yet whose id is absent from `fresh_edge_ids`, was not
+        // re-emitted by this run and is therefore stale.
+        let mut stale_edges: Vec<String> = Vec::new();
+        if fresh_edge_ids.is_empty() {
+            // An empty set means the caller supplied no information, not that
+            // every edge is stale. Deleting on that inference would wipe the table.
+            debug!("Skipping stale edge reconciliation for {project}: no fresh edge ids supplied");
+        } else {
+            let mut response = self
+                .db
+                .query("SELECT VALUE [<string> id, <string> from, <string> to] FROM edges WHERE project_id = $project;")
+                .bind(("project", project.to_string()))
+                .await
+                .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?
+                .check()
+                .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?;
+            let edge_rows: Vec<Vec<Option<String>>> = response.take(0).unwrap_or_default();
+
+            let decode_edge_id = |raw: &str| {
+                raw.strip_prefix("edges:")
+                    .unwrap_or(raw)
+                    .trim_matches('`')
+                    .to_string()
+            };
+            let scanned = |id: &str| {
+                file_by_node
+                    .get(id)
+                    .is_some_and(|file| fresh_nodes_by_file.contains_key(file))
+            };
+            for row in &edge_rows {
+                let (Some(raw_id), Some(raw_from), Some(raw_to)) = (
+                    row.first().and_then(|v| v.as_deref()),
+                    row.get(1).and_then(|v| v.as_deref()),
+                    row.get(2).and_then(|v| v.as_deref()),
+                ) else {
+                    continue;
+                };
+                let id = decode_edge_id(raw_id);
+                if fresh_edge_ids.contains(&id) {
+                    continue;
+                }
+                let from_id = decode_id(raw_from);
+                let to_id = decode_id(raw_to);
+                // Endpoints in files this run did not scan may belong to another
+                // scope, so those edges stay put. Edges hanging off nodes that no
+                // longer exist are already covered by the stale-node delete.
+                if scanned(&from_id) || scanned(&to_id) {
+                    stale_edges.push(id);
+                }
+            }
+        }
+
+        if stale_nodes.is_empty() && stale_chunks.is_empty() && stale_edges.is_empty() {
             return Ok(());
         }
 
         let stale_records: Vec<String> = stale_nodes.clone();
         let stale_chunk_records: Vec<String> = stale_chunks.clone();
+        let stale_edge_records: Vec<String> = stale_edges.clone();
         self.db
             .query(
                 r#"
                 BEGIN TRANSACTION;
                 LET $stale_nodes = $stale.map(|$id| type::record('nodes', $id));
                 LET $stale_chunk_ids = $stale_chunks.map(|$id| type::record('chunks', $id));
+                LET $stale_edge_ids = $stale_edges.map(|$id| type::record('edges', $id));
                 DELETE edges WHERE project_id = $project AND $has_nodes AND (from IN $stale_nodes OR to IN $stale_nodes);
+                DELETE edges WHERE project_id = $project AND $has_stale_edges AND id IN $stale_edge_ids;
                 DELETE symbol_embeddings WHERE project_id = $project AND $has_nodes AND node_id IN $stale_nodes;
                 DELETE chunks WHERE project_id = $project AND id IN $stale_chunk_ids;
                 DELETE nodes WHERE project_id = $project AND id IN $stale_nodes;
@@ -507,7 +569,9 @@ impl SurrealDbStorage {
             .bind(("project", project.to_string()))
             .bind(("stale", stale_records))
             .bind(("stale_chunks", stale_chunk_records))
+            .bind(("stale_edges", stale_edge_records))
             .bind(("has_nodes", !stale_nodes.is_empty()))
+            .bind(("has_stale_edges", !stale_edges.is_empty()))
             .await
             .map_err(|e| CodeGraphError::Database(format!("Catalog reconciliation failed: {e}")))?
             .check()

@@ -2056,8 +2056,6 @@ impl ProjectIndexer {
             );
             let mut targets = Vec::with_capacity(edges.len());
             let mut resolution_provenance = Vec::with_capacity(edges.len());
-            let mut exact_count = 0;
-            let mut lexical_count = 0;
             // Resolution over 96k edges was a serial loop measured at ~200s on
             // one core. `SymbolCatalog`'s lookup methods are `&self`, so the loop
             // parallelises with rayon (order preserved by collect); the two
@@ -2111,11 +2109,6 @@ impl ProjectIndexer {
                     })
                     .collect();
                 for (target, provenance) in results {
-                    match provenance.0 {
-                        "lexical" => lexical_count += 1,
-                        "definition" | "exact" | "normalized" => exact_count += 1,
-                        _ => {}
-                    }
                     targets.push(target);
                     resolution_provenance.push(provenance);
                 }
@@ -2290,6 +2283,8 @@ impl ProjectIndexer {
             }
             let edge_persistence_start = std::time::Instant::now();
             let resolved_count = targets.iter().filter(|target| target.is_some()).count();
+            let (exact_count, lexical_count, semantic_count) =
+                classify_resolution_counts(&targets, &resolution_provenance);
             let mut resolved_edges = Vec::with_capacity(resolved_count);
             for ((edge, target), (method, score)) in
                 edges.iter().zip(targets).zip(resolution_provenance)
@@ -2341,7 +2336,7 @@ impl ProjectIndexer {
                 edges.len(),
                 exact_count,
                 lexical_count,
-                resolved_count.saturating_sub(exact_count + lexical_count),
+                semantic_count,
                 resolution_start.elapsed()
             );
 
@@ -2447,6 +2442,7 @@ impl ProjectIndexer {
                     &self.project_id,
                     &fresh_nodes_by_file,
                     &next_catalog.chunks,
+                    &next_catalog.edges,
                     reconcile_scope.as_ref(),
                 )
                 .await?;
@@ -4817,5 +4813,80 @@ mod normalize_file_path_tests {
         let once = normalize_file_path(root, "./packages/core/src/tool/mcp.ts");
         assert_eq!(once, "packages/core/src/tool/mcp.ts");
         assert_eq!(normalize_file_path(root, &once), once);
+    }
+}
+
+/// Classify resolved relationships into `(exact, lexical, semantic)` counts.
+///
+/// Iterates over `targets` and `provenance` pairwise. If the two slices have
+/// different lengths, iteration stops at the shorter slice, so the extra
+/// trailing entries of the longer slice are ignored and the function never
+/// panics.
+///
+/// * `targets[i]` being `None` (unresolved) is never counted in any category,
+///   even when the provenance string at that index looks like a resolved method.
+/// * A resolved target is classified by `provenance[i].0`:
+///   `"lexical"` → lexical, `"definition" | "exact" | "normalized"` → exact,
+///   `"semantic"` → semantic, and any other string → not counted.
+fn classify_resolution_counts(
+    targets: &[Option<NodeId>],
+    provenance: &[(&'static str, f64)],
+) -> (usize, usize, usize) {
+    let mut exact = 0;
+    let mut lexical = 0;
+    let mut semantic = 0;
+    for (target, (method, _score)) in targets.iter().zip(provenance.iter()) {
+        if target.is_none() {
+            continue;
+        }
+        match *method {
+            "lexical" => lexical += 1,
+            "definition" | "exact" | "normalized" => exact += 1,
+            "semantic" => semantic += 1,
+            _ => {}
+        }
+    }
+    (exact, lexical, semantic)
+}
+
+#[cfg(test)]
+mod resolution_count_tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_edges_are_not_counted() {
+        let targets = [Some(NodeId::new_v4()), None, None, Some(NodeId::new_v4())];
+        let provenance = [
+            ("exact", 1.0),
+            ("exact", 1.0),
+            ("normalized", 1.0),
+            ("lexical", 1.0),
+        ];
+        assert_eq!(classify_resolution_counts(&targets, &provenance), (1, 1, 0));
+    }
+
+    #[test]
+    fn semantic_matches_are_counted() {
+        let targets = [
+            Some(NodeId::new_v4()),
+            Some(NodeId::new_v4()),
+            Some(NodeId::new_v4()),
+        ];
+        let provenance = [("definition", 1.0), ("semantic", 0.78), ("semantic", 0.81)];
+        assert_eq!(classify_resolution_counts(&targets, &provenance), (1, 0, 2));
+    }
+
+    #[test]
+    fn unresolved_semantic_is_not_counted() {
+        let targets = [None, Some(NodeId::new_v4())];
+        let provenance = [("semantic", 0.0), ("normalized", 1.0)];
+        assert_eq!(classify_resolution_counts(&targets, &provenance), (1, 0, 0));
+    }
+
+    #[test]
+    fn mismatched_lengths_do_not_panic() {
+        let targets = [Some(NodeId::new_v4()), Some(NodeId::new_v4())];
+        let provenance = [("exact", 1.0)];
+        assert_eq!(classify_resolution_counts(&targets, &provenance), (1, 0, 0));
     }
 }
