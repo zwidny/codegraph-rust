@@ -44,8 +44,8 @@ pub(crate) struct FuzzyStats {
     pub calls: u64,
     pub nanos: u64,
     pub candidates: u64,
-    /// Candidates dropped by the length-ratio prune inside
-    /// `ranked_candidate_indices`, before the shortlist cap is applied.
+    /// Distinct candidates dropped by the length-ratio prune while counting
+    /// trigram overlaps, before the shortlist cap is applied.
     pub len_pruned: u64,
     /// Attempts to score a candidate with `normalized_similarity_with_args`.
     pub levenshtein_calls: u64,
@@ -62,6 +62,11 @@ pub(crate) struct SymbolCatalog {
     aliases: BTreeMap<String, Vec<NodeId>>,
     symbols: HashMap<NodeId, Symbol>,
     lexical: Vec<LexicalCandidate>,
+    /// Packed copy of `LexicalCandidate::characters`. The prune in
+    /// `candidate_counts_pruned` runs once per trigram posting, and a posting
+    /// hit on the full `LexicalCandidate` is a cache miss; four lengths share a
+    /// cache line here, so the per-posting length test stays in cache.
+    lengths: Vec<u32>,
     trigrams: HashMap<String, Vec<usize>>,
     fuzzy_calls: AtomicU64,
     fuzzy_nanos: AtomicU64,
@@ -126,6 +131,57 @@ fn trigrams(name: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Length-ratio prefilter: edit-distance similarity cannot exceed the ratio of
+/// the shorter to the longer name, so a candidate below `min_ratio` can never
+/// beat `min_ratio` as a score.
+///
+/// Shared by the counting pass's length window, the shortlist ranking and
+/// `fuzzy`'s scoring loop so the three cannot drift apart; the integer division
+/// order and the `f64::EPSILON` tolerance are part of the retained result.
+fn length_ratio_passes(target_length: usize, candidate_length: usize, min_ratio: f64) -> bool {
+    (target_length.min(candidate_length) as f64)
+        / (target_length.max(candidate_length).max(1) as f64)
+        + f64::EPSILON
+        >= min_ratio
+}
+
+/// Inclusive candidate-length window that satisfies `length_ratio_passes`.
+///
+/// The ratio rises monotonically with the candidate length up to the target
+/// length and falls monotonically above it, so the predicate is true exactly on
+/// one interval. Both bounds are located by binary search on the predicate
+/// itself, which makes per-posting membership testing (`lo <= length <= hi`)
+/// equivalent to evaluating the ratio: no rounding, `f64::EPSILON` or integer
+/// division order is re-derived by hand. An empty window is `(1, 0)`.
+fn length_window(target_length: usize, min_ratio: f64) -> (u32, u32) {
+    let longest = u32::MAX as usize;
+    if !length_ratio_passes(target_length, target_length, min_ratio) {
+        return (1, 0);
+    }
+    let mut low = 0usize;
+    let mut high = target_length;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if length_ratio_passes(target_length, mid, min_ratio) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let first = low;
+    let mut low = target_length;
+    let mut high = longest;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if length_ratio_passes(target_length, mid, min_ratio) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    (first as u32, low as u32)
+}
+
 /// Upper bound on how many trigram-overlap candidates `fuzzy` scores per lookup.
 ///
 /// `0` keeps every candidate that survives the length-ratio prune. The cap is
@@ -177,6 +233,7 @@ impl SymbolCatalog {
             aliases: BTreeMap::new(),
             symbols: HashMap::new(),
             lexical: Vec::new(),
+            lengths: Vec::new(),
             trigrams: HashMap::new(),
             fuzzy_calls: AtomicU64::new(0),
             fuzzy_nanos: AtomicU64::new(0),
@@ -264,6 +321,18 @@ impl SymbolCatalog {
                 gram_count: grams.len(),
             });
         }
+        // Alias lengths are bounded by the source text; a name longer than
+        // `u32::MAX` characters cannot exist in memory, so the packing is lossless.
+        debug_assert!(
+            self.lexical
+                .iter()
+                .all(|c| c.characters <= u32::MAX as usize)
+        );
+        self.lengths = self
+            .lexical
+            .iter()
+            .map(|candidate| candidate.characters as u32)
+            .collect();
         self
     }
 
@@ -346,6 +415,7 @@ impl SymbolCatalog {
 
     /// Number of shared trigrams per catalog entry. Shared by the sorted shortlist
     /// and the unsorted fuzzy shortlist.
+    #[cfg(any(test, feature = "ai-enhanced"))]
     fn candidate_counts(&self, grams: &BTreeSet<String>) -> HashMap<usize, usize> {
         let mut counts = HashMap::<usize, usize>::new();
         for gram in grams {
@@ -358,7 +428,50 @@ impl SymbolCatalog {
         counts
     }
 
+    /// Number of shared trigrams per catalog entry, dropping candidates whose
+    /// length ratio cannot reach `min_ratio`.
+    ///
+    /// The prune runs before the count map is touched because a candidate that
+    /// fails it fails the identical check in `fuzzy`'s scoring loop as well: an
+    /// insert for such a candidate could only ever be discarded again. Pruned
+    /// candidates are still counted once each in `fuzzy_len_pruned`, using the
+    /// same "distinct candidate" unit the unpruned counting path reported. The
+    /// length test is the precomputed `length_window`, which is equivalent to
+    /// `length_ratio_passes` for every candidate length.
+    fn candidate_counts_pruned(
+        &self,
+        grams: &BTreeSet<String>,
+        target_characters: usize,
+        min_ratio: f64,
+    ) -> HashMap<usize, usize> {
+        let mut counts = HashMap::<usize, usize>::new();
+        let mut pruned = 0usize;
+        let mut visited = vec![0u64; self.lexical.len().div_ceil(64)];
+        let (min_length, max_length) = length_window(target_characters, min_ratio);
+        for gram in grams {
+            if let Some(indices) = self.trigrams.get(gram) {
+                for index in indices {
+                    let length = self.lengths[*index];
+                    if length >= min_length && length <= max_length {
+                        *counts.entry(*index).or_default() += 1;
+                    } else {
+                        let slot = &mut visited[index / 64];
+                        let mask = 1u64 << (index % 64);
+                        if *slot & mask == 0 {
+                            *slot |= mask;
+                            pruned += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.fuzzy_len_pruned
+            .fetch_add(pruned as u64, Ordering::Relaxed);
+        counts
+    }
+
     /// A deterministic shortlist; a zero limit retains every overlapping candidate.
+    #[cfg(any(test, feature = "ai-enhanced"))]
     fn candidate_indices(&self, grams: &BTreeSet<String>, limit: usize) -> Vec<(usize, usize)> {
         let mut ranked: Vec<_> = self.candidate_counts(grams).into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -378,7 +491,9 @@ impl SymbolCatalog {
     /// Candidates whose length ratio cannot reach `min_ratio` are dropped before
     /// the cap is applied: edit-distance similarity is bounded by the ratio of
     /// the shorter to the longer string, so such a candidate can never beat the
-    /// initial `best` and would only consume a shortlist slot.
+    /// initial `best` and would only consume a shortlist slot. The prune happens
+    /// while counting trigram overlaps (see `candidate_counts_pruned`); the
+    /// filter below stays as an exact, cheap safeguard.
     fn ranked_candidate_indices(
         &self,
         grams: &BTreeSet<String>,
@@ -386,16 +501,13 @@ impl SymbolCatalog {
         min_ratio: f64,
         limit: usize,
     ) -> Vec<(usize, usize)> {
-        let counts = self.candidate_counts(grams);
+        let counts = self.candidate_counts_pruned(grams, target_length, min_ratio);
         let overlapping = counts.len();
         let mut ranked: Vec<_> = counts
             .into_iter()
             .filter(|(index, _)| {
                 let candidate = &self.lexical[*index];
-                (target_length.min(candidate.characters) as f64)
-                    / (target_length.max(candidate.characters).max(1) as f64)
-                    + f64::EPSILON
-                    >= min_ratio
+                length_ratio_passes(target_length, candidate.characters, min_ratio)
             })
             .collect();
         if ranked.len() < overlapping {
@@ -460,11 +572,7 @@ impl SymbolCatalog {
         for (index, _) in candidates {
             let candidate = &self.lexical[index];
             // Edit-distance similarity cannot exceed the ratio of the shorter length.
-            if (target_length.min(candidate.characters) as f64)
-                / (target_length.max(candidate.characters).max(1) as f64)
-                + f64::EPSILON
-                < best
-            {
+            if !length_ratio_passes(target_length, candidate.characters, best) {
                 continue;
             }
             self.fuzzy_levenshtein_calls.fetch_add(1, Ordering::Relaxed);
@@ -684,5 +792,111 @@ mod tests {
             all,
             "a cap wider than the candidate set must retain it unchanged"
         );
+    }
+
+    #[test]
+    fn length_window_matches_the_ratio_predicate() {
+        for target in [0usize, 1, 2, 5, 16, 40, 120] {
+            for ratio in [0.0, 0.34, 0.5, 0.85, 0.9, 0.99, 1.0, 1.0 + f64::EPSILON] {
+                let (low, high) = length_window(target, ratio);
+                let check =
+                    |candidate: usize| low as usize <= candidate && candidate <= high as usize;
+                for candidate in 0..=400 {
+                    assert_eq!(
+                        check(candidate),
+                        length_ratio_passes(target, candidate, ratio),
+                        "target={target} ratio={ratio} candidate={candidate} window=({low}, {high})"
+                    );
+                }
+                for candidate in [1_000usize, 65_535, u32::MAX as usize] {
+                    assert_eq!(
+                        check(candidate),
+                        length_ratio_passes(target, candidate, ratio),
+                        "target={target} ratio={ratio} candidate={candidate} window=({low}, {high})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pruned_counts_equal_the_unpruned_map_filtered_by_the_same_ratio() {
+        let nodes: Vec<_> = [
+            "calculate_result",
+            "calculate_result_extra",
+            "recalculate_result",
+            "calculate_reslt",
+            "calculate",
+            "unrelated",
+        ]
+        .into_iter()
+        .map(|name| node("a.rs", name))
+        .collect();
+        let catalog = SymbolCatalog::new(&nodes);
+        let target = "calculate_result";
+        let grams = trigrams(target);
+        let length = target.chars().count();
+        let mut expected: Vec<_> = catalog
+            .candidate_counts(&grams)
+            .into_iter()
+            .filter(|(index, _)| {
+                length_ratio_passes(length, catalog.lexical[*index].characters, 0.85)
+            })
+            .collect();
+        let mut actual: Vec<_> = catalog
+            .candidate_counts_pruned(&grams, length, 0.85)
+            .into_iter()
+            .collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(!actual.is_empty());
+    }
+
+    #[test]
+    fn length_prune_counter_counts_each_dropped_candidate_once() {
+        let nodes: Vec<_> = [
+            "calculate_result",
+            "calculate_result_extra",
+            "recalculate_result",
+            "calculate_reslt",
+            "calculate",
+            "unrelated",
+        ]
+        .into_iter()
+        .map(|name| node("a.rs", name))
+        .collect();
+        let catalog = SymbolCatalog::new(&nodes);
+        let target = "calculate_result";
+        let grams = trigrams(target);
+        let length = target.chars().count();
+        let dropped = catalog
+            .candidate_counts(&grams)
+            .keys()
+            .filter(|index| !length_ratio_passes(length, catalog.lexical[**index].characters, 0.85))
+            .count();
+        // Several dropped candidates share more than one trigram with the target;
+        // the counter must still report distinct candidates, as it did before the
+        // prune moved ahead of the count map.
+        assert!(dropped > 1, "fixture must drop more than one candidate");
+        catalog.candidate_counts_pruned(&grams, length, 0.85);
+        assert_eq!(catalog.fuzzy_stats().len_pruned, dropped as u64);
+    }
+
+    #[test]
+    fn fuzzy_prunes_overlong_candidates_before_shortlisting() {
+        let target = node("a.rs", "calculate_result");
+        let catalog = SymbolCatalog::new(std::slice::from_ref(&target));
+        assert_eq!(
+            catalog
+                .fuzzy(&edge(target.id, "calculate_reslt"))
+                .map(|(id, _)| id),
+            Some(target.id)
+        );
+        // Three aliases share trigrams with the target; only the 16-character
+        // name survives the 0.85 length ratio, the 22- and 26-character
+        // `file::name` / `kind::name` aliases are dropped while counting.
+        assert_eq!(catalog.fuzzy_stats().candidates, 1);
+        assert_eq!(catalog.fuzzy_stats().len_pruned, 2);
     }
 }

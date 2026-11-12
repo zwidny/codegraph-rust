@@ -8,6 +8,7 @@ Welcome to the comprehensive documentation for the CodeGraph project.
 - [Installation & setup](INSTALLATION_GUIDE.md)
 - [Usage guide (for AI assistants)](USAGE_GUIDE.md)
 - [Incremental indexing (single file / subdirectory)](INCREMENTAL_INDEXING.md)
+- [Indexing pipeline: stages, timings and controls](INDEXING_PIPELINE.md)
 - [Agentic CLI commands and Claude Code/Codex hooks](AGENTIC_CLI.md)
 - [AI provider configuration (embeddings + LLMs)](AI_PROVIDERS.md)
 - [Agentic prompt tiers (4-tier system)](AGENT_PROMPT_TIERS.md)

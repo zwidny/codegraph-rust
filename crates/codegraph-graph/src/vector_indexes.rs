@@ -14,7 +14,11 @@ pub enum VectorIndexMode {
 impl VectorIndexMode {
     pub fn from_env() -> Result<Self> {
         match std::env::var("CODEGRAPH_VECTOR_INDEX_MODE")
-            .unwrap_or_else(|_| "all".into())
+            // Default to deferred: on a fresh store the HNSW index is built once after all
+            // rows are durable, instead of being maintained per insert. Measured on a
+            // 170k-chunk project, per-insert maintenance wrote 125 rows/s (~23 min) while
+            // deferred wrote 357-499 rows/s and built the index in 51s afterwards.
+            .unwrap_or_else(|_| "deferred".into())
             .as_str()
         {
             "all" => Ok(Self::All),
