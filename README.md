@@ -220,6 +220,24 @@ codegraph init . --hooks both --index-tier fast
 codegraph index server --index-tier fast -l typescript   # one subtree; belongs to the repo project
 ```
 
+**Faster, reproducible indexing with SCIP.** Instead of driving a language server once per
+file, import pre-built SCIP indexes:
+
+```bash
+rust-analyzer scip .                          # Rust
+NODE_OPTIONS=--max-old-space-size=16384 scip-typescript index --pnpm-workspaces   # TS/JS
+scip-go                                       # Go
+
+CODEGRAPH_SCIP_INDEX="/abs/rust.scip,/abs/go.scip@easytier-go" \
+  codegraph index . --index-tier balanced
+```
+
+Each entry is `<path>[@<subdir>]`, where `subdir` is the index's directory relative to the
+project root. Setting the variable disables language servers for the run, so supply one index
+per language in a mixed-language project. On a 10k-file TypeScript project this cut the
+analysis phase from 21 minutes to 2.4 s plus a 3.9 s import, and contributed 62,711
+definition edges the LSP path never produced. Details: [Indexing pipeline](docs/INDEXING_PIPELINE.md).
+
 Indexing a subdirectory or a single file updates only that scope and leaves the rest
 of the project graph intact; see
 [incremental indexing](docs/INCREMENTAL_INDEXING.md) for project-root resolution and limits.

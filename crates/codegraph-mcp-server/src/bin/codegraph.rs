@@ -168,6 +168,16 @@ enum Commands {
                         (defaults to the nearest .git or .codegraph ancestor).\n\
                       - Partial re-indexes skip language servers; set CODEGRAPH_LSP_ON_PARTIAL=1 and pass\n\
                         --project-root to enable them (LSP loads the whole project, not just the scan path).\n\
+                      - Symbol analysis uses language servers unless CODEGRAPH_SCIP_INDEX names pre-built SCIP\n\
+                        indexes. That is faster and reproducible, and contributes definition edges the LSP\n\
+                        path does not produce. It takes a comma-separated list; each entry is <path>[@<subdir>],\n\
+                        where subdir is the index's directory relative to the project root, e.g.\n\
+                        \"rust.scip,go.scip@easytier-go,ui.scip@ui\". Setting it disables language servers\n\
+                        for the whole run, so mixed-language projects need an index per language.\n\
+                      - Vector indexes are built once after all rows are durable\n\
+                        (CODEGRAPH_VECTOR_INDEX_MODE=deferred, the default); on a fresh store this writes\n\
+                        chunks several times faster than maintaining HNSW per insert. Existing stores keep\n\
+                        their index; set it to \"all\" to restore per-insert maintenance.\n\
                       - An embedding provider is required; without one the run fails before writing the graph.\n\
                       - Re-run after code changes, or start the MCP server with --watch to keep it fresh."
     )]
