@@ -1,6 +1,6 @@
 # TODO — indexing performance & LSP → SCIP migration
 
-Context for a fresh session. State below reflects commit `610fd05` (2026-11-12).
+Context for a fresh session. State below reflects commit `0a075d3` (2026-11-12).
 
 ## Where things stand
 
@@ -108,23 +108,22 @@ Acceptance: on a fresh clone with `rust-analyzer` installed, plain `codegraph in
 produces a SCIP-backed run with no environment variables set. Until then, `AGENTS.md`
 tells agents to run `scripts/scip-index.sh` first.
 
-### 1. Per-language analyzer selection (highest priority)
+### 1. Per-language analyzer selection — **done in `0a075d3`**
 
-Today `CODEGRAPH_SCIP_INDEX` disables LSP **globally**:
+Previously `CODEGRAPH_SCIP_INDEX` disabled LSP **globally**, so any language without an
+index (Kotlin, C, a missing Go index) got zero enrichment — worse than the LSP-only baseline.
 
-```rust
-// indexer.rs ~1141
-if analyzer_settings.lsp_enabled() && !analyzer_languages.is_empty() && scip_path.is_none()
-```
+Now `ImportStats.covered_files` records the project-relative keys of every document an index
+matched, and the indexer imports SCIP first, then runs LSP only on
+`files_without_scip_coverage`. LSP stats accumulate with `+=` (SCIP contributes first) and the
+LSP summary line reports its own `total_stats`.
 
-Consequence: in a mixed-language project, languages without an indexer (Kotlin, C, and any
-language whose SCIP file is missing) get **zero** enrichment — worse than before.
+Measured on this repo: SCIP covers **227 of 260** files, LSP runs on the remaining **33**
+(5.1 s, `languages: [Python, Rust]`, **478 nodes + 458 edges** — previously zero).
+`lsp_nodes_enriched` went 4,035 → 4,520 == 4,042 (SCIP) + 478 (LSP) exactly.
 
-Needed: for each file, use SCIP when the index covers that language, otherwise fall back to
-LSP for the remaining languages in the same run.
-
-Acceptance: EasyTier with Rust+Go SCIP **plus** LSP for Kotlin/C must have
-`lsp_nodes_enriched` ≥ 15,673 (Rust+Go only) and the Kotlin/C files enriched.
+Still open: the EasyTier acceptance target (`lsp_nodes_enriched` ≥ 15,673 with Rust+Go SCIP
+plus Kotlin/C LSP) needs that project's indexes generated and measured.
 
 ### 2. TypeScript on EasyTier
 
