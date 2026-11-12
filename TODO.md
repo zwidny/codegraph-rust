@@ -75,7 +75,13 @@ default configuration was measured twice and agrees.
 |---|---|---|---|---|
 | default (pool 1, chunk batch 256) | 415–428 s | 241 s | 136 s | 117 s |
 | `CODEGRAPH_SURREAL_POOL_SIZE=4` | **130 s** | 71 s | 47 s | 36 s |
-| pool 4 + `CODEGRAPH_CHUNK_DB_BATCH_SIZE=1024` | **89 s** | 23 s | 52 s | 39 s |
+| pool 4 + `CODEGRAPH_CHUNK_DB_BATCH_SIZE=512` | **89 s** | 23 s | 52 s | 39 s |
+
+`chunk_embedding_db_batch_size` clamps to **512** (`indexer.rs`, `MAX`), and
+`CODEGRAPH_SURREAL_POOL_SIZE` clamps to **1..=4**, so the tuned run above was executed with
+the variable set to 1024 but the effective value was 512. Set these to 512 and 4 any other way
+and nothing further happens; raising the caps is a separate code change (`Surreal query depth is
+limited`, per the comment above the clamp).
 
 Two default-config runs (427.6 s and 415.3 s) bracket the baseline, so the 4.7x is real and not
 load noise. The `analyzers` figure swings 5–27 s between identical runs with the same
@@ -88,7 +94,7 @@ Direct measurements that rule out the usual suspects:
 - **Per-insert HNSW is not the cost**: 1,000 random 1024-d rows take 3.22 s with no index and
   3.18 s with the HNSW index defined. The 1024-d row write itself dominates.
 - **What actually changed**: with `pool=4` the same rows land at 2.4 ms/row; adding
-  `chunk batch=1024` drops the chunk window to 0.79 ms/row (23.4 s for 29,538 chunks).
+  `chunk batch=512` (the clamp) drops the chunk window to 0.79 ms/row (23.4 s for 29,538 chunks).
 - 29,538 vectors produced only 65 embedding inferences (`inference_texts: 65`,
   `cache_hits: 47,142`), so the phase named "embeddings_and_writes" is ~99% writes.
 - Skipping inference entirely (`CODEGRAPH_EMBEDDING_POLICY=deferred`) needs 115 s and leaves
