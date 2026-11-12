@@ -13,13 +13,18 @@ use tracing::{debug, warn};
 /// Outcome of one SCIP import. `edges_resolved` counts bindings that either
 /// re-pointed an existing edge or materialised a `References` edge; `nodes_enriched`
 /// counts distinct nodes that received compiler symbol/doc metadata.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportStats {
     pub documents: usize,
     pub documents_matched: usize,
     pub documents_with_nodes: usize,
     pub nodes_enriched: usize,
     pub edges_resolved: usize,
+    /// Project-relative posix keys of every document this index matched to a
+    /// captured source. Used to skip LSP per-file enrichment for files the
+    /// compiler index already covers. Files that matched but produced no nodes
+    /// are included: the index did analyse them, they simply have no symbols.
+    pub covered_files: BTreeSet<String>,
 }
 
 /// Project-relative posix key, identical to `CodeNode::location.file_path`.
@@ -323,6 +328,7 @@ pub fn import(
             .chain(text.match_indices('\n').map(|(offset, _)| offset + 1))
             .collect();
         let file_key = relative_key(root, &snapshot.path);
+        stats.covered_files.insert(file_key.clone());
         let Some(indices) = by_file.get(&file_key) else {
             return Ok(());
         };
@@ -718,6 +724,7 @@ mod tests {
                 documents_with_nodes: 1,
                 nodes_enriched: 1,
                 edges_resolved: 1,
+                covered_files: BTreeSet::from(["a.rs".to_string()]),
             }
         );
         assert_eq!(edges[0].metadata["target_node_id"], nodes[0].id.to_string());

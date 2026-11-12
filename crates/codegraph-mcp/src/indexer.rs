@@ -1154,9 +1154,58 @@ impl ProjectIndexer {
             nodes.dedup_by_key(|node| node.id);
 
             let mut lsp_enrichment_stats = crate::analyzers::lsp::LspEnrichmentStats::default();
+            let mut scip_covered: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            if !scip_specs.is_empty() && analyzer_settings.lsp_enabled() {
+                let start = std::time::Instant::now();
+                for spec in &scip_specs {
+                    let index_start = std::time::Instant::now();
+                    let scip_stats = crate::analyzers::scip::import(
+                        &spec.path,
+                        spec.path_prefix.as_deref(),
+                        &self.project_root,
+                        &source_snapshots,
+                        &mut nodes,
+                        &mut edges,
+                        analyzer_settings.lsp_definitions_enabled(),
+                    )?;
+                    scip_covered.extend(scip_stats.covered_files.iter().cloned());
+                    lsp_enrichment_stats.nodes_enriched += scip_stats.nodes_enriched;
+                    lsp_enrichment_stats.edges_resolved += scip_stats.edges_resolved;
+                    info!(
+                        "🧠 SCIP import complete for {}{}: {} nodes enriched + {} edges resolved from {} of {} documents ({} documents had indexed nodes) in {:.1?}",
+                        spec.path.display(),
+                        spec.path_prefix
+                            .as_ref()
+                            .map(|prefix| format!(" (path prefix: {prefix})"))
+                            .unwrap_or_default(),
+                        scip_stats.nodes_enriched,
+                        scip_stats.edges_resolved,
+                        scip_stats.documents_matched,
+                        scip_stats.documents,
+                        scip_stats.documents_with_nodes,
+                        index_start.elapsed()
+                    );
+                }
+                info!(
+                    "🧠 SCIP import complete: {} indexes, {} nodes enriched + {} edges resolved in {:.1?}",
+                    scip_specs.len(),
+                    lsp_enrichment_stats.nodes_enriched,
+                    lsp_enrichment_stats.edges_resolved,
+                    start.elapsed()
+                );
+                info!(
+                    "🧠 SCIP coverage: {} of {} scanned files already have compiler-index data; language-server enrichment runs on the remaining {}",
+                    scip_covered.len(),
+                    files.len(),
+                    files.len().saturating_sub(scip_covered.len())
+                );
+            }
+
+            let lsp_files = files_without_scip_coverage(&self.project_root, &files, &scip_covered);
             if analyzer_settings.lsp_enabled()
                 && !analyzer_languages.is_empty()
-                && scip_specs.is_empty()
+                && !lsp_files.is_empty()
             {
                 let start = std::time::Instant::now();
                 info!(
@@ -1172,7 +1221,7 @@ impl ProjectIndexer {
                     Vec<PathBuf>,
                 > = std::collections::HashMap::new();
                 let registry = codegraph_parser::LanguageRegistry::new();
-                for (p, _) in &files {
+                for p in &lsp_files {
                     if let Some(lang) = registry.detect_language(&p.to_string_lossy()) {
                         language_files.entry(lang).or_default().push(p.clone());
                     }
@@ -1264,50 +1313,12 @@ impl ProjectIndexer {
                     }
                 }
 
-                lsp_enrichment_stats = total_stats;
+                lsp_enrichment_stats.nodes_enriched += total_stats.nodes_enriched;
+                lsp_enrichment_stats.edges_resolved += total_stats.edges_resolved;
                 info!(
                     "🧠 Language-server analysis complete: {} nodes enriched + {} edges resolved in {:.1?}",
-                    lsp_enrichment_stats.nodes_enriched,
-                    lsp_enrichment_stats.edges_resolved,
-                    start.elapsed()
-                );
-            }
-
-            if !scip_specs.is_empty() && analyzer_settings.lsp_enabled() {
-                let start = std::time::Instant::now();
-                for spec in &scip_specs {
-                    let index_start = std::time::Instant::now();
-                    let scip_stats = crate::analyzers::scip::import(
-                        &spec.path,
-                        spec.path_prefix.as_deref(),
-                        &self.project_root,
-                        &source_snapshots,
-                        &mut nodes,
-                        &mut edges,
-                        analyzer_settings.lsp_definitions_enabled(),
-                    )?;
-                    lsp_enrichment_stats.nodes_enriched += scip_stats.nodes_enriched;
-                    lsp_enrichment_stats.edges_resolved += scip_stats.edges_resolved;
-                    info!(
-                        "🧠 SCIP import complete for {}{}: {} nodes enriched + {} edges resolved from {} of {} documents ({} documents had indexed nodes) in {:.1?}",
-                        spec.path.display(),
-                        spec.path_prefix
-                            .as_ref()
-                            .map(|prefix| format!(" (path prefix: {prefix})"))
-                            .unwrap_or_default(),
-                        scip_stats.nodes_enriched,
-                        scip_stats.edges_resolved,
-                        scip_stats.documents_matched,
-                        scip_stats.documents,
-                        scip_stats.documents_with_nodes,
-                        index_start.elapsed()
-                    );
-                }
-                info!(
-                    "🧠 SCIP import complete: {} indexes, {} nodes enriched + {} edges resolved in {:.1?}",
-                    scip_specs.len(),
-                    lsp_enrichment_stats.nodes_enriched,
-                    lsp_enrichment_stats.edges_resolved,
+                    total_stats.nodes_enriched,
+                    total_stats.edges_resolved,
                     start.elapsed()
                 );
             }
@@ -4536,6 +4547,26 @@ pub(crate) fn normalize_file_path(project_root: &Path, raw: &str) -> String {
     if out.is_empty() { ".".to_string() } else { out }
 }
 
+/// Files this run scanned that no supplied SCIP index covers. LSP enrichment
+/// runs only on these, so a mixed-language project gets compiler-grade symbol
+/// data where an index exists and language-server data everywhere else.
+pub(crate) fn files_without_scip_coverage(
+    project_root: &Path,
+    files: &[(PathBuf, u64)],
+    covered: &std::collections::BTreeSet<String>,
+) -> Vec<PathBuf> {
+    if covered.is_empty() {
+        return files.iter().map(|(path, _)| path.clone()).collect();
+    }
+    files
+        .iter()
+        .filter(|(path, _)| {
+            !covered.contains(&normalize_file_path(project_root, &path.to_string_lossy()))
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 /// One `CODEGRAPH_SCIP_INDEX` entry: a SCIP artifact plus the optional directory
 /// prefix its document paths are relative to (for indexes generated in a subdirectory).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4888,5 +4919,79 @@ mod resolution_count_tests {
         let targets = [Some(NodeId::new_v4()), Some(NodeId::new_v4())];
         let provenance = [("exact", 1.0)];
         assert_eq!(classify_resolution_counts(&targets, &provenance), (1, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod scip_coverage_tests {
+    use super::*;
+
+    fn files(paths: &[&str]) -> Vec<(PathBuf, u64)> {
+        paths.iter().map(|path| (PathBuf::from(path), 0)).collect()
+    }
+
+    fn covered(keys: &[&str]) -> std::collections::BTreeSet<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    #[test]
+    fn scip_covered_files_are_skipped() {
+        let root = Path::new("/repo");
+        let scanned = files(&["src/a.rs", "src/b.go", "web/c.ts"]);
+        let remaining = files_without_scip_coverage(root, &scanned, &covered(&["src/a.rs"]));
+        assert_eq!(
+            remaining,
+            vec![PathBuf::from("src/b.go"), PathBuf::from("web/c.ts")],
+            "only files covered by a SCIP index should be removed from LSP input"
+        );
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            !remaining.contains(&PathBuf::from("src/a.rs")),
+            "a SCIP-covered file must not be handed to LSP"
+        );
+    }
+
+    #[test]
+    fn no_scip_coverage_keeps_all_files() {
+        let root = Path::new("/repo");
+        let scanned = files(&["src/a.rs", "src/b.go", "web/c.ts"]);
+        let remaining = files_without_scip_coverage(root, &scanned, &covered(&[]));
+        assert_eq!(
+            remaining,
+            vec![
+                PathBuf::from("src/a.rs"),
+                PathBuf::from("src/b.go"),
+                PathBuf::from("web/c.ts"),
+            ],
+            "with no SCIP index every scanned file must stay in LSP input, in order"
+        );
+    }
+
+    #[test]
+    fn absolute_paths_match_coverage_keys() {
+        let root = Path::new("/repo");
+        let scanned = files(&["/repo/src/a.rs", "/repo/src/b.go"]);
+        let remaining = files_without_scip_coverage(root, &scanned, &covered(&["src/a.rs"]));
+        assert_eq!(
+            remaining,
+            vec![PathBuf::from("/repo/src/b.go")],
+            "absolute scanned paths must normalise to the same project-relative key SCIP emits"
+        );
+        assert!(
+            !remaining.contains(&PathBuf::from("/repo/src/a.rs")),
+            "SCIP keys are project-relative posix while scanned files may be absolute"
+        );
+    }
+
+    #[test]
+    fn uncovered_files_keep_their_order() {
+        let root = Path::new("/repo");
+        let scanned = files(&["src/a.rs", "src/b.go", "web/c.ts"]);
+        let remaining = files_without_scip_coverage(root, &scanned, &covered(&["src/b.go"]));
+        assert_eq!(
+            remaining,
+            vec![PathBuf::from("src/a.rs"), PathBuf::from("web/c.ts")],
+            "filtering must preserve the scanned order of the remaining files"
+        );
     }
 }
