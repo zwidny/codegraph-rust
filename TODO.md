@@ -65,6 +65,36 @@ Project databases: `EasyTier_8a11a0febb5c`, `codegraph_rust_1954fc594668`,
 | resolve_and_enqueue_edges | 25 min | 7.8 min | length pruning before candidate counting |
 | chunk fingerprint | 9 min | 2.5 min | `FingerprintTail`: fixed config hashed once |
 
+### Measured: writer tuning is the single biggest lever
+
+Full tier, identical graph, only env changed (`--scip-auto --index-tier full --force`,
+semantic=sync, embedding=sync). Three runs per configuration are not needed here because the
+default configuration was measured twice and agrees.
+
+| config | index_ms | embeddings_and_writes | resolve | symbol_embeddings |
+|---|---|---|---|---|
+| default (pool 1, chunk batch 256) | 415–428 s | 241 s | 136 s | 117 s |
+| `CODEGRAPH_SURREAL_POOL_SIZE=4` | **130 s** | 71 s | 47 s | 36 s |
+| pool 4 + `CODEGRAPH_CHUNK_DB_BATCH_SIZE=1024` | **89 s** | 23 s | 52 s | 39 s |
+
+Two default-config runs (427.6 s and 415.3 s) bracket the baseline, so the 4.7x is real and not
+load noise. The `analyzers` figure swings 5–27 s between identical runs with the same
+478 nodes / 458 edges — that is the LSP non-determinism from `docs/LSP_DETERMINISM.md`, not a
+tuning effect; do not attribute it to `POOL_SIZE`.
+
+Direct measurements that rule out the usual suspects:
+
+- **Embedding service is fast**: 45–54 ms for 1 text, 35–61 ms for 8, 85–610 ms for 64.
+- **Per-insert HNSW is not the cost**: 1,000 random 1024-d rows take 3.22 s with no index and
+  3.18 s with the HNSW index defined. The 1024-d row write itself dominates.
+- **What actually changed**: with `pool=4` the same rows land at 2.4 ms/row; adding
+  `chunk batch=1024` drops the chunk window to 0.79 ms/row (23.4 s for 29,538 chunks).
+- 29,538 vectors produced only 65 embedding inferences (`inference_texts: 65`,
+  `cache_hits: 47,142`), so the phase named "embeddings_and_writes" is ~99% writes.
+- Skipping inference entirely (`CODEGRAPH_EMBEDDING_POLICY=deferred`) needs 115 s and leaves
+  `chunks=0`, `embedding_status=pending`; reconcile then costs 26 s (up from 4–11 s) to delete
+  the missing rows. Useful for "graph now, vectors later", not for a one-shot build.
+
 ### What was learned (do not re-derive)
 
 - `embeddings_and_writes` is a **database write** phase: GPU 0%, embedding container 0.4%
