@@ -1,6 +1,6 @@
 // ABOUTME: Imports compiler-produced SCIP identities without starting one language server per run.
 // ABOUTME: Streams documents in two passes and validates source identity and position encoding.
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use codegraph_core::{CodeNode, EdgeRelationship, EdgeType, NodeId, Span};
 use codegraph_parser::{SourceSnapshot, SourceSnapshots};
 use scip::types::{Document, Occurrence};
@@ -149,6 +149,39 @@ fn range(occurrence: &Occurrence) -> Result<[i32; 4]> {
     }
     Ok(range)
 }
+/// Warn when the artifact predates the captured sources: positions recorded by the
+/// compiler then point at different text, which surfaces as an opaque
+/// "SCIP column is invalid" error further down.
+fn warn_if_index_predates_sources(index: &Path, sources: &SourceSnapshots) {
+    let Ok(index_mtime) = std::fs::metadata(index).and_then(|meta| meta.modified()) else {
+        return;
+    };
+    let mut newer = 0usize;
+    let mut total = 0usize;
+    for snapshot in sources.iter() {
+        total += 1;
+        if snapshot.modified_at > index_mtime {
+            newer += 1;
+        }
+    }
+    if newer > 0 {
+        warn!(
+            "SCIP index {} is older than {} of {} captured sources; recorded positions may not match the current text. Regenerate it (`rust-analyzer scip .`, `scip-typescript index`, or `scip-go`) to avoid position errors",
+            index.display(),
+            newer,
+            total
+        );
+    }
+}
+
+/// Message used when a recorded SCIP position cannot be mapped onto the captured text.
+fn position_error_context(relative_path: &str, range: &[i32; 4], encoding: i32) -> String {
+    let [line, start, end_line, end] = *range;
+    format!(
+        "SCIP position {relative_path}:{line}:{start} (end {end_line}:{end}, encoding {encoding}) does not fit the captured source; the index is probably stale or built from different sources"
+    )
+}
+
 fn byte_position(
     source: &str,
     starts: &[usize],
@@ -307,6 +340,7 @@ pub fn import(
     let mut unmatched_example: Option<String> = None;
     let mut enriched = BTreeSet::<usize>::new();
     let mut definitions = BTreeMap::<String, BTreeSet<NodeId>>::new();
+    warn_if_index_predates_sources(path, sources);
     documents(path, |document| {
         stats.documents += 1;
         let Some(snapshot) = source(
@@ -343,20 +377,15 @@ pub fn import(
                 continue;
             }
             let range = range(occurrence)?;
-            let byte = byte_position(
-                &text,
-                &starts,
-                range[0],
-                range[1],
-                document.position_encoding.value(),
-            )?;
-            let end = byte_position(
-                &text,
-                &starts,
-                range[2],
-                range[3],
-                document.position_encoding.value(),
-            )?;
+            let encoding = document.position_encoding.value();
+            let byte =
+                byte_position(&text, &starts, range[0], range[1], encoding).with_context(|| {
+                    position_error_context(&document.relative_path, &range, encoding)
+                })?;
+            let end =
+                byte_position(&text, &starts, range[2], range[3], encoding).with_context(|| {
+                    position_error_context(&document.relative_path, &range, encoding)
+                })?;
             let name = text[byte..end].trim_start_matches("r#");
             let matching: Vec<_> = indices
                 .iter()
@@ -434,20 +463,15 @@ pub fn import(
             }
             let target = *targets.first().unwrap();
             let range = range(occurrence)?;
-            let start = byte_position(
-                &text,
-                &starts,
-                range[0],
-                range[1],
-                document.position_encoding.value(),
-            )?;
-            let end = byte_position(
-                &text,
-                &starts,
-                range[2],
-                range[3],
-                document.position_encoding.value(),
-            )?;
+            let encoding = document.position_encoding.value();
+            let start =
+                byte_position(&text, &starts, range[0], range[1], encoding).with_context(|| {
+                    position_error_context(&document.relative_path, &range, encoding)
+                })?;
+            let end =
+                byte_position(&text, &starts, range[2], range[3], encoding).with_context(|| {
+                    position_error_context(&document.relative_path, &range, encoding)
+                })?;
             let Some(caller) = containing(nodes, indices, start) else {
                 continue;
             };
@@ -638,6 +662,26 @@ mod tests {
         assert!(byte_position(text, &[0], 0, 1, 1).is_err());
         assert!(byte_position(text, &[0], 0, 0, 0).is_err());
         assert_ne!(symbol_key("a.rs", "local 0"), symbol_key("b.rs", "local 0"));
+    }
+
+    #[test]
+    fn position_context_names_path_and_encoding() {
+        let message = position_error_context("src/lib.rs", &[10, 2, 10, 8], 1);
+        assert!(message.contains("src/lib.rs:10:2"), "{message}");
+        assert!(message.contains("encoding 1"), "{message}");
+        assert!(message.contains("stale"), "{message}");
+    }
+
+    #[test]
+    fn position_context_includes_end_position() {
+        let message = position_error_context("src/lib.rs", &[3, 0, 5, 4], 1);
+        assert!(message.contains("end 5:4"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn stale_warning_does_not_panic_without_index() {
+        let sources = SourceSnapshots::capture(&[], 1024, 1).await.unwrap();
+        warn_if_index_predates_sources(Path::new("/nonexistent/x.scip"), &sources);
     }
 
     #[tokio::test]
