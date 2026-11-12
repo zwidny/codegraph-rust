@@ -77,4 +77,12 @@ edges** (only `documentSymbol`); `full` uses `SymbolsAndDefinitions` and resolve
 `0 edges resolved` on balanced is expected. Set `CODEGRAPH_LSP_DEFINITIONS=1` to force
 definition resolution on balanced.
 
+**Prefer SCIP over per-file LSP.** Generate a compiler index first and pass it via
+`CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`;
+comma-separated entries, `path@subdir` when the index was built inside a subdirectory).
+On a 10k-file tree this cut analysis from 21 minutes to 2.4 s plus a 3.9 s import, and it
+contributes definition edges even on `balanced`. `scripts/scip-index.sh` generates every
+language and prints the value. Setting the variable disables language servers for the run,
+so each language needs its own index; a language without one gets no enrichment.
+
 Reload this guidance with `codegraph agent instructions` after context loss.

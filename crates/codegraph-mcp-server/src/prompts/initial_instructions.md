@@ -154,6 +154,13 @@ CODEGRAPH_LSP_ON_PARTIAL=1 codegraph index packages/happy-android \
   failure. To get LSP edges on balanced, set `CODEGRAPH_LSP_DEFINITIONS=1` (slower).
 - For a large repository, prefer one full `codegraph index <root>` pass with LSP, then
   use partial re-indexes without LSP for day-to-day edits.
+- **Prefer SCIP over per-file LSP.** Generate a compiler index first and pass it via
+  `CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`;
+  comma-separated, `path@subdir` for an index built inside a subdirectory). Measured on a
+  10k-file tree: analysis 21 min -> 2.4 s + 3.9 s import, and it yields definition edges
+  even on `balanced`, where LSP produces none. `scripts/scip-index.sh` does this per
+  language and prints the value. A language with no index gets no enrichment, because
+  setting `CODEGRAPH_SCIP_INDEX` disables language servers for the run.
 
 ---
 
