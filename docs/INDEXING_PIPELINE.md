@@ -71,6 +71,7 @@ counting pass ran *before* the length prune.
 |---|---|
 | `CODEGRAPH_INDEX_TIER=fast` | no language server at all |
 | `CODEGRAPH_SCIP_INDEX=<index.scip>` | import a pre-built SCIP index instead of driving a language server; also skips LSP tool validation |
+| `CODEGRAPH_SCIP_MAX_BYTES=<n>` | opt-in safety valve that rejects an artifact larger than `n` bytes; unset/`0` disables it (default) |
 | `CODEGRAPH_LSP_SKIP_TEST_FILES` | default on; skips `.stories.`, `.generated.`, `__mocks__/`, `__fixtures__/`, `generated/`. **Do not** add `.test.`/`.spec.` back to the skip list — that dropped 25,970 resolvable edges (31.57% → 30.23%) |
 | `CODEGRAPH_LSP_ON_PARTIAL=1` | allow language servers on partial (subdirectory) indexes |
 
@@ -85,7 +86,9 @@ an entry that exists but disagrees with the captured source is rejected as stale
 normalised to the same project-relative posix keys as nodes, so indexes built from `.`,
 an absolute root or Windows separators all bind. Import fails loudly when zero documents
 decode or zero documents match an indexed source instead of reporting success with no
-enrichment.
+enrichment. Documents are decoded one length-delimited message at a time and dropped before
+the next, so peak memory tracks the largest single document, not the artifact size; there is
+no default file-size cap. `CODEGRAPH_SCIP_MAX_BYTES` opts into a size limit instead.
 
 ### Stage 10 — embedding and chunk writes
 

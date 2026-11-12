@@ -38,11 +38,42 @@ fn document_key(relative_path: &str) -> String {
     key
 }
 
-fn documents(path: &Path, mut visit: impl FnMut(Document) -> Result<()>) -> Result<()> {
-    let mut file = std::fs::File::open(path)?;
-    if file.metadata()?.len() > 512 * 1024 * 1024 {
-        bail!("SCIP artifact exceeds 512 MiB import limit");
+/// Parse `CODEGRAPH_SCIP_MAX_BYTES`. `0` (the default) disables the size check:
+/// documents are decoded one at a time, so the file size does not set the memory
+/// budget. A positive value is an opt-in safety valve for pathological artifacts.
+fn max_bytes_from_env(raw: Option<&str>) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(0);
     }
+    let value = raw
+        .parse::<u64>()
+        .map_err(|error| anyhow!("invalid CODEGRAPH_SCIP_MAX_BYTES={raw:?}: {error}"))?;
+    Ok(value)
+}
+
+fn documents_with_limit(
+    path: &Path,
+    max_bytes: u64,
+    mut visit: impl FnMut(Document) -> Result<()>,
+) -> Result<()> {
+    let mut file = std::fs::File::open(path)?;
+    if max_bytes > 0
+        && let Ok(metadata) = file.metadata()
+        && metadata.len() > max_bytes
+    {
+        bail!(
+            "SCIP artifact is {} bytes, above the configured CODEGRAPH_SCIP_MAX_BYTES={} safety limit",
+            metadata.len(),
+            max_bytes
+        );
+    }
+    // `Index.documents` is a repeated field; decode one length-delimited document
+    // at a time and drop it before reading the next, so peak memory tracks the
+    // largest single document instead of the artifact size.
     let mut input = protobuf::CodedInputStream::new(&mut file);
     while let Some(tag) = input.read_raw_tag_or_eof()? {
         if tag == 18 {
@@ -55,6 +86,11 @@ fn documents(path: &Path, mut visit: impl FnMut(Document) -> Result<()>) -> Resu
         }
     }
     Ok(())
+}
+
+fn documents(path: &Path, visit: impl FnMut(Document) -> Result<()>) -> Result<()> {
+    let max_bytes = max_bytes_from_env(std::env::var("CODEGRAPH_SCIP_MAX_BYTES").ok().as_deref())?;
+    documents_with_limit(path, max_bytes, visit)
 }
 
 fn symbol_key(document: &str, symbol: &str) -> String {
@@ -515,6 +551,52 @@ pub fn import(
 mod tests {
     use super::*;
     use protobuf::Message;
+
+    #[test]
+    fn scip_max_bytes_is_opt_in_and_parsed() {
+        assert_eq!(max_bytes_from_env(None).unwrap(), 0);
+        assert_eq!(max_bytes_from_env(Some("")).unwrap(), 0);
+        assert_eq!(max_bytes_from_env(Some(" 0 ")).unwrap(), 0);
+        assert_eq!(max_bytes_from_env(Some("1048576")).unwrap(), 1 << 20);
+        assert!(max_bytes_from_env(Some("512MiB")).is_err());
+    }
+
+    /// Documents are decoded one at a time, so an artifact larger than the legacy
+    /// 512 MiB threshold must import; only an explicit positive limit rejects it.
+    #[test]
+    fn documents_stream_without_a_default_size_cap() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let artifact = root.path().join("index.scip");
+        let index = scip::types::Index {
+            documents: vec![
+                Document {
+                    relative_path: "a.rs".into(),
+                    ..Default::default()
+                },
+                Document {
+                    relative_path: "b.rs".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        std::fs::write(&artifact, index.write_to_bytes()?)?;
+        let len = std::fs::metadata(&artifact)?.len();
+        let mut seen = Vec::new();
+        documents_with_limit(&artifact, 0, |document| {
+            seen.push(document.relative_path);
+            Ok(())
+        })?;
+        assert_eq!(seen, ["a.rs", "b.rs"]);
+        let mut count = 0;
+        documents_with_limit(&artifact, len, |_| {
+            count += 1;
+            Ok(())
+        })?;
+        assert_eq!(count, 2);
+        assert!(documents_with_limit(&artifact, len - 1, |_| Ok(())).is_err());
+        Ok(())
+    }
 
     #[test]
     fn unicode_positions_reject_split_surrogates_and_unspecified_encoding() {
