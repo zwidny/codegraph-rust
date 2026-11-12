@@ -1,8 +1,44 @@
 # TODO — indexing performance & LSP → SCIP migration
 
-Context for a fresh session. State below reflects commit `812d580` (2026-11-12).
+Context for a fresh session. State below reflects commit `610fd05` (2026-11-12).
 
 ## Where things stand
+
+### Fixed in `610fd05` (both were measurement/graph defects, verified on real data)
+
+| defect | before | after |
+|---|---|---|
+| resolution log counted unresolved edges as resolved | `exact/contextual=138859 + lexical=1099 = 139958` = the **total** edge count; `semantic=0` while the store held 3,182 semantic edges | `94276 + 1100 + 3225 = 98601` = `resolved` |
+| stale edges never pruned | store 102,832 rows vs a 96,411-edge graph (6,421 residue); every old edge had live endpoints, so `from IN $stale_nodes OR to IN $stale_nodes` never matched | 96,733 == 96,733; a forged edge with live endpoints is removed by the next run |
+
+`reconcile_catalog_by_file` now takes `fresh_edge_ids` and deletes ids absent from that set
+whose endpoints live in a scanned file. Edge identity includes provenance/`source_span`, so
+switching `--index-tier` changes edge ids while node ids stay put — that is what orphaned the
+residue. An empty `fresh_edge_ids` skips the sweep instead of wiping the table.
+
+### Best-quality configuration (measured on this repo)
+
+```bash
+CODEGRAPH_SCIP_INDEX=$PWD/.codegraph/scip/rust.scip \
+CODEGRAPH_SEMANTIC_RESOLUTION=sync CODEGRAPH_EMBEDDING_POLICY=sync \
+CODEGRAPH_FUZZY_CANDIDATE_LIMIT=0 CODEGRAPH_VECTOR_INDEX_MODE=deferred \
+CODEGRAPH_PROVIDER_CONCURRENCY=4 \
+codegraph index . --index-tier full --force --recursive
+```
+
+`full` is not cosmetic: `extraction_policy_for_tier` emits `references` only for `Full`, and
+`filter_edges_for_tier` strips `References` from `Balanced`.
+
+| | balanced + deferred | full + sync |
+|---|---|---|
+| nodes | 14,041 | 29,220 |
+| edges | 24,205 | 96,733 |
+| `resolution_rate` | 38.28% | 70.23% |
+| semantic | `pending` (0 edges) | `ready` (3,192 edges) |
+| `index_ms` | 126,426 | 196,425 |
+
+Note: `semantic=sync` on this repo yields ~3.2k edges (565 distinct names above the 0.75
+threshold out of 1,614 unresolved names). It is real but modest; `full` contributes far more.
 
 ### Datastore
 
@@ -41,6 +77,16 @@ Project databases: `EasyTier_8a11a0febb5c`, `codegraph_rust_1954fc594668`,
   see `docs/LSP_DETERMINISM.md`. SCIP is static and does not have this problem.
 - Native (`*_native`) analysis methods are gated by `CODEGRAPH_NATIVE_ANALYSIS` (opt-in) and
   verified on real data by `crates/codegraph-graph/tests/native_real_data_diff.rs` (`#[ignore]`).
+- **Regenerate `rust.scip` after editing sources.** Reusing a stale index aborts the whole run
+  with `SCIP column is invalid or document position encoding is unspecified`
+  (`crates/codegraph-mcp/src/analyzers/scip.rs:183`): `byte_position` rejects a recorded column
+  that is past the line or off a char boundary. The message names neither the document nor the
+  cause. Check with `find crates -name '*.rs' -newer .codegraph/scip/rust.scip`.
+- **`phase_ms` mixes counters with durations.** `resolution_fuzzy_len_pruned=130849978` is a
+  count, not milliseconds, so `jq '.phase_ms | sort_by(.value)'` misreads the run.
+- **`ingestion_write_test` flakes under parallel threads.** `bulk_ingestion_is_repeatable_and_
+  cleanup_is_typed_and_scoped` fails ~2/20 on a clean HEAD with `The query was not executed due
+  to a failed transaction`; `--test-threads=1` is stable. Pre-existing `mem://` engine issue.
 
 ## TODO
 
@@ -103,13 +149,17 @@ by hand. Decide: generate in CI and cache, or run the indexers as a pre-step.
 
 | Item | Detail |
 |---|---|
-| Existing stores keep per-insert HNSW | `deferred` only helps fresh stores; migrating an existing project needs dropping and rebuilding the index |
+| Stale-edge sweep is endpoint-scoped | Fixed in `610fd05`, but a file that produces zero nodes never enters `fresh_nodes_by_file`, so its edges only get pruned when the *other* endpoint is in a scanned file |
+| `fresh_edge_ids.is_empty()` skips the sweep | Safe default, but a genuinely edge-less project never prunes. Callers must always pass the real set |
+| Existing stores keep per-insert HNSW | `deferred` only helps fresh stores; migrating an existing project needs dropping and rebuilding the index. This repo's store was rebuilt from empty at `610fd05` |
 | 9 HNSW index definitions in schema | Only one dimension is populated; the other 8 are empty definitions (`idx_chunks_embedding_384/768/1536/…`) |
 | `documents()` memory | SCIP parsing is already streaming; the 3.5 GB peak is the node/edge structures (~18.5 KB/node). `CODEGRAPH_SCIP_MAX_BYTES` is the opt-in guard |
 | `scip` CLI has no merge | Merging is unnecessary now that multiple indexes are supported directly |
 | `pnpm dev` during indexing | It wrecked one measurement (`lsp_nodes_enriched` 42,874 → 2,556). Never measure with a dev server running |
 | paperclip's LSP-enriched count | 42,874 (LSP) vs 44,587 (SCIP). The earlier 2,556 sample was the polluted run |
 | LSP determinism | Still open, see `docs/LSP_DETERMINISM.md`; SCIP is the intended exit |
+| Stale SCIP error message | A stale `index.scip` fails as `SCIP column is invalid or document position encoding is unspecified` with no document name. Consider comparing the index mtime to the source tree and reporting "SCIP index is older than N sources" instead |
+| Occurrence-aware edge ids | ~31% of this repo's 96,733 edges share `(from,to,type)` with another edge (max 71 occurrences of one `references`). Deliberate (`edge.rs` keeps distinct call sites distinct), but degree/coupling metrics must `DISTINCT` or they over-count |
 
 ## Useful commands
 
@@ -128,8 +178,10 @@ docker run --rm -v <go-module>:/src -v /tmp:/out -v /tmp/opencode/scip-go:/usr/l
   -w /src -e GOPROXY=https://goproxy.cn,direct golang:1.23-alpine \
   sh -c "apk add --no-cache git >/dev/null; scip-go --output /out/go.scip"
 
-# Read a run
-jq '.phase_ms' /tmp/stats.json | sort -k2 -n
+# Read a run (`phase_ms` also carries counters such as
+# resolution_fuzzy_len_pruned, so filter to real durations)
+jq '.phase_ms | to_entries | map(select(.key|endswith("_ms")))
+    | sort_by(.value) | reverse | .[0:8]' /tmp/stats.json
 ```
 
 Flags that matter: `CODEGRAPH_SCIP_INDEX`, `CODEGRAPH_SCIP_MAX_BYTES`,
