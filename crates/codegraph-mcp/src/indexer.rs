@@ -768,22 +768,30 @@ impl ProjectIndexer {
                 .map(PathBuf::from)
                 .map(|path| crate::reconciliation::file_fingerprint(&path))
                 .transpose()?;
-            let scip_fingerprint =
-                if let Some(path) = std::env::var_os("CODEGRAPH_SCIP_INDEX").map(PathBuf::from) {
-                    Some(fingerprint(&(
-                        crate::reconciliation::file_fingerprint(&path)?,
-                        if path.with_extension("sources.json").exists() {
+            let scip_specs =
+                parse_scip_indexes(std::env::var("CODEGRAPH_SCIP_INDEX").ok().as_deref())?;
+            let scip_fingerprint = if scip_specs.is_empty() {
+                None
+            } else {
+                let mut indexes = Vec::with_capacity(scip_specs.len());
+                for spec in &scip_specs {
+                    indexes.push((
+                        crate::reconciliation::file_fingerprint(&spec.path)?,
+                        if spec.path.with_extension("sources.json").exists() {
                             Some(crate::reconciliation::file_fingerprint(
-                                &path.with_extension("sources.json"),
+                                &spec.path.with_extension("sources.json"),
                             )?)
                         } else {
                             None
                         },
-                        std::env::var("CODEGRAPH_SCIP_TRUST_SOURCE").unwrap_or_default(),
-                    ))?)
-                } else {
-                    None
-                };
+                        spec.path_prefix.clone(),
+                    ));
+                }
+                Some(fingerprint(&(
+                    indexes,
+                    std::env::var("CODEGRAPH_SCIP_TRUST_SOURCE").unwrap_or_default(),
+                ))?)
+            };
             let make_fingerprint =
                 |external_support: &std::collections::BTreeMap<String, String>| {
                     fingerprint(&(
@@ -914,8 +922,7 @@ impl ProjectIndexer {
             }
             let analyzer_languages: Vec<codegraph_core::Language> =
                 analyzer_languages.into_iter().collect();
-            let scip_path = std::env::var_os("CODEGRAPH_SCIP_INDEX").map(PathBuf::from);
-            if scip_path.is_none() {
+            if scip_specs.is_empty() {
                 Self::validate_analyzer_tools(
                     &analyzer_languages,
                     analyzer_settings,
@@ -1138,7 +1145,7 @@ impl ProjectIndexer {
             let mut lsp_enrichment_stats = crate::analyzers::lsp::LspEnrichmentStats::default();
             if analyzer_settings.lsp_enabled()
                 && !analyzer_languages.is_empty()
-                && scip_path.is_none()
+                && scip_specs.is_empty()
             {
                 let start = std::time::Instant::now();
                 info!(
@@ -1255,27 +1262,41 @@ impl ProjectIndexer {
                 );
             }
 
-            if let Some(path) = &scip_path
-                && analyzer_settings.lsp_enabled()
-            {
+            if !scip_specs.is_empty() && analyzer_settings.lsp_enabled() {
                 let start = std::time::Instant::now();
-                let scip_stats = crate::analyzers::scip::import(
-                    path,
-                    &self.project_root,
-                    &source_snapshots,
-                    &mut nodes,
-                    &mut edges,
-                    analyzer_settings.lsp_definitions_enabled(),
-                )?;
-                lsp_enrichment_stats.nodes_enriched = scip_stats.nodes_enriched;
-                lsp_enrichment_stats.edges_resolved = scip_stats.edges_resolved;
+                for spec in &scip_specs {
+                    let index_start = std::time::Instant::now();
+                    let scip_stats = crate::analyzers::scip::import(
+                        &spec.path,
+                        spec.path_prefix.as_deref(),
+                        &self.project_root,
+                        &source_snapshots,
+                        &mut nodes,
+                        &mut edges,
+                        analyzer_settings.lsp_definitions_enabled(),
+                    )?;
+                    lsp_enrichment_stats.nodes_enriched += scip_stats.nodes_enriched;
+                    lsp_enrichment_stats.edges_resolved += scip_stats.edges_resolved;
+                    info!(
+                        "🧠 SCIP import complete for {}{}: {} nodes enriched + {} edges resolved from {} of {} documents ({} documents had indexed nodes) in {:.1?}",
+                        spec.path.display(),
+                        spec.path_prefix
+                            .as_ref()
+                            .map(|prefix| format!(" (path prefix: {prefix})"))
+                            .unwrap_or_default(),
+                        scip_stats.nodes_enriched,
+                        scip_stats.edges_resolved,
+                        scip_stats.documents_matched,
+                        scip_stats.documents,
+                        scip_stats.documents_with_nodes,
+                        index_start.elapsed()
+                    );
+                }
                 info!(
-                    "🧠 SCIP import complete: {} nodes enriched + {} edges resolved from {} of {} documents ({} documents had indexed nodes) in {:.1?}",
-                    scip_stats.nodes_enriched,
-                    scip_stats.edges_resolved,
-                    scip_stats.documents_matched,
-                    scip_stats.documents,
-                    scip_stats.documents_with_nodes,
+                    "🧠 SCIP import complete: {} indexes, {} nodes enriched + {} edges resolved in {:.1?}",
+                    scip_specs.len(),
+                    lsp_enrichment_stats.nodes_enriched,
+                    lsp_enrichment_stats.edges_resolved,
                     start.elapsed()
                 );
             }
@@ -4506,6 +4527,171 @@ pub(crate) fn normalize_file_path(project_root: &Path, raw: &str) -> String {
         out = stripped.to_string();
     }
     if out.is_empty() { ".".to_string() } else { out }
+}
+
+/// One `CODEGRAPH_SCIP_INDEX` entry: a SCIP artifact plus the optional directory
+/// prefix its document paths are relative to (for indexes generated in a subdirectory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScipIndexSpec {
+    pub path: PathBuf,
+    pub path_prefix: Option<String>,
+}
+
+/// Parse `CODEGRAPH_SCIP_INDEX` as comma-separated `<path>[@<subdir>]` entries.
+///
+/// Unset or blank values yield no indexes (the LSP path takes over). A malformed
+/// entry is a hard error: silently treating `"a.scip,b.scip"` as one path would
+/// produce a confusing "file not found" far from the real mistake.
+pub(crate) fn parse_scip_indexes(raw: Option<&str>) -> Result<Vec<ScipIndexSpec>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut specs = Vec::new();
+    for (index, entry) in raw.split(',').enumerate() {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(anyhow!(
+                "invalid CODEGRAPH_SCIP_INDEX: entry {} is empty; expected `<path>[@<subdir>]` entries separated by commas",
+                index + 1
+            ));
+        }
+        let (path, path_prefix) = match entry.rsplit_once('@') {
+            Some((path, prefix)) => {
+                let path = path.trim();
+                let prefix = prefix.trim();
+                if path.is_empty() {
+                    return Err(anyhow!(
+                        "invalid CODEGRAPH_SCIP_INDEX entry {entry:?}: missing index path before `@`"
+                    ));
+                }
+                if prefix.is_empty() {
+                    return Err(anyhow!(
+                        "invalid CODEGRAPH_SCIP_INDEX entry {entry:?}: missing subdirectory after `@`"
+                    ));
+                }
+                (path, Some(normalize_scip_prefix(prefix)?))
+            }
+            None => (entry, None),
+        };
+        specs.push(ScipIndexSpec {
+            path: PathBuf::from(path),
+            path_prefix,
+        });
+    }
+    Ok(specs)
+}
+
+/// Normalise a `@<subdir>` prefix to the same posix form as project-relative paths,
+/// rejecting prefixes that would escape the project root.
+fn normalize_scip_prefix(prefix: &str) -> Result<String> {
+    if Path::new(prefix).is_absolute() {
+        return Err(anyhow!(
+            "invalid CODEGRAPH_SCIP_INDEX subdirectory {prefix:?}: must be relative to the project root"
+        ));
+    }
+    let mut parts = Vec::new();
+    let normalized = prefix.replace('\\', "/");
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => {
+                return Err(anyhow!(
+                    "invalid CODEGRAPH_SCIP_INDEX subdirectory {prefix:?}: must stay inside the project root"
+                ));
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return Err(anyhow!(
+            "invalid CODEGRAPH_SCIP_INDEX subdirectory {prefix:?}: resolves to the project root; omit `@` instead"
+        ));
+    }
+    Ok(parts.join("/"))
+}
+
+#[cfg(test)]
+mod scip_index_tests {
+    use super::*;
+
+    #[test]
+    fn unset_or_blank_means_no_scip_index() {
+        assert!(parse_scip_indexes(None).unwrap().is_empty());
+        assert!(parse_scip_indexes(Some("")).unwrap().is_empty());
+        assert!(parse_scip_indexes(Some("   ")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_path_keeps_legacy_behavior() {
+        assert_eq!(
+            parse_scip_indexes(Some("/tmp/rust.scip")).unwrap(),
+            vec![ScipIndexSpec {
+                path: PathBuf::from("/tmp/rust.scip"),
+                path_prefix: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn multiple_paths_and_prefixes_parse() {
+        assert_eq!(
+            parse_scip_indexes(Some(
+                "/tmp/rust.scip, /tmp/go.scip@easytier-go ,/tmp/ts.scip@ui/web"
+            ))
+            .unwrap(),
+            vec![
+                ScipIndexSpec {
+                    path: PathBuf::from("/tmp/rust.scip"),
+                    path_prefix: None,
+                },
+                ScipIndexSpec {
+                    path: PathBuf::from("/tmp/go.scip"),
+                    path_prefix: Some("easytier-go".into()),
+                },
+                ScipIndexSpec {
+                    path: PathBuf::from("/tmp/ts.scip"),
+                    path_prefix: Some("ui/web".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn prefixes_are_normalized() {
+        assert_eq!(
+            parse_scip_indexes(Some("/tmp/go.scip@./easytier-go/"))
+                .unwrap()
+                .remove(0)
+                .path_prefix,
+            Some("easytier-go".into())
+        );
+        assert_eq!(
+            parse_scip_indexes(Some("/tmp/go.scip@easytier-go\\sub"))
+                .unwrap()
+                .remove(0)
+                .path_prefix,
+            Some("easytier-go/sub".into())
+        );
+    }
+
+    #[test]
+    fn malformed_entries_are_errors_not_one_path() {
+        // Empty middle entry.
+        assert!(parse_scip_indexes(Some("/tmp/a.scip,,/tmp/b.scip")).is_err());
+        // Trailing separator.
+        assert!(parse_scip_indexes(Some("/tmp/a.scip,")).is_err());
+        // Missing path or prefix around `@`.
+        assert!(parse_scip_indexes(Some("@easytier-go")).is_err());
+        assert!(parse_scip_indexes(Some("/tmp/go.scip@")).is_err());
+        assert!(parse_scip_indexes(Some("/tmp/go.scip@.")).is_err());
+        // Prefix must not escape the project root.
+        assert!(parse_scip_indexes(Some("/tmp/go.scip@..")).is_err());
+        assert!(parse_scip_indexes(Some("/tmp/go.scip@a/../b")).is_err());
+        assert!(parse_scip_indexes(Some("/tmp/go.scip@/abs")).is_err());
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use codegraph_parser::{SourceSnapshot, SourceSnapshots};
 use scip::types::{Document, Occurrence};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 use tracing::{debug, warn};
 
@@ -31,11 +31,28 @@ fn relative_key(root: &Path, path: &Path) -> String {
 }
 
 fn document_key(relative_path: &str) -> String {
-    let mut key = relative_path.replace('\\', "/");
-    while let Some(stripped) = key.strip_prefix("./") {
-        key = stripped.to_string();
+    // `Path::join` keeps `.` segments, and SCIP writers spell paths as `./a.ts`,
+    // `a//b.ts` or `a\b.ts`, so collapse those instead of only stripping a leading
+    // `./`; otherwise a prefixed document can never match its snapshot key.
+    let mut parts = Vec::new();
+    let normalized = relative_path.replace('\\', "/");
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        parts.push(part);
     }
-    key
+    parts.join("/")
+}
+
+/// Apply a per-index directory prefix with `Path::join` semantics, so the
+/// separator between the prefix and the document path is never lost (plain string
+/// concatenation would produce `easytier-gohost.go`).
+fn joined_document_path(relative_path: &str, path_prefix: Option<&str>) -> PathBuf {
+    match path_prefix {
+        Some(prefix) => Path::new(prefix).join(relative_path),
+        None => PathBuf::from(relative_path),
+    }
 }
 
 /// Parse `CODEGRAPH_SCIP_MAX_BYTES`. `0` (the default) disables the size check:
@@ -167,20 +184,26 @@ fn byte_position(
 }
 fn source<'a>(
     document: &Document,
+    path_prefix: Option<&str>,
     by_relative: &'a BTreeMap<String, &'a SourceSnapshot>,
     manifest: &BTreeMap<String, String>,
     trust_source: bool,
     missing_manifest: &mut usize,
 ) -> Result<Option<&'a SourceSnapshot>> {
-    let path = Path::new(&document.relative_path);
+    // The prefix is part of the document's project-relative path, so it must be
+    // applied before the snapshot lookup normalises the path.
+    let path = joined_document_path(&document.relative_path, path_prefix);
+    // SCIP writers can emit documents outside the indexed directory (`scip-go`
+    // records generated files as `../root/.cache/go-build/...`). They can never
+    // match a project snapshot, so skip them instead of failing the whole import.
     if path.is_absolute()
         || path
             .components()
             .any(|part| matches!(part, Component::ParentDir))
     {
-        bail!("SCIP document path escapes the project");
+        return Ok(None);
     }
-    let key = document_key(&document.relative_path);
+    let key = document_key(&path.to_string_lossy());
     let Some(source) = by_relative.get(&key) else {
         return Ok(None);
     };
@@ -240,6 +263,7 @@ fn containing(nodes: &[CodeNode], indices: &[usize], byte: usize) -> Option<usiz
 
 pub fn import(
     path: &Path,
+    path_prefix: Option<&str>,
     root: &Path,
     sources: &SourceSnapshots,
     nodes: &mut [CodeNode],
@@ -282,6 +306,7 @@ pub fn import(
         stats.documents += 1;
         let Some(snapshot) = source(
             &document,
+            path_prefix,
             &by_relative,
             &manifest,
             trust_source,
@@ -372,6 +397,7 @@ pub fn import(
     documents(path, |document| {
         let Some(snapshot) = source(
             &document,
+            path_prefix,
             &by_relative,
             &manifest,
             trust_source,
@@ -679,6 +705,7 @@ mod tests {
         assert_eq!(
             import(
                 &artifact,
+                None,
                 root.path(),
                 &sources,
                 &mut nodes,
@@ -699,6 +726,7 @@ mod tests {
         assert!(
             import(
                 &artifact,
+                None,
                 root.path(),
                 &sources,
                 &mut nodes,
@@ -794,6 +822,7 @@ mod tests {
         std::fs::write(&artifact, index.write_to_bytes()?)?;
         let stats = import(
             &artifact,
+            None,
             root.path(),
             &sources,
             &mut nodes,
@@ -817,6 +846,7 @@ mod tests {
         assert!(
             import(
                 &artifact,
+                None,
                 root.path(),
                 &sources,
                 &mut nodes,
@@ -825,6 +855,140 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn document_key_collapses_join_artifacts() {
+        assert_eq!(document_key("a.rs"), "a.rs");
+        assert_eq!(document_key("./a.rs"), "a.rs");
+        assert_eq!(document_key("a//b.rs"), "a/b.rs");
+        assert_eq!(document_key("a/./b.rs"), "a/b.rs");
+        assert_eq!(document_key("a\\b.rs"), "a/b.rs");
+        assert_eq!(
+            joined_document_path("host.go", None),
+            PathBuf::from("host.go")
+        );
+        assert_eq!(
+            joined_document_path("host.go", Some("easytier-go")),
+            PathBuf::from("easytier-go/host.go")
+        );
+        assert_eq!(
+            joined_document_path("./host.go", Some("easytier-go/")),
+            PathBuf::from("easytier-go/./host.go")
+        );
+    }
+
+    /// A Go index generated inside `easytier-go/` records `host.go`, while the
+    /// project-relative node path is `easytier-go/host.go`. The prefix must be
+    /// joined before normalisation or nothing matches.
+    #[tokio::test]
+    async fn path_prefix_binds_documents_from_a_subdirectory_index() -> Result<()> {
+        use codegraph_core::{Language, Location, NodeType};
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("easytier-go"))?;
+        let path = root.path().join("easytier-go/host.go");
+        let text = "package main\nfunc target() {}\nfunc caller() { target() }\n";
+        std::fs::write(&path, text)?;
+        let sources =
+            SourceSnapshots::capture(&[(path.clone(), text.len() as u64)], 1024, 1).await?;
+        let make_node = |name: &str, start, end| {
+            let mut node = CodeNode::new(
+                name,
+                Some(NodeType::Function),
+                Some(Language::Go),
+                Location {
+                    file_path: "easytier-go/host.go".into(),
+                    line: 2,
+                    column: 0,
+                    end_line: Some(2),
+                    end_column: None,
+                },
+            );
+            node.span = Some(Span {
+                start_byte: start,
+                end_byte: end,
+            });
+            node
+        };
+        let target_start = text.find("target() {}").unwrap() as u32;
+        let call_start = text.rfind("target() }").unwrap() as u32;
+        let mut nodes = vec![
+            make_node("target", target_start, target_start + 6),
+            make_node(
+                "caller",
+                text.find("func caller").unwrap() as u32,
+                text.len() as u32,
+            ),
+        ];
+        let mut edges = vec![EdgeRelationship {
+            from: nodes[1].id,
+            to: "target".into(),
+            edge_type: EdgeType::Calls,
+            metadata: Default::default(),
+            span: Some(Span {
+                start_byte: call_start,
+                end_byte: call_start + 8,
+            }),
+        }];
+        let line_start = text[..call_start as usize].rfind('\n').unwrap() + 1;
+        let column = (call_start as usize - line_start) as i32;
+        let line = text[..call_start as usize].matches('\n').count() as i32;
+        let document = Document {
+            relative_path: "host.go".into(),
+            position_encoding: scip::types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart
+                .into(),
+            occurrences: vec![
+                Occurrence {
+                    symbol: "scip go . host.go target".into(),
+                    symbol_roles: 1,
+                    range: vec![1, 5, 11],
+                    ..Default::default()
+                },
+                Occurrence {
+                    symbol: "scip go . host.go target".into(),
+                    range: vec![line, column, column + 6],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let artifact = root.path().join("go.scip");
+        let index = scip::types::Index {
+            documents: vec![document],
+            ..Default::default()
+        };
+        std::fs::write(&artifact, index.write_to_bytes()?)?;
+
+        // Without the prefix the document cannot be matched.
+        let mut unmatched_nodes = nodes.clone();
+        let mut unmatched_edges = edges.clone();
+        let unmatched = import(
+            &artifact,
+            None,
+            root.path(),
+            &sources,
+            &mut unmatched_nodes,
+            &mut unmatched_edges,
+            false,
+        );
+        assert!(unmatched.is_err());
+
+        let stats = import(
+            &artifact,
+            Some("easytier-go"),
+            root.path(),
+            &sources,
+            &mut nodes,
+            &mut edges,
+            false,
+        )?;
+        assert_eq!(stats.documents, 1);
+        assert_eq!(stats.documents_matched, 1);
+        assert_eq!(stats.documents_with_nodes, 1);
+        assert_eq!(stats.nodes_enriched, 1);
+        assert_eq!(stats.edges_resolved, 1);
+        assert_eq!(edges[0].metadata["target_node_id"], nodes[0].id.to_string());
         Ok(())
     }
 }
