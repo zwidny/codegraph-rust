@@ -168,12 +168,18 @@ enum Commands {
                         (defaults to the nearest .git or .codegraph ancestor).\n\
                       - Partial re-indexes skip language servers; set CODEGRAPH_LSP_ON_PARTIAL=1 and pass\n\
                         --project-root to enable them (LSP loads the whole project, not just the scan path).\n\
-                      - Symbol analysis uses language servers unless CODEGRAPH_SCIP_INDEX names pre-built SCIP\n\
-                        indexes. That is faster and reproducible, and contributes definition edges the LSP\n\
-                        path does not produce. It takes a comma-separated list; each entry is <path>[@<subdir>],\n\
-                        where subdir is the index's directory relative to the project root, e.g.\n\
-                        \"rust.scip,go.scip@easytier-go,ui.scip@ui\". Setting it disables language servers\n\
-                        for the whole run, so mixed-language projects need an index per language.\n\
+                      - RECOMMENDED: generate a SCIP index first, then import it. Without one, every\n\
+                        file costs a language-server round-trip (about 21 minutes per 10k files;\n\
+                        importing a SCIP index for the same tree takes seconds and also yields\n\
+                        definition edges). Generate with `rust-analyzer scip .` (Rust),\n\
+                        `scip-typescript index` (TS/JS) or `scip-go` (Go), then set\n\
+                        CODEGRAPH_SCIP_INDEX. This repository ships scripts/scip-index.sh to do all\n\
+                        of that per language and print the value.\n\
+                      - CODEGRAPH_SCIP_INDEX takes a comma-separated list; each entry is\n\
+                        <path>[@<subdir>], where subdir is the index's directory relative to the project\n\
+                        root, e.g. \"rust.scip,go.scip@easytier-go,ui.scip@ui\". Setting it disables\n\
+                        language servers for the whole run, so a mixed-language project needs one index\n\
+                        per language; a language without an index gets no symbol enrichment.\n\
                       - Vector indexes are built once after all rows are durable\n\
                         (CODEGRAPH_VECTOR_INDEX_MODE=deferred, the default); on a fresh store this writes\n\
                         chunks several times faster than maintaining HNSW per insert. Existing stores keep\n\

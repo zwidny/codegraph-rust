@@ -770,6 +770,17 @@ impl ProjectIndexer {
                 .transpose()?;
             let scip_specs =
                 parse_scip_indexes(std::env::var("CODEGRAPH_SCIP_INDEX").ok().as_deref())?;
+            // Print on every indexing path (fast, partial, balanced): a harness that only
+            // runs `codegraph index` should still learn that SCIP exists.
+            if scip_specs.is_empty() {
+                info!(
+                    "💡 hint: no SCIP index supplied, so symbol analysis falls back to one \
+                     language-server round-trip per file (about 21 minutes per 10k files). \
+                     Generate one (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`) \
+                     and set CODEGRAPH_SCIP_INDEX, or run scripts/scip-index.sh. \
+                     See `codegraph index --help`."
+                );
+            }
             let scip_fingerprint = if scip_specs.is_empty() {
                 None
             } else {
