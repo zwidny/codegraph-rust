@@ -1,6 +1,6 @@
 # TODO — indexing performance & LSP → SCIP migration
 
-Context for a fresh session. State below reflects commit `0a075d3` (2026-11-12).
+Context for a fresh session. State below reflects commit `ee749b1` (2026-11-12).
 
 ## Where things stand
 
@@ -90,23 +90,34 @@ Project databases: `EasyTier_8a11a0febb5c`, `codegraph_rust_1954fc594668`,
 
 ## TODO
 
-### 0. Let `codegraph index` generate SCIP itself (today: manual script only)
+### 0. Let `codegraph index` generate SCIP itself — **done in `ee749b1`**
 
-Current workflow is manual: run `scripts/scip-index.sh`, export
-`CODEGRAPH_SCIP_INDEX`, then index. A fresh session that just runs `codegraph index .`
-silently takes the LSP path (21 min on a 10k-file project instead of ~6 s).
+`--scip-auto` detects languages from manifests (root `Cargo.toml`, any `go.mod`, any
+`package.json` within depth 3, skipping `vendor`/`target`/`node_modules`/`dist`), generates
+one index per language into `.codegraph/scip/`, and feeds the paths back as
+`CODEGRAPH_SCIP_INDEX` entries.
 
-`codegraph index --scip-auto` should:
+Caching lives in the `scip-auto-v1` artifact namespace, keyed by a fingerprint over
+`(relative path, byte length, mtime seconds)` of **that language's** sources, so a Rust edit
+does not invalidate a TypeScript index. Per-language failure handling: a missing indexer or a
+non-zero exit warns and falls back to language servers; `--scip-strict` turns both into errors
+carrying the last 20 stderr lines. An explicit `CODEGRAPH_SCIP_INDEX` wins and skips
+auto-generation.
 
-- detect languages (`Cargo.toml` / `package.json` / `go.mod`)
-- run the matching indexer into `.codegraph/scip/`, cached by content fingerprint
-  (regenerate only when sources or the indexer version change)
-- fall back to LSP with a warning when an indexer is missing or fails
-- offer `--scip-strict` to fail instead of falling back
+Measured here with no environment variables set:
 
-Acceptance: on a fresh clone with `rust-analyzer` installed, plain `codegraph index .`
-produces a SCIP-backed run with no environment variables set. Until then, `AGENTS.md`
-tells agents to run `scripts/scip-index.sh` first.
+| run | SCIP step | index_ms | graph |
+|---|---|---|---|
+| 1 (generate) | ~70 s `rust-analyzer scip`, import 180 ms | 506,541 | nodes 29,486 / edges 97,768 |
+| 2 (cache hit) | `reusing cached SCIP index for rust:`, import 187 ms | 407,901 | identical, `complete: true` |
+
+Both runs produced the same 228/228 documents, 4,069 nodes + 14,360 edges, and a
+bit-identical `resolution_rate`. **Known gap:** an indexer that exits 0 without writing its
+output still yields a spec, so the run fails later with "file not found" instead of falling
+back.
+
+Still manual: CI. `scripts/scip-index.sh` and `--scip-auto` both work locally; wiring either
+into CI (and caching the artifacts between jobs) is unstarted.
 
 ### 1. Per-language analyzer selection — **done in `0a075d3`**
 
@@ -170,10 +181,16 @@ directory, which would overwrite the rust-analyzer index. The Rust index lived a
 - C (1 file): `scip-clang` requires `compile_commands.json`.
 Low value on EasyTier; revisit only if other projects need them.
 
-### 4. CI: generate indexes per language
+### 4. CI: cache the generated indexes (decision made, CI wiring open)
 
-Long term, `codegraph index` should not depend on a developer having produced `index.scip`
-by hand. Decide: generate in CI and cache, or run the indexers as a pre-step.
+The "run the indexers as a pre-step" option is now implemented as `--scip-auto` (see item 0),
+so the decision between the two routes is settled: precondition is part of `codegraph index`
+itself, not a separate CI-only artifact.
+
+What remains is CI plumbing: run `codegraph index --scip-auto` (or
+`scripts/scip-index.sh --export`) in the workflow and cache `.codegraph/scip/` between jobs
+keyed by the same source fingerprint, so a CI run does not rebuild indexes it already has.
+Nothing is wired up yet.
 
 ### 5. Known limits not yet addressed
 
