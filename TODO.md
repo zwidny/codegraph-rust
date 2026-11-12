@@ -1,6 +1,6 @@
 # TODO — indexing performance & LSP → SCIP migration
 
-Context for a fresh session. State below reflects commit `ee749b1` (2026-11-12).
+Context for a fresh session. State below reflects commit `291192f` (2026-11-12).
 
 ## Where things stand
 
@@ -79,9 +79,12 @@ Project databases: `EasyTier_8a11a0febb5c`, `codegraph_rust_1954fc594668`,
   verified on real data by `crates/codegraph-graph/tests/native_real_data_diff.rs` (`#[ignore]`).
 - **Regenerate `rust.scip` after editing sources.** Reusing a stale index aborts the whole run
   with `SCIP column is invalid or document position encoding is unspecified`
-  (`crates/codegraph-mcp/src/analyzers/scip.rs:183`): `byte_position` rejects a recorded column
-  that is past the line or off a char boundary. The message names neither the document nor the
-  cause. Check with `find crates -name '*.rs' -newer .codegraph/scip/rust.scip`.
+  (`crates/codegraph-mcp/src/analyzers/scip.rs`): `byte_position` rejects a recorded column that
+  is past the line or off a char boundary. Since `291192f` the import first warns
+  `SCIP index … is older than N of M captured sources` and the position error names the document
+  and encoding, so this is now diagnosable instead of mysterious. `--scip-auto` regenerates by
+  fingerprint; with an explicit `CODEGRAPH_SCIP_INDEX` check with
+  `find crates -name '*.rs' -newer .codegraph/scip/rust.scip`.
 - **`phase_ms` mixes counters with durations.** `resolution_fuzzy_len_pruned=130849978` is a
   count, not milliseconds, so `jq '.phase_ms | sort_by(.value)'` misreads the run.
 - **`ingestion_write_test` flakes under parallel threads.** `bulk_ingestion_is_repeatable_and_
@@ -205,7 +208,7 @@ Nothing is wired up yet.
 | `pnpm dev` during indexing | It wrecked one measurement (`lsp_nodes_enriched` 42,874 → 2,556). Never measure with a dev server running |
 | paperclip's LSP-enriched count | 42,874 (LSP) vs 44,587 (SCIP). The earlier 2,556 sample was the polluted run |
 | LSP determinism | Still open, see `docs/LSP_DETERMINISM.md`; SCIP is the intended exit |
-| Stale SCIP error message | A stale `index.scip` fails as `SCIP column is invalid or document position encoding is unspecified` with no document name. Consider comparing the index mtime to the source tree and reporting "SCIP index is older than N sources" instead |
+| Stale SCIP error message | **Fixed in `291192f`**: the import now warns `SCIP index … is older than N of M captured sources` (mtime comparison, non-fatal) and position failures carry `<path>:<line>:<col> (end …, encoding N) … the index is probably stale`. The mtime heuristic can misfire on `git checkout`/`touch` — it only warns, so that is cosmetic |
 | Occurrence-aware edge ids | ~31% of this repo's 96,733 edges share `(from,to,type)` with another edge (max 71 occurrences of one `references`). Deliberate (`edge.rs` keeps distinct call sites distinct), but degree/coupling metrics must `DISTINCT` or they over-count |
 
 ## Useful commands
