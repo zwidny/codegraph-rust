@@ -122,16 +122,47 @@ Measured on this repo: SCIP covers **227 of 260** files, LSP runs on the remaini
 (5.1 s, `languages: [Python, Rust]`, **478 nodes + 458 edges** — previously zero).
 `lsp_nodes_enriched` went 4,035 → 4,520 == 4,042 (SCIP) + 478 (LSP) exactly.
 
-Still open: the EasyTier acceptance target (`lsp_nodes_enriched` ≥ 15,673 with Rust+Go SCIP
-plus Kotlin/C LSP) needs that project's indexes generated and measured.
+EasyTier acceptance (2026-11-12, four indexes: rust, go@easytier-go, ts, ts-js@easytier-js):
 
-### 2. TypeScript on EasyTier
+| metric | value |
+|---|---|
+| SCIP coverage | **743 of 847** scanned files (104 to LSP) |
+| SCIP contribution | 15,903 nodes + 62,011 edges in 957 ms |
+| LSP contribution | 115 nodes + 748 edges in 37.5 s |
+| `lsp_nodes_enriched` | **16,018** = 15,903 + 115 (target ≥ 15,673 ✅) |
+| LSP-enriched by language | **Kotlin 73**, TypeScript 25, JavaScript 15, Cpp 2 |
+| graph | 75,353 nodes / 262,138 edges, `resolution_rate` 71.13%, `complete: true`, 0 errors |
 
-`scip-typescript 0.6.2` is installed globally. EasyTier has 79 `.ts` + 19 `.js` files
-(`easytier-js`, `easytier-gui`). Add `ts.scip@<subdir>` and measure. Expected: modest gain
-(98 files) but completes the multi-language picture on this project.
+The Kotlin/C files that used to get nothing now carry `analyzer: lsp_symbols` in
+`metadata` (note: `metadata` is stored as a *stringified* JSON on nodes, so query it with
+`string::contains(metadata, 'lsp_symbols')`, not `metadata.attributes.analyzer`).
 
-Note: `scip-typescript` needs `pnpm install` in that package and a resolvable tsconfig.
+### 2. TypeScript on EasyTier — **done**
+
+`scip-typescript 0.6.2` + `pnpm install` produced two indexes because EasyTier has **two**
+independent pnpm workspaces:
+
+```bash
+# root workspace: easytier-gui, easytier-web/{frontend,frontend-lib,config-generator},
+# tauri-plugin-vpnservice (7 tsconfig projects)
+cd <project> && pnpm install   # 1m32s, 835 packages
+NODE_OPTIONS=--max-old-space-size=16384 scip-typescript index --pnpm-workspaces \
+  --output /tmp/opencode/easytier-ts.scip      # 2.1 MB
+
+# easytier-js is its OWN workspace (browser/cloudflare/runtime/examples), NOT covered
+# by the root --pnpm-workspaces run
+cd <project>/easytier-js && pnpm install       # 3m03s
+NODE_OPTIONS=--max-old-space-size=16384 scip-typescript index --pnpm-workspaces \
+  --output /tmp/opencode/easytier-ts-js.scip   # 887 KB → use @easytier-js prefix
+```
+
+Measured: TS index covered 40 documents (188 nodes + 213 edges), `easytier-js` covered 28
+documents (42 nodes + 87 edges). `examples/web` has no tsconfig and is skipped by the
+indexer itself.
+
+**Always pass `--output`**: `scip-typescript` defaults to `index.scip` in the current
+directory, which would overwrite the rust-analyzer index. The Rust index lived at
+`<project>/index.scip` (48 MB) and was copied aside before the first run.
 
 ### 3. Kotlin and C
 
