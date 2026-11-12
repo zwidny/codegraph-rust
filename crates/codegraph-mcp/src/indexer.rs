@@ -2091,11 +2091,38 @@ impl ProjectIndexer {
             phase_ms.insert("resolution_fuzzy_calls".into(), fuzzy.calls);
             phase_ms.insert("resolution_fuzzy_ms".into(), fuzzy.nanos / 1_000_000);
             phase_ms.insert("resolution_fuzzy_candidates".into(), fuzzy.candidates);
+            phase_ms.insert("resolution_fuzzy_len_pruned".into(), fuzzy.len_pruned);
+            phase_ms.insert(
+                "resolution_fuzzy_levenshtein_calls".into(),
+                fuzzy.levenshtein_calls,
+            );
+            phase_ms.insert("resolution_fuzzy_above_cutoff".into(), fuzzy.above_cutoff);
+            phase_ms.insert(
+                "resolution_fuzzy_trigram_ms".into(),
+                fuzzy.trigram_nanos / 1_000_000,
+            );
+            phase_ms.insert(
+                "resolution_fuzzy_counts_ms".into(),
+                fuzzy.counts_nanos / 1_000_000,
+            );
+            phase_ms.insert(
+                "resolution_fuzzy_lev_ms".into(),
+                fuzzy.lev_nanos / 1_000_000,
+            );
             info!(
-                "🔤 Fuzzy resolution: {} calls, {} candidates, {} ms summed across workers",
+                "🔤 Fuzzy resolution: {} calls, {} candidates ({} length-pruned), {} \
+                 levenshtein calls, {} above cutoff, {} ms summed across workers \
+                 [trigrams {} ms, counts {} ms, loop {} ms] (limit {})",
                 fuzzy.calls,
                 fuzzy.candidates,
-                fuzzy.nanos / 1_000_000
+                fuzzy.len_pruned,
+                fuzzy.levenshtein_calls,
+                fuzzy.above_cutoff,
+                fuzzy.nanos / 1_000_000,
+                fuzzy.trigram_nanos / 1_000_000,
+                fuzzy.counts_nanos / 1_000_000,
+                fuzzy.lev_nanos / 1_000_000,
+                fuzzy.limit
             );
             // Diagnostic only: the rayon pool size actually used by the loop above.
             // Recorded as a raw number (not a duration) so it is never summed.

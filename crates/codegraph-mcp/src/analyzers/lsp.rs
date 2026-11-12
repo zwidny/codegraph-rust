@@ -1188,19 +1188,17 @@ fn is_test_like_path(path: &str) -> bool {
     let path = path.replace('\\', "/").to_lowercase();
     let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
 
-    const FILE_MARKERS: [&str; 4] = [".test.", ".spec.", ".stories.", ".generated."];
+    const FILE_MARKERS: [&str; 2] = [".stories.", ".generated."];
     if FILE_MARKERS.iter().any(|marker| file_name.contains(marker)) {
         return true;
     }
 
-    // Pad so that a relative path's leading segment still matches, e.g. `__tests__/x.ts`.
+    // Pad so that a relative path's leading segment still matches, e.g. `__mocks__/x.ts`.
     let padded = format!("/{}", path.trim_start_matches('/'));
-    const DIR_MARKERS: [&str; 4] = [
-        "/__tests__/",
-        "/__mocks__/",
-        "/__fixtures__/",
-        "/generated/",
-    ];
+    // `.test.` / `.spec.` files and `__tests__/` are deliberately NOT skipped: measured on
+    // paperclip, skipping them dropped 25,970 otherwise-resolvable edges (resolution 31.57%
+    // -> 30.23%), because test symbols feed edges that need LSP qualified names.
+    const DIR_MARKERS: [&str; 3] = ["/__mocks__/", "/__fixtures__/", "/generated/"];
     DIR_MARKERS.iter().any(|marker| padded.contains(marker))
 }
 
@@ -1455,19 +1453,29 @@ mod tests {
     fn test_like_paths_are_detected_without_false_positives() {
         // Filename-segment markers.
         for hit in [
-            "src/foo.test.ts",
-            "src/foo.spec.tsx",
             "src/Button.stories.tsx",
             "src/types.generated.ts",
-            "packages/Foo/__tests__/bar.ts",
             "packages/Foo/__mocks__/bar.ts",
             "packages/Foo/__fixtures__/bar.ts",
             "packages/Foo/generated/bar.ts",
-            "__tests__/relative.ts",
             "GENERATED/Upper.ts",
-            "src/Foo.Test.TS",
         ] {
             assert!(is_test_like_path(hit), "expected test-like: {hit}");
+        }
+
+        // `.test.` / `.spec.` / `__tests__/` must NOT be skipped: they feed edges that need
+        // LSP qualified names (paperclip lost 25,970 resolvable edges when they were skipped).
+        for keep in [
+            "src/foo.test.ts",
+            "src/foo.spec.tsx",
+            "src/Foo.Test.TS",
+            "packages/Foo/__tests__/bar.ts",
+            "__tests__/relative.ts",
+        ] {
+            assert!(
+                !is_test_like_path(keep),
+                "test file must stay in LSP: {keep}"
+            );
         }
 
         // Real sources must survive: no bare `contains("test")`, no substring match

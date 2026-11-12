@@ -34,11 +34,28 @@ pub(crate) struct ExternalSymbol {
 /// Diagnostic counters for the fuzzy fallback, aggregated across the parallel
 /// resolution loop. `nanos` sums per-call wall time over every rayon worker, so
 /// it is total CPU time spent in `fuzzy`, not elapsed wall time.
+///
+/// Phase timings are recorded once per `fuzzy` call (never per candidate): the
+/// timer itself would otherwise dominate the sub-nanosecond work it measures.
+/// `lev_nanos` is the whole traversal/scoring loop, which is where the
+/// Levenshtein calls happen; the loop also runs the length prune and `choose`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FuzzyStats {
     pub calls: u64,
     pub nanos: u64,
     pub candidates: u64,
+    /// Candidates dropped by the length-ratio prune inside
+    /// `ranked_candidate_indices`, before the shortlist cap is applied.
+    pub len_pruned: u64,
+    /// Attempts to score a candidate with `normalized_similarity_with_args`.
+    pub levenshtein_calls: u64,
+    /// Scores at or above the current `best` that reached `choose()`.
+    pub above_cutoff: u64,
+    pub trigram_nanos: u64,
+    pub counts_nanos: u64,
+    pub lev_nanos: u64,
+    /// Effective candidate cap; `0` means unlimited.
+    pub limit: usize,
 }
 
 pub(crate) struct SymbolCatalog {
@@ -49,6 +66,13 @@ pub(crate) struct SymbolCatalog {
     fuzzy_calls: AtomicU64,
     fuzzy_nanos: AtomicU64,
     fuzzy_candidates: AtomicU64,
+    fuzzy_len_pruned: AtomicU64,
+    fuzzy_levenshtein_calls: AtomicU64,
+    fuzzy_above_cutoff: AtomicU64,
+    fuzzy_trigram_nanos: AtomicU64,
+    fuzzy_counts_nanos: AtomicU64,
+    fuzzy_lev_nanos: AtomicU64,
+    fuzzy_limit: usize,
 }
 
 pub(crate) fn aliases(node: &CodeNode) -> BTreeSet<String> {
@@ -104,13 +128,36 @@ fn trigrams(name: &str) -> BTreeSet<String> {
 
 /// Upper bound on how many trigram-overlap candidates `fuzzy` scores per lookup.
 ///
-/// The cap is applied after ranking by shared trigrams and after the length-ratio
-/// prune, so expensive Levenshtein comparisons only run on the most promising
-/// names. A sensitivity sweep over the 63,292-relationship codegraph-rust fixture
-/// (14,316 fuzzy calls) produced a byte-identical resolved edge set from 4
-/// candidates upward; 256 is kept as a wide margin for much larger catalogs
-/// because the capped window is not the dominant cost.
-const FUZZY_CANDIDATE_LIMIT: usize = 256;
+/// `0` keeps every candidate that survives the length-ratio prune. The cap is
+/// opt-in through `CODEGRAPH_FUZZY_CANDIDATE_LIMIT`: on the 1.9M-relationship
+/// paperclip catalog a hard 256 cap dropped 25,970 otherwise-resolvable edges,
+/// so the default must not truncate.
+fn fuzzy_limit_for(value: Option<&str>) -> usize {
+    value
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Resolve the effective fuzzy candidate cap from the environment.
+///
+/// Unset, empty and `0` all mean "unlimited". A value that fails to parse also
+/// degrades to unlimited, with a debug note, rather than failing the index.
+fn configured_fuzzy_limit() -> usize {
+    let value = std::env::var("CODEGRAPH_FUZZY_CANDIDATE_LIMIT").ok();
+    let limit = fuzzy_limit_for(value.as_deref());
+    if let Some(raw) = value.as_deref().map(str::trim)
+        && !raw.is_empty()
+        && raw.parse::<usize>().is_err()
+    {
+        tracing::debug!(
+            "CODEGRAPH_FUZZY_CANDIDATE_LIMIT={raw:?} is not a non-negative integer; \
+             fuzzy candidate cap disabled (0 = unlimited)"
+        );
+    }
+    limit
+}
 
 impl SymbolCatalog {
     pub(crate) fn new(nodes: &[CodeNode]) -> Self {
@@ -134,6 +181,13 @@ impl SymbolCatalog {
             fuzzy_calls: AtomicU64::new(0),
             fuzzy_nanos: AtomicU64::new(0),
             fuzzy_candidates: AtomicU64::new(0),
+            fuzzy_len_pruned: AtomicU64::new(0),
+            fuzzy_levenshtein_calls: AtomicU64::new(0),
+            fuzzy_above_cutoff: AtomicU64::new(0),
+            fuzzy_trigram_nanos: AtomicU64::new(0),
+            fuzzy_counts_nanos: AtomicU64::new(0),
+            fuzzy_lev_nanos: AtomicU64::new(0),
+            fuzzy_limit: configured_fuzzy_limit(),
         };
         for node in nodes {
             catalog.insert_symbol(
@@ -332,8 +386,9 @@ impl SymbolCatalog {
         min_ratio: f64,
         limit: usize,
     ) -> Vec<(usize, usize)> {
-        let mut ranked: Vec<_> = self
-            .candidate_counts(grams)
+        let counts = self.candidate_counts(grams);
+        let overlapping = counts.len();
+        let mut ranked: Vec<_> = counts
             .into_iter()
             .filter(|(index, _)| {
                 let candidate = &self.lexical[*index];
@@ -343,6 +398,10 @@ impl SymbolCatalog {
                     >= min_ratio
             })
             .collect();
+        if ranked.len() < overlapping {
+            self.fuzzy_len_pruned
+                .fetch_add((overlapping - ranked.len()) as u64, Ordering::Relaxed);
+        }
         if limit != 0 && ranked.len() > limit {
             ranked.select_nth_unstable_by(limit, |a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             ranked.truncate(limit);
@@ -356,6 +415,13 @@ impl SymbolCatalog {
             calls: self.fuzzy_calls.load(Ordering::Relaxed),
             nanos: self.fuzzy_nanos.load(Ordering::Relaxed),
             candidates: self.fuzzy_candidates.load(Ordering::Relaxed),
+            len_pruned: self.fuzzy_len_pruned.load(Ordering::Relaxed),
+            levenshtein_calls: self.fuzzy_levenshtein_calls.load(Ordering::Relaxed),
+            above_cutoff: self.fuzzy_above_cutoff.load(Ordering::Relaxed),
+            trigram_nanos: self.fuzzy_trigram_nanos.load(Ordering::Relaxed),
+            counts_nanos: self.fuzzy_counts_nanos.load(Ordering::Relaxed),
+            lev_nanos: self.fuzzy_lev_nanos.load(Ordering::Relaxed),
+            limit: self.fuzzy_limit,
         }
     }
 
@@ -375,14 +441,22 @@ impl SymbolCatalog {
         let scorer = rapidfuzz::distance::levenshtein::BatchComparator::new(target.chars());
         let mut best = 0.85f64;
         let mut matches = HashSet::new();
-        let candidates = self.ranked_candidate_indices(
-            &trigrams(&target),
-            target_length,
-            best,
-            FUZZY_CANDIDATE_LIMIT,
+        let trigram_started = Instant::now();
+        let grams = trigrams(&target);
+        self.fuzzy_trigram_nanos.fetch_add(
+            trigram_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        let counts_started = Instant::now();
+        let candidates =
+            self.ranked_candidate_indices(&grams, target_length, best, self.fuzzy_limit);
+        self.fuzzy_counts_nanos.fetch_add(
+            counts_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
         );
         self.fuzzy_candidates
             .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+        let lev_started = Instant::now();
         for (index, _) in candidates {
             let candidate = &self.lexical[index];
             // Edit-distance similarity cannot exceed the ratio of the shorter length.
@@ -393,6 +467,7 @@ impl SymbolCatalog {
             {
                 continue;
             }
+            self.fuzzy_levenshtein_calls.fetch_add(1, Ordering::Relaxed);
             let Some(score) = scorer.normalized_similarity_with_args(
                 candidate.normalized.chars(),
                 &rapidfuzz::distance::levenshtein::Args::default().score_cutoff(best),
@@ -402,6 +477,7 @@ impl SymbolCatalog {
             if score < best {
                 continue;
             }
+            self.fuzzy_above_cutoff.fetch_add(1, Ordering::Relaxed);
             let Some(id) = self.choose(&self.aliases[&candidate.alias], edge.from) else {
                 continue;
             };
@@ -411,6 +487,8 @@ impl SymbolCatalog {
             }
             matches.insert(id);
         }
+        self.fuzzy_lev_nanos
+            .fetch_add(lev_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.fuzzy_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         (matches.len() == 1).then(|| (*matches.iter().next().unwrap(), best))
@@ -549,5 +627,62 @@ mod tests {
         assert_eq!(stats.calls, 1);
         assert!(stats.candidates > 0);
         assert!(stats.nanos > 0);
+        assert!(stats.levenshtein_calls > 0);
+        assert!(stats.levenshtein_calls <= stats.candidates);
+        assert!(stats.above_cutoff > 0);
+        assert!(stats.above_cutoff <= stats.levenshtein_calls);
+        assert!(stats.trigram_nanos > 0);
+        assert!(stats.counts_nanos > 0);
+        assert!(stats.lev_nanos > 0);
+        assert!(stats.trigram_nanos + stats.counts_nanos + stats.lev_nanos <= stats.nanos);
+    }
+
+    #[test]
+    fn fuzzy_candidate_limit_parsing_defaults_to_unlimited() {
+        assert_eq!(fuzzy_limit_for(None), 0);
+        assert_eq!(fuzzy_limit_for(Some("")), 0);
+        assert_eq!(fuzzy_limit_for(Some("   ")), 0);
+        assert_eq!(fuzzy_limit_for(Some("0")), 0);
+        assert_eq!(fuzzy_limit_for(Some("256")), 256);
+        assert_eq!(fuzzy_limit_for(Some(" 128 ")), 128);
+        assert_eq!(fuzzy_limit_for(Some("abc")), 0);
+        assert_eq!(fuzzy_limit_for(Some("-1")), 0);
+    }
+
+    #[test]
+    fn zero_limit_keeps_every_length_pruned_candidate() {
+        let nodes: Vec<_> = [
+            "calculate_result",
+            "calculate_result_extra",
+            "calculate_response",
+            "calculate",
+            "recalculate_result",
+            "unrelated",
+        ]
+        .into_iter()
+        .map(|name| node("a.rs", name))
+        .collect();
+        let catalog = SymbolCatalog::new(&nodes);
+        let target = "calculate_reslt";
+        let grams = trigrams(target);
+        let length = target.chars().count();
+        let all = catalog.ranked_candidate_indices(&grams, length, 0.85, 0);
+        assert!(!all.is_empty(), "unlimited shortlist must not be empty");
+        let expected = catalog
+            .candidate_counts(&grams)
+            .into_iter()
+            .filter(|(index, _)| {
+                let characters = catalog.lexical[*index].characters;
+                (length.min(characters) as f64) / (length.max(characters).max(1) as f64)
+                    + f64::EPSILON
+                    >= 0.85
+            })
+            .count();
+        assert_eq!(all.len(), expected);
+        assert_eq!(
+            catalog.ranked_candidate_indices(&grams, length, 0.85, expected + 10),
+            all,
+            "a cap wider than the candidate set must retain it unchanged"
+        );
     }
 }
