@@ -271,6 +271,16 @@ enum Commands {
             help = "Complete the persisted deferred inference job with current sources"
         )]
         complete_deferred: bool,
+        #[arg(
+            long,
+            help = "Generate SCIP indexes for detected languages (Rust/TS/Go) before indexing, cached by source fingerprint; falls back to language servers when an indexer is missing or fails"
+        )]
+        scip_auto: bool,
+        #[arg(
+            long,
+            help = "With --scip-auto, fail instead of falling back to language servers"
+        )]
+        scip_strict: bool,
         #[arg(long, help = "Write indexing metrics and completion status as JSON")]
         stats_json: Option<PathBuf>,
 
@@ -655,6 +665,8 @@ fn main() -> Result<()> {
             symbol_max_concurrent: None,
             index_tier,
             complete_deferred: false,
+            scip_auto: false,
+            scip_strict: false,
             stats_json: None,
             project_root: None,
         };
@@ -730,6 +742,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
             symbol_max_concurrent,
             index_tier,
             complete_deferred,
+            scip_auto,
+            scip_strict,
             stats_json,
             project_root,
         } => {
@@ -751,6 +765,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 symbol_max_concurrent,
                 index_tier,
                 complete_deferred,
+                scip_auto,
+                scip_strict,
                 stats_json,
                 project_root,
                 cli.debug,
@@ -1329,6 +1345,8 @@ async fn handle_index(
     symbol_max_concurrent: Option<usize>,
     index_tier: Option<IndexTier>,
     complete_deferred: bool,
+    scip_auto: bool,
+    scip_strict: bool,
     stats_json: Option<PathBuf>,
     project_root_override: Option<PathBuf>,
     debug_log: bool,
@@ -1403,6 +1421,8 @@ async fn handle_index(
     let languages_list = languages.clone().unwrap_or_default();
     let indexer_config = IndexerConfig {
         complete_deferred,
+        scip_auto: scip_auto || scip_strict,
+        scip_strict,
         languages: languages_list.clone(),
         exclude_patterns: exclude,
         include_patterns: include,

@@ -6,6 +6,7 @@ pub mod indexer;
 pub mod policy;
 mod reconciliation;
 mod resolution;
+pub mod scip_auto;
 #[cfg(any(test, feature = "ai-enhanced"))]
 mod semantic_scoring;
 pub mod transport;

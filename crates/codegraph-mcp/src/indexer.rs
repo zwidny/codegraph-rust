@@ -138,6 +138,12 @@ fn extract_count(values: Vec<JsonValue>) -> Result<i64> {
 pub struct IndexerConfig {
     #[serde(default)]
     pub complete_deferred: bool,
+    /// Generate SCIP indexes for detected languages before indexing.
+    #[serde(default)]
+    pub scip_auto: bool,
+    /// With `scip_auto`, fail instead of falling back to LSP.
+    #[serde(default)]
+    pub scip_strict: bool,
     pub languages: Vec<String>,
     pub exclude_patterns: Vec<String>,
     pub include_patterns: Vec<String>,
@@ -162,6 +168,8 @@ impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
             complete_deferred: false,
+            scip_auto: false,
+            scip_strict: false,
             languages: vec![],
             exclude_patterns: vec![],
             include_patterns: vec![],
@@ -768,8 +776,35 @@ impl ProjectIndexer {
                 .map(PathBuf::from)
                 .map(|path| crate::reconciliation::file_fingerprint(&path))
                 .transpose()?;
-            let scip_specs =
-                parse_scip_indexes(std::env::var("CODEGRAPH_SCIP_INDEX").ok().as_deref())?;
+            let scip_specs = if self.config.scip_auto || self.config.scip_strict {
+                let explicit = std::env::var("CODEGRAPH_SCIP_INDEX")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty());
+                if explicit.is_some() {
+                    info!("CODEGRAPH_SCIP_INDEX is set; ignoring --scip-auto");
+                    parse_scip_indexes(explicit.as_deref())?
+                } else {
+                    let scip_dir = self.project_root.join(".codegraph/scip");
+                    let entries = crate::scip_auto::ensure_indexes(
+                        &self.project_root,
+                        &scip_dir,
+                        self.config.scip_strict,
+                    )?;
+                    if entries.is_empty() {
+                        warn!("--scip-auto produced no indexes; falling back to language servers");
+                        Vec::new()
+                    } else {
+                        info!(
+                            "SCIP auto-generation produced {} index(es): {}",
+                            entries.len(),
+                            entries.join(", ")
+                        );
+                        parse_scip_indexes(Some(&entries.join(",")))?
+                    }
+                }
+            } else {
+                parse_scip_indexes(std::env::var("CODEGRAPH_SCIP_INDEX").ok().as_deref())?
+            };
             // Print on every indexing path (fast, partial, balanced): a harness that only
             // runs `codegraph index` should still learn that SCIP exists.
             if scip_specs.is_empty() {
