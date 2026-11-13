@@ -100,13 +100,31 @@ WHERE project_id = $1 AND edge_type = ANY($2) AND (to_id = ANY($3) OR from_id = 
 ORDER BY id";
 
 /// Node-level vector candidates: the closest chunk per parent node.
+///
+/// Two stages on purpose. `GROUP BY parent_node` with a global `ORDER BY
+/// min(distance)` cannot use the HNSW index, so it degrades to a sequential scan
+/// of every chunk: measured at 176 ms for 38k chunks versus 1.6 ms here, and the
+/// gap grows linearly. `$4` bounds the candidate chunk set first, which lets the
+/// index serve the `ORDER BY`.
 const SEARCH_VECTOR_SQL: &str = "\
-SELECT parent_node AS id, min(embedding <=> $1::text::vector) AS distance \
-FROM chunks \
-WHERE project_id = $2 AND embedding IS NOT NULL \
+WITH knn AS ( \
+  SELECT parent_node, embedding <=> $1::text::vector AS distance \
+  FROM chunks \
+  WHERE project_id = $2 AND embedding IS NOT NULL \
+  ORDER BY distance \
+  LIMIT $4 \
+) \
+SELECT parent_node AS id, min(distance) AS distance \
+FROM knn \
 GROUP BY parent_node \
 ORDER BY distance \
 LIMIT $3";
+
+/// How many chunks the vector leg may look at before collapsing to nodes.
+///
+/// SurrealDB's `<|100,200|>` asks for the 100 nearest chunks; 200 here is slightly
+/// wider so a node whose best chunk ranks just past SurrealDB's cut is not lost.
+const VECTOR_CANDIDATE_CHUNKS: i64 = 200;
 
 /// Exact or prefix `name` matches. `$2` is already `LIKE`-escaped by
 /// [`escape_like_pattern`], and the escape character is pinned to `\`.
@@ -873,6 +891,7 @@ impl crate::graph_types::GraphQuery for PgGraph {
                     &vector_text(query_embedding),
                     &self.project_id,
                     &vector_limit,
+                    &VECTOR_CANDIDATE_CHUNKS,
                 ],
             )
             .await
