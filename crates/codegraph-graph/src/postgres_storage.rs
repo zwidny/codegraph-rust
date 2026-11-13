@@ -545,9 +545,11 @@ UPDATE edges SET to_id = $3 WHERE project_id = $1 AND to_id = $2
 const FIND_NODES_BY_NAME_SQL: &str = r#"
 SELECT name, node_type, language, file_path, start_line, end_line, id
 FROM nodes
-WHERE project_id = $1 AND (name = $2 OR left(name, char_length($2)) = $2)
+WHERE project_id = $1
+  AND (name = $2 OR left(name, char_length($2)) = $2)
+  AND ($3::text IS NULL OR node_type ILIKE '%' || $3 || '%')
 ORDER BY name ASC
-LIMIT $3
+LIMIT $4
 "#;
 
 /// Callers of every node named `$2`, over `calls` edges.
@@ -2401,17 +2403,23 @@ impl crate::storage::IndexStorage for PgStore {
     }
 
     /// Exact-or-prefix name match ordered by name. A NULL `file_path` decodes as
-    /// an empty string, mirroring [`Self::node_identities`].
+    /// an empty string, mirroring [`Self::node_identities`]. A `NULL` `kind` binds
+    /// as SQL `NULL`, so `$3::text IS NULL` disables the kind predicate; a non-NULL
+    /// kind is matched case-insensitively as a substring of `node_type`.
     async fn find_nodes_by_name(
         &self,
         project_id: &str,
         symbol: &str,
+        kind: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<crate::storage::SymbolMatch>> {
         let limit = crate::storage::clamp_lookup_limit(limit);
         let client = self.pool.get().await.map_err(db_err)?;
         let rows = client
-            .query(FIND_NODES_BY_NAME_SQL, &[&project_id, &symbol, &limit])
+            .query(
+                FIND_NODES_BY_NAME_SQL,
+                &[&project_id, &symbol, &kind, &limit],
+            )
             .await
             .map_err(db_err)?;
 
@@ -4798,7 +4806,7 @@ mod tests {
             .expect("upsert nodes");
 
         let exact = store
-            .find_nodes_by_name(&project, "parse", 100)
+            .find_nodes_by_name(&project, "parse", None, 100)
             .await
             .expect("find parse");
         let names: Vec<&str> = exact.iter().map(|row| row.name.as_str()).collect();
@@ -4809,7 +4817,7 @@ mod tests {
         );
 
         let prefix = store
-            .find_nodes_by_name(&project, "par", 100)
+            .find_nodes_by_name(&project, "par", None, 100)
             .await
             .expect("find par");
         // Only `parse` and `parse_config` start with `par`; `other` does not, so
@@ -4836,7 +4844,7 @@ mod tests {
             .expect("upsert nodes");
 
         let rows = store
-            .find_nodes_by_name(&project, "a_", 100)
+            .find_nodes_by_name(&project, "a_", None, 100)
             .await
             .expect("find a_");
         let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
@@ -4845,6 +4853,70 @@ mod tests {
             vec!["a_b"],
             "`left(...)` must not treat `_` as a LIKE wildcard"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn find_nodes_by_name_filters_by_kind() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("query_kind");
+        let mut function = named_node("q_dup_fn", &project, "dup");
+        function.node_type = Some("Function".to_string());
+        let mut macro_node = named_node("q_dup_macro", &project, "dup");
+        macro_node.node_type = Some("Other(\"macro_invocation\")".to_string());
+        store
+            .upsert_nodes(&[function, macro_node])
+            .await
+            .expect("upsert nodes");
+
+        let unfiltered = store
+            .find_nodes_by_name(&project, "dup", None, 100)
+            .await
+            .expect("find dup without kind");
+        assert_eq!(unfiltered.len(), 2, "a NULL kind must not filter");
+
+        let macros = store
+            .find_nodes_by_name(&project, "dup", Some("macro"), 100)
+            .await
+            .expect("find dup as macro");
+        assert_eq!(macros.len(), 1, "only the macro invocation matches `macro`");
+        assert!(
+            macros[0]
+                .node_type
+                .as_deref()
+                .is_some_and(|kind| kind.contains("macro_invocation")),
+            "got {:?}",
+            macros[0].node_type
+        );
+
+        let functions = store
+            .find_nodes_by_name(&project, "dup", Some("Function"), 100)
+            .await
+            .expect("find dup as Function");
+        assert_eq!(
+            functions.len(),
+            1,
+            "every other node type is excluded, and the match is case-insensitive"
+        );
+        assert!(
+            functions[0]
+                .node_type
+                .as_deref()
+                .is_some_and(|kind| kind.contains("Function")),
+            "got {:?}",
+            functions[0].node_type
+        );
+
+        let none = store
+            .find_nodes_by_name(&project, "dup", Some("no_such_kind"), 100)
+            .await
+            .expect("find dup with an unmatched kind");
+        assert!(none.is_empty(), "an unmatched kind matches nothing");
     }
 
     #[tokio::test]

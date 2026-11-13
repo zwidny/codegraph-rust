@@ -61,6 +61,12 @@ pub struct QueryArgs {
     /// and scope --callers/--callees to that exact node.
     #[arg(long)]
     pub file: Option<String>,
+
+    /// Only match nodes whose kind contains this text (case-insensitive):
+    /// `function`, `method`, `struct`, `enum`, `trait`, `module`, `import`,
+    /// `impl`, `variable`, `macro`, `feature`, ...
+    #[arg(long)]
+    pub kind: Option<String>,
 }
 
 pub fn run(args: QueryArgs) -> Result<()> {
@@ -73,19 +79,29 @@ pub fn run(args: QueryArgs) -> Result<()> {
 }
 
 /// The compact JSON printed when a name lookup finds nothing.
+#[cfg(test)]
 fn empty_match_output(symbol: &str) -> Value {
-    json!({"symbol": symbol, "matches": 0, "hint": EMPTY_MATCH_HINT})
+    empty_match_output_with_filters(symbol, None, None)
 }
 
-/// The compact JSON printed when `--file` filtered every match away.
+/// The compact JSON printed when `--file` / `--kind` filtered every match away.
 ///
-/// Same three keys as [`empty_match_output`], but the hint names the file so the
-/// caller can tell "the symbol exists elsewhere" from "no such symbol".
-fn empty_match_output_for_file(symbol: &str, file: &str) -> Value {
+/// Same three keys as [`empty_match_output`], but the hint names the active
+/// filters so the caller can tell "the symbol exists, just not here" from
+/// "no such symbol".
+fn empty_match_output_with_filters(symbol: &str, file: Option<&str>, kind: Option<&str>) -> Value {
+    let hint = match (file, kind) {
+        (None, None) => EMPTY_MATCH_HINT.to_string(),
+        (Some(file), None) => format!("no definition named {symbol} in {file}"),
+        (None, Some(kind)) => format!("no definition named {symbol} with kind {kind}"),
+        (Some(file), Some(kind)) => {
+            format!("no definition named {symbol} in {file} with kind {kind}")
+        }
+    };
     json!({
         "symbol": symbol,
         "matches": 0,
-        "hint": format!("no definition named {symbol} in {file}"),
+        "hint": hint,
     })
 }
 
@@ -177,7 +193,12 @@ async fn run_async(args: QueryArgs) -> Result<()> {
         limit
     };
     let fetched = storage
-        .find_nodes_by_name(&project_id, &args.symbol, lookup_limit)
+        .find_nodes_by_name(
+            &project_id,
+            &args.symbol,
+            args.kind.as_deref(),
+            lookup_limit,
+        )
         .await
         .context("symbol lookup")?;
 
@@ -187,10 +208,14 @@ async fn run_async(args: QueryArgs) -> Result<()> {
     let matches = select_matches(fetched, args.file.as_deref(), args.limit);
 
     if matches.is_empty() {
-        match args.file.as_deref() {
-            Some(wanted) => println!("{}", empty_match_output_for_file(&args.symbol, wanted)),
-            None => println!("{}", empty_match_output(&args.symbol)),
-        }
+        println!(
+            "{}",
+            empty_match_output_with_filters(
+                &args.symbol,
+                args.file.as_deref(),
+                args.kind.as_deref()
+            )
+        );
         return Ok(());
     }
 
@@ -322,12 +347,36 @@ mod tests {
 
     #[test]
     fn empty_match_output_for_file_keeps_the_contract() {
-        let output = empty_match_output_for_file("new", "a/b.rs");
+        let output = empty_match_output_with_filters("new", Some("a/b.rs"), None);
         assert_eq!(output["symbol"], "new");
         assert_eq!(output["matches"], 0);
         assert_eq!(output["hint"], "no definition named new in a/b.rs");
         assert_eq!(
             output.as_object().map(|object| object.len()),
+            Some(3),
+            "the empty-result JSON is exactly symbol/matches/hint"
+        );
+    }
+
+    #[test]
+    fn kind_hint_mentions_the_filter() {
+        let kind_only = empty_match_output_with_filters("assert_eq", None, Some("macro"));
+        assert_eq!(kind_only["symbol"], "assert_eq");
+        assert_eq!(kind_only["matches"], 0);
+        assert!(
+            kind_only["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("macro")),
+            "the hint must name the --kind filter, got {kind_only}"
+        );
+
+        let both = empty_match_output_with_filters("assert_eq", Some("a/b.rs"), Some("macro"));
+        assert_eq!(
+            both["hint"],
+            "no definition named assert_eq in a/b.rs with kind macro"
+        );
+        assert_eq!(
+            both.as_object().map(|object| object.len()),
             Some(3),
             "the empty-result JSON is exactly symbol/matches/hint"
         );

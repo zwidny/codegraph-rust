@@ -711,13 +711,17 @@ pub trait IndexStorage: Send + Sync {
     /// Returns whether the indexes are ready.
     async fn ensure_vector_indexes(&self, dimension: usize, tables: &[String]) -> Result<bool>;
 
-    /// Exact-or-prefix match on node name, ordered by name for determinism.
+    /// Exact-or-prefix match on node name, restricted to a node kind when `kind` is
+    /// given. `kind` is matched case-insensitively as a substring of the stored
+    /// `node_type` (which is `format!("{:?}", NodeType)`), so `"macro"` selects
+    /// `Other("macro_invocation")` and `"function"` selects `Function`.
     ///
     /// `limit` is clamped to `1..=1000`; `limit <= 0` means 1000.
     async fn find_nodes_by_name(
         &self,
         project_id: &str,
         symbol: &str,
+        kind: Option<&str>,
         limit: i64,
     ) -> Result<Vec<SymbolMatch>>;
 

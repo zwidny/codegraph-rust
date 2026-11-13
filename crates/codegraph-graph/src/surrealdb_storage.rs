@@ -3146,13 +3146,19 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
     /// Port of the SurrealQL `codegraph query` used to run inline. `ORDER BY name`
     /// was added here (the original had no ordering, so equal-prefix results came
     /// back in an unspecified order) to match the Postgres backend.
+    ///
+    /// A `None` kind binds as the empty string, which disables the kind predicate;
+    /// otherwise the lowercased kind is matched as a substring of the lowercased
+    /// `node_type` (stored as `format!("{:?}", NodeType)`).
     async fn find_nodes_by_name(
         &self,
         project_id: &str,
         symbol: &str,
+        kind: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<crate::storage::SymbolMatch>> {
         let limit = crate::storage::clamp_lookup_limit(limit);
+        let kind = kind.map(str::to_lowercase).unwrap_or_default();
         let mut response = self
             .db
             .query(
@@ -3162,12 +3168,14 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
                 FROM nodes
                 WHERE project_id = $project
                   AND (name = $symbol OR string::starts_with(name, $symbol))
+                  AND ($kind = '' OR string::contains(string::lowercase(node_type), $kind))
                 ORDER BY name ASC
                 LIMIT $limit;
                 "#,
             )
             .bind(("project", project_id.to_string()))
             .bind(("symbol", symbol.to_string()))
+            .bind(("kind", kind))
             .bind(("limit", limit))
             .await
             .map_err(|e| CodeGraphError::Database(format!("symbol lookup failed: {e}")))?
@@ -3511,6 +3519,84 @@ mod tests {
     #[test]
     fn surrealdb_storage_implements_index_storage() {
         assert_index_storage::<SurrealDbStorage>();
+    }
+
+    /// The in-memory engine runs the real SurrealQL, so the `--kind` predicate is
+    /// verified without a server: an empty kind disables it, a non-empty kind is a
+    /// case-insensitive substring match against `node_type`.
+    #[tokio::test]
+    async fn find_nodes_by_name_filters_by_kind_in_memory() {
+        use crate::storage::IndexStorage;
+        use codegraph_core::{Language, Location, NodeType};
+
+        let storage = SurrealDbStorage::new(SurrealDbConfig {
+            connection: "mem://".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("in-memory storage");
+
+        let project = "kind_filter_project";
+        let make_node = |name: &str, file: &str, node_type: NodeType, project: &str| -> CodeNode {
+            let mut node = CodeNode::new(
+                name.to_string(),
+                Some(node_type),
+                Some(Language::Rust),
+                Location {
+                    file_path: file.to_string(),
+                    line: 1,
+                    column: 1,
+                    end_line: Some(2),
+                    end_column: None,
+                },
+            );
+            node.metadata
+                .attributes
+                .insert("project_id".into(), project.to_string());
+            node.set_deterministic_id(project);
+            node
+        };
+
+        let function = make_node("dup", "a.rs", NodeType::Function, project);
+        let macro_node = make_node(
+            "dup",
+            "b.rs",
+            NodeType::Other("macro_invocation".to_string()),
+            project,
+        );
+        storage
+            .upsert_nodes(&[function, macro_node])
+            .await
+            .expect("upsert nodes");
+
+        let unfiltered = IndexStorage::find_nodes_by_name(&storage, project, "dup", None, 100)
+            .await
+            .expect("find dup without kind");
+        assert_eq!(unfiltered.len(), 2, "an empty kind must not filter");
+
+        let macros = IndexStorage::find_nodes_by_name(&storage, project, "dup", Some("macro"), 100)
+            .await
+            .expect("find dup as macro");
+        assert_eq!(macros.len(), 1, "only the macro invocation matches");
+        assert!(
+            macros[0]
+                .node_type
+                .as_deref()
+                .is_some_and(|kind| kind.contains("macro_invocation")),
+            "got {:?}",
+            macros[0].node_type
+        );
+
+        let functions =
+            IndexStorage::find_nodes_by_name(&storage, project, "dup", Some("FUNCTION"), 100)
+                .await
+                .expect("find dup as FUNCTION");
+        assert_eq!(
+            functions.len(),
+            1,
+            "the kind match is case-insensitive and excludes every other type"
+        );
+        assert_eq!(functions[0].file_path, "a.rs");
     }
 
     fn assert_graph_query<T: crate::graph_types::GraphQuery>() {}
