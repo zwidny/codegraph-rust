@@ -313,7 +313,7 @@ Nothing is wired up yet.
 | Stale SCIP error message | **Fixed in `291192f`**: the import now warns `SCIP index … is older than N of M captured sources` (mtime comparison, non-fatal) and position failures carry `<path>:<line>:<col> (end …, encoding N) … the index is probably stale`. The mtime heuristic can misfire on `git checkout`/`touch` — it only warns, so that is cosmetic |
 | Occurrence-aware edge ids | ~31% of this repo's 96,733 edges share `(from,to,type)` with another edge (max 71 occurrences of one `references`). Deliberate (`edge.rs` keeps distinct call sites distinct), but degree/coupling metrics must `DISTINCT` or they over-count |
 
-### 6. Postgres + pgvector backend — **end-to-end working, queries pending**
+### 6. Postgres + pgvector backend — **default backend, SurrealDB opt-in**
 
 Evaluation is settled (107x write, 56x KNN, 156x full-text; see
 [docs/BACKEND_EVALUATION.md](docs/BACKEND_EVALUATION.md)). The migration proceeds in
@@ -338,6 +338,9 @@ suites stay green):
 | `3f509ac` | `CODEGRAPH_BACKEND=postgres` + subprocess test isolation fix |
 | `7ca45e6` | Fixes a pre-existing panic: enrichment sliced past the end of a source file |
 | `ee6afd1` | `codegraph-mcp-server` forwards the feature so the binary can be built |
+| `9d50a12` | `PgGraph` implements `GraphQuery` (8 of 12 methods; 2 fail loudly) |
+| `de463b2` | `official_server` picks the graph backend at runtime |
+| `fd76245` | Default build is Postgres-only; `surrealdb-core` is no longer compiled |
 
 **End-to-end measured** (details and conditions in
 [docs/BACKEND_EVALUATION.md](docs/BACKEND_EVALUATION.md#end-to-end-verification-measured-not-projected)):
@@ -355,9 +358,21 @@ micro-benchmark's row and connection counts. Do not quote 107x as an indexing sp
 | Item | Why it blocks |
 |---|---|
 | Postgres scoped reconciliation | Single-file and subdirectory indexes fail with an explicit error; full indexes work |
-| `GraphQueries` parity | hub / coupling / call chain / subgraph are SurrealQL-only, so switching the backend changes how the graph is written, not how it is read |
-| MCP query tools on Postgres | `official_server.rs` and `graph_functions` still assume SurrealDB |
-| `postgres` feature defaults | Not in `make build-dist`; you must pass `DIST_FEATURES=...,postgres` (or `make install-dist` with it) |
+| Postgres `semantic_search_with_context` | `semantic_code_search` on the Postgres backend fails with "not implemented" |
+| Postgres `detect_circular_dependencies` | Same |
+| `make build-dist` feature list | Not updated for the new default; `DIST_FEATURES` still needs `postgres` spelled out (or dropped, since it is now default) |
+| Surreal-only integration tests | `reconciliation_test`, `daemon_watch`, `graph_tools_smoke` are now `#![cfg(feature = "surrealdb")]`, so a default build skips them; they need an explicit `--features surrealdb` run in CI |
+
+**Build shape (implemented in `fd76245`):**
+
+| Build | Compiles `surrealdb-core` | Notes |
+|---|---|---|
+| default (`daemon,postgres`) | **no** | `cargo tree -p codegraph-mcp-server | grep -c surrealdb` → 0 |
+| `--features surrealdb` | yes | `CODEGRAPH_BACKEND` unset still means SurrealDB for these builds |
+
+`StorageBackend::Surreal` is itself behind the feature, so a Postgres-only build cannot select
+it: `CODEGRAPH_BACKEND=surreal` returns "requires a build with --features surrealdb" rather
+than falling back.
 
 **Semantics that deliberately differ, do not "fix" silently:**
 
@@ -369,6 +384,8 @@ micro-benchmark's row and connection counts. Do not quote 107x as an indexing sp
 - `tsquery_prefix` does not split camelCase (`HandleFile` → `handlefile:*`), unlike
   SurrealDB's CAMEL tokenizer. Known recall gap for camelCase identifiers.
 - `delete_data_for_files` returns submitted paths on SurrealDB and rows affected on Postgres.
+- `CODEGRAPH_BACKEND` unset resolves by build: SurrealDB if the feature is compiled, else
+  Postgres.
 
 **Traps already paid for** (do not rediscover):
 

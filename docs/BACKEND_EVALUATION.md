@@ -303,7 +303,7 @@ Configuration error: scoped reconciliation is not implemented for the Postgres b
 Passing `--project-root <dir>` explicitly fixes it. This is pre-existing CLI behaviour, not a
 backend issue, but it makes an otherwise valid benchmark look broken.
 
-## Removing the hard SurrealDB dependency (planned)
+## Removing the hard SurrealDB dependency (done in `fd76245`)
 
 `codegraph-graph` already keeps `surrealdb` optional, and every `use surrealdb::` in it sits
 behind `#[cfg(feature = "surrealdb")]`. What forces `surrealdb-core` into every build is two
@@ -351,3 +351,25 @@ and must be requested with `--features surrealdb`:
 | MCP graph tools | until `PgGraph` implements `GraphQuery` |
 
 `codegraph index` and the `IndexStorage` write path are already backend-neutral.
+
+### Result
+
+Both unconditional lines are gone, and the default build no longer pulls the dependency:
+
+```
+cargo tree -p codegraph-mcp-server -e normal | grep -c surrealdb   -> 0
+cargo tree -p codegraph-mcp-server --features surrealdb ...        -> 1
+```
+
+`StorageBackend::Surreal` is itself behind `#[cfg(feature = "surrealdb")]`, so the selection
+cannot silently fall back. `CODEGRAPH_BACKEND` unset resolves by build: SurrealDB when the
+feature is compiled (existing deployments keep their backend on upgrade), Postgres otherwise.
+
+Two dependencies were contributing silently and were also fixed: `codegraph-mcp-server`
+depended on `surrealdb` directly with no source reference to it, and `codegraph-mcp` carried
+it as a dev-dependency.
+
+Cost, stated plainly: the Surreal-specific integration tests (`reconciliation_test`,
+`daemon_watch`, `graph_tools_smoke`, `open_storage_export`, the rig agent tests) and
+`codegraph-vector`'s `search`/`rag` modules now require `--features surrealdb`. A CI job that
+only builds the default would stop exercising them.

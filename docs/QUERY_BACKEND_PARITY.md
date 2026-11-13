@@ -75,7 +75,7 @@ pub struct PlanNodeRow {
 | `callers_of_name(project, target, limit) -> Vec<CallRelation>` | query | `edges JOIN nodes ON edges.from_id = nodes.id WHERE nodes.name = $2 AND edge_type = 'calls'` |
 | `callees_of_name(project, target, limit) -> Vec<CallRelation>` | query | mirror, joining `to_id` |
 | `node_identities(project) -> Vec<(String, String, String)>` | plan verify | `SELECT id, name, file_path FROM nodes` |
-| `edge_endpoints(project) -> Vec<(String, String)>` | plan verify | `SELECT from_id, to_id FROM edges` |
+| `edge_endpoints(project) -> Vec<EdgeEndpoint>` | plan verify/show | `SELECT from_id, to_id, edge_type FROM edges` (type is needed so `plan show` round-trips the kind) |
 | `nodes_with_metadata(project) -> Vec<PlanNodeRow>` | plan show | `SELECT id, name, metadata FROM nodes` |
 | `project_metadata_value(project) -> Option<serde_json::Value>` | plan show | `SELECT metadata FROM project_metadata` |
 | `delete_project(project) -> u64` | plan store/drop | `DELETE` from all five tables for the project, in one transaction |
