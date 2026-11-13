@@ -233,6 +233,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE INDEX IF NOT EXISTS nodes_project ON nodes(project_id);
 CREATE INDEX IF NOT EXISTS nodes_project_file ON nodes(project_id, file_path);
 CREATE INDEX IF NOT EXISTS nodes_project_name ON nodes(project_id, name);
+CREATE INDEX IF NOT EXISTS nodes_name_prefix ON nodes(project_id, name text_pattern_ops);
 CREATE INDEX IF NOT EXISTS nodes_hnsw ON nodes USING hnsw (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);
 CREATE INDEX IF NOT EXISTS nodes_tsv ON nodes USING gin(content_tsv);
 
@@ -893,6 +894,39 @@ pub(crate) fn rrf_fuse(vector_ids: &[String], text_ids: &[String], limit: usize)
             .partial_cmp(&a.rrf)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.id.cmp(&b.id))
+    });
+    if limit > 0 {
+        hits.truncate(limit);
+    }
+    hits
+}
+
+/// Reciprocal Rank Fusion over an arbitrary number of ranked lists.
+///
+/// Each list contributes `1 / (60 + rank)` for its first occurrence of an id
+/// (rank is 1-based); duplicates inside one list are ignored. Ties break on id
+/// so the order is deterministic. `limit == 0` means no truncation.
+///
+/// This is the N-list form of [`rrf_fuse`]; for two lists the ids, the order and
+/// the scores are identical.
+pub(crate) fn rrf_fuse_lists(lists: &[&[String]], limit: usize) -> Vec<(String, f64)> {
+    let mut fused: BTreeMap<String, f64> = BTreeMap::new();
+
+    for list in lists {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (index, id) in list.iter().enumerate() {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            *fused.entry(id.clone()).or_insert(0.0) += rrf_contribution(index + 1);
+        }
+    }
+
+    let mut hits: Vec<(String, f64)> = fused.into_iter().collect();
+    hits.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
     if limit > 0 {
         hits.truncate(limit);
@@ -2512,8 +2546,8 @@ mod tests {
              project_metadata tables"
         );
         assert_eq!(
-            index_count, 17,
-            "expected 17 chunks/edges/nodes/symbol/file_metadata indexes \
+            index_count, 18,
+            "expected 18 chunks/edges/nodes/symbol/file_metadata indexes \
              (project_metadata is keyed by its primary key and needs no extra index)"
         );
     }
@@ -2809,6 +2843,77 @@ mod tests {
     fn rrf_empty_inputs() {
         assert!(rrf_fuse(&[], &[], 0).is_empty());
         assert!(rrf_fuse(&[], &[], 5).is_empty());
+    }
+
+    #[test]
+    fn rrf_fuse_lists_matches_the_two_list_fuser_on_two_lists() {
+        let vector = ids(&["a", "b", "c"]);
+        let text = ids(&["b", "a", "d"]);
+
+        let two = rrf_fuse(&vector, &text, 0);
+        let many = rrf_fuse_lists(&[&vector, &text], 0);
+
+        assert_eq!(many.len(), two.len());
+        for (fused, hit) in many.iter().zip(two.iter()) {
+            assert_eq!(fused.0, hit.id, "id order must match rrf_fuse");
+            assert!(
+                (fused.1 - hit.rrf).abs() < 1e-12,
+                "score for {} differed: {} vs {}",
+                fused.0,
+                fused.1,
+                hit.rrf
+            );
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_lists_merges_three_lists() {
+        // `c` sits at rank 63 in both the second and third list, so its two
+        // contributions (2/123) stay below the single first-place contribution of
+        // `a` (1/61). That is the point of RRF: two mediocre placements can lose to
+        // one top placement.
+        let first = ids(&["a"]);
+        let filler: Vec<String> = (0..62).map(|i| format!("f{i:02}")).collect();
+        let mut second = filler.clone();
+        second.push("c".to_string());
+        let mut third = filler;
+        third.push("c".to_string());
+
+        let fused = rrf_fuse_lists(&[&first, &second, &third], 0);
+        let position = |id: &str| {
+            fused
+                .iter()
+                .position(|(fused_id, _)| fused_id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the fused output"))
+        };
+        assert!(
+            position("a") < position("c"),
+            "a single first-place hit must outrank two rank-63 hits"
+        );
+
+        let c = fused[position("c")].1;
+        assert!(
+            (c - (1.0 / 123.0 + 1.0 / 123.0)).abs() < 1e-12,
+            "c scores the sum of its rank-63 contributions in both lists, got {c}"
+        );
+        let a = fused[position("a")].1;
+        assert!((a - 1.0 / 61.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rrf_fuse_lists_dedupes_within_a_list() {
+        let list = ids(&["a", "a", "b"]);
+
+        let fused = rrf_fuse_lists(&[&list], 0);
+
+        assert_eq!(fused.len(), 2, "a is counted once");
+        let a = fused.iter().find(|(id, _)| id == "a").expect("a present").1;
+        assert!(
+            (a - 1.0 / 61.0).abs() < 1e-12,
+            "a must score one first-place contribution, not two"
+        );
+        let b = fused.iter().find(|(id, _)| id == "b").expect("b present").1;
+        assert!((b - 1.0 / 63.0).abs() < 1e-12, "rank is the list position");
     }
 
     // ---- Integration tests (require CODEGRAPH_PG_URL, run with --ignored) ----

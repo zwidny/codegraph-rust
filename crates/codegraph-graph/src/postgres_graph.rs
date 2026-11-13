@@ -8,8 +8,9 @@
 //! both backends: `analysis::hubs`, `analysis::expand_bfs`, `analysis::trace_bfs` and
 //! `analysis::score_hotspots` are the single source of truth for ranking and traversal.
 //!
-//! `detect_circular_dependencies` and `semantic_search_with_context` are **not implemented**
-//! here and return an explicit configuration error instead of silently returning empty data.
+//! `detect_circular_dependencies` is **not implemented** here and returns an explicit
+//! configuration error instead of silently returning empty data; every other method,
+//! including `semantic_search_with_context`, is implemented.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use crate::graph_types::{
     CouplingMetricsResult, DependencyNode, EdgeTypeCount, HubNode, NodeEdgeSummary, NodeInfo,
     NodeLocation, NodeReference,
 };
-use crate::postgres_storage::PgStore;
+use crate::postgres_storage::{PgStore, rrf_fuse_lists, vector_text};
 
 /// Cap `fn::get_hub_nodes` applies to its ranked output.
 const HUB_LIMIT: usize = 50;
@@ -96,8 +97,60 @@ SELECT from_id, to_id, edge_type FROM edges \
 WHERE project_id = $1 AND edge_type = ANY($2) AND (to_id = ANY($3) OR from_id = ANY($3)) \
 ORDER BY id";
 
+/// Node-level vector candidates: the closest chunk per parent node.
+const SEARCH_VECTOR_SQL: &str = "\
+SELECT parent_node AS id, min(embedding <=> $1::text::vector) AS distance \
+FROM chunks \
+WHERE project_id = $2 AND embedding IS NOT NULL \
+GROUP BY parent_node \
+ORDER BY distance \
+LIMIT $3";
+
+/// Exact or prefix `name` matches. `$2` is already `LIKE`-escaped by
+/// [`escape_like_pattern`], and the escape character is pinned to `\`.
+const SEARCH_NAME_SQL: &str = "\
+SELECT id FROM nodes \
+WHERE project_id = $1 AND (name = $2 OR name LIKE $2 || '%' ESCAPE '\\') \
+ORDER BY name ASC \
+LIMIT $3";
+
+/// Edges leaving any of the hit nodes, for the optional graph context.
+const SEARCH_OUTGOING_EDGES_SQL: &str = "\
+SELECT from_id, to_id, edge_type FROM edges \
+WHERE project_id = $1 AND from_id = ANY($2) ORDER BY id LIMIT 200";
+
+/// Edges entering any of the hit nodes, for the optional graph context.
+const SEARCH_INCOMING_EDGES_SQL: &str = "\
+SELECT from_id, to_id, edge_type FROM edges \
+WHERE project_id = $1 AND to_id = ANY($2) ORDER BY id LIMIT 200";
+
+/// Peer nodes referenced by the edge context.
+const SEARCH_EDGE_NODES_SQL: &str = "\
+SELECT id, name, node_type, file_path FROM nodes \
+WHERE project_id = $1 AND id = ANY($2)";
+
+/// Width of `chunks.embedding` / `nodes.embedding_1024`.
+const EMBEDDING_DIMENSION: usize = 1024;
+
+/// Per-node cap on each edge direction, matching `fn::edges_for_nodes(..., 5)`.
+const EDGE_CONTEXT_LIMIT: usize = 5;
+
 fn db_err<E: std::fmt::Display>(error: E) -> CodeGraphError {
     CodeGraphError::Database(error.to_string())
+}
+
+/// Escape the `LIKE` metacharacters in `term` so a symbol named `a_b` cannot match
+/// `axb`. Postgres' default escape character is the backslash, which the search
+/// statements pin explicitly with `ESCAPE '\'`.
+fn escape_like_pattern(term: &str) -> String {
+    let mut escaped = String::with_capacity(term.len());
+    for ch in term.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 /// Accept the id shapes `fn::resolve_node` accepts: `nodes:x`, `x`, and the
@@ -733,20 +786,264 @@ impl crate::graph_types::GraphQuery for PgGraph {
         ))
     }
 
-    /// Not implemented on the Postgres backend yet; see the module documentation.
+    /// Hybrid node search backed by pgvector and Postgres full-text indexes.
+    ///
+    /// The shape and semantics mirror `fn::semantic_search_nodes_via_chunks` in
+    /// `schema/codegraph_v2.surql`: chunk KNN aggregated per `parent_node`, a `name`
+    /// list, a `content` full-text list, three-way Reciprocal Rank Fusion, and (when
+    /// requested) at most [`EDGE_CONTEXT_LIMIT`] edges per direction per node.
+    ///
+    /// `vector_score` filters on `threshold` only for the vector list, exactly like the
+    /// stored procedure: a literal text match still surfaces when its cosine
+    /// similarity is low.
+    ///
+    /// `dimension` is accepted for the shared [`GraphQuery`] contract but not used:
+    /// `chunks.embedding` is `vector(1024)`, so a caller with any other embedding
+    /// width gets a configuration error instead of silently empty results.
+    ///
+    /// `content` is the plain `text` column stored by `code_node_to_row`. SurrealDB
+    /// may return a compressed string in the same field, so the *representation*
+    /// differs between backends even though both are strings that the MCP tools treat
+    /// as text.
     async fn semantic_search_with_context(
         &self,
-        _query_text: &str,
-        _query_embedding: &[f32],
-        _dimension: usize,
-        _limit: usize,
-        _threshold: f32,
-        _include_graph_context: bool,
+        query_text: &str,
+        query_embedding: &[f32],
+        dimension: usize,
+        limit: usize,
+        threshold: f32,
+        include_graph_context: bool,
     ) -> Result<Vec<serde_json::Value>> {
-        Err(CodeGraphError::Configuration(
-            "semantic search with graph context is not implemented for the Postgres backend yet"
-                .into(),
-        ))
+        let _ = dimension;
+        if query_embedding.len() != EMBEDDING_DIMENSION {
+            return Err(CodeGraphError::Configuration(format!(
+                "semantic search on the Postgres backend requires a {EMBEDDING_DIMENSION}-dimension \
+                 query embedding because chunks.embedding is vector({EMBEDDING_DIMENSION}); got {}",
+                query_embedding.len()
+            )));
+        }
+
+        let safe_limit = if limit > 0 && limit <= 100 { limit } else { 10 };
+        let client = self.store.pool().get().await.map_err(db_err)?;
+
+        // 1) Vector list at node granularity: the closest chunk per parent node.
+        let vector_limit = i64::try_from(safe_limit * 3).unwrap_or(i64::MAX);
+        let vector_rows = client
+            .query(
+                SEARCH_VECTOR_SQL,
+                &[
+                    &vector_text(query_embedding),
+                    &self.project_id,
+                    &vector_limit,
+                ],
+            )
+            .await
+            .map_err(db_err)?;
+
+        let mut vector_ids: Vec<String> = Vec::with_capacity(vector_rows.len());
+        let mut vector_scores: HashMap<String, f64> = HashMap::new();
+        for row in &vector_rows {
+            let id: String = row.get(0);
+            // pgvector's distance operators return `double precision`.
+            let distance: f64 = row.get(1);
+            let score = 1.0 - distance;
+            // A zero query vector makes pgvector report `NaN`; that is not a hit.
+            if !score.is_finite() || score < f64::from(threshold) {
+                continue;
+            }
+            vector_scores.insert(id.clone(), score);
+            vector_ids.push(id);
+        }
+
+        // 2) Name list (exact or prefix) and 3) content list (`ts_rank_cd`).
+        // An empty query would make `name LIKE '%'` match the whole project, so the
+        // name list is skipped instead (the content list skips itself for no terms).
+        let name_ids: Vec<String> = if query_text.is_empty() {
+            Vec::new()
+        } else {
+            let name_limit = i64::try_from(safe_limit * 2).unwrap_or(i64::MAX);
+            let name_rows = client
+                .query(
+                    SEARCH_NAME_SQL,
+                    &[
+                        &self.project_id,
+                        &escape_like_pattern(query_text),
+                        &name_limit,
+                    ],
+                )
+                .await
+                .map_err(db_err)?;
+            name_rows.iter().map(|row| row.get(0)).collect()
+        };
+
+        let content_rows = self
+            .store
+            .full_text_nodes(&self.project_id, query_text, safe_limit * 2)
+            .await?;
+        let content_ids: Vec<String> = content_rows.iter().map(|(id, _)| id.clone()).collect();
+        let text_scores: HashMap<String, f64> = content_rows.into_iter().collect();
+
+        // 4) Three-way Reciprocal Rank Fusion, ordered by combined score descending.
+        let fused = rrf_fuse_lists(&[&vector_ids, &name_ids, &content_ids], safe_limit);
+        if fused.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 5) Hydrate the fused ids in one query.
+        let ids: Vec<String> = fused.iter().map(|(id, _)| id.clone()).collect();
+        let node_rows = client
+            .query(NODES_BY_IDS_SQL, &[&self.project_id, &ids])
+            .await
+            .map_err(db_err)?;
+        let by_id: HashMap<String, &tokio_postgres::Row> = node_rows
+            .iter()
+            .map(|row| (row.get::<_, String>("id"), row))
+            .collect();
+
+        // 6) Optional one-hop edge context, capped per node and direction.
+        let mut outgoing_edges: Option<HashMap<String, Vec<(String, String)>>> = None;
+        let mut incoming_edges: Option<HashMap<String, Vec<(String, String)>>> = None;
+        let mut peers: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
+
+        if include_graph_context {
+            let outgoing_rows = client
+                .query(SEARCH_OUTGOING_EDGES_SQL, &[&self.project_id, &ids])
+                .await
+                .map_err(db_err)?;
+            let incoming_rows = client
+                .query(SEARCH_INCOMING_EDGES_SQL, &[&self.project_id, &ids])
+                .await
+                .map_err(db_err)?;
+
+            let mut outgoing: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            for row in &outgoing_rows {
+                let from: String = row.get("from_id");
+                let to: String = row.get("to_id");
+                let edge_type: String = row.get("edge_type");
+                let entry = outgoing.entry(from).or_default();
+                if entry.len() < EDGE_CONTEXT_LIMIT {
+                    entry.push((to, edge_type));
+                }
+            }
+
+            let mut incoming: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            for row in &incoming_rows {
+                let from: String = row.get("from_id");
+                let to: String = row.get("to_id");
+                let edge_type: String = row.get("edge_type");
+                let entry = incoming.entry(to).or_default();
+                if entry.len() < EDGE_CONTEXT_LIMIT {
+                    entry.push((from, edge_type));
+                }
+            }
+
+            let mut peer_ids: Vec<String> = Vec::new();
+            let connected = outgoing
+                .values()
+                .flatten()
+                .chain(incoming.values().flatten())
+                .map(|(peer_id, _)| peer_id);
+            for peer_id in connected {
+                if !peer_ids.iter().any(|known| known == peer_id) {
+                    peer_ids.push(peer_id.clone());
+                }
+            }
+            let peer_rows = if peer_ids.is_empty() {
+                Vec::new()
+            } else {
+                client
+                    .query(SEARCH_EDGE_NODES_SQL, &[&self.project_id, &peer_ids])
+                    .await
+                    .map_err(db_err)?
+            };
+            peers = peer_rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<_, String>("id"),
+                        (
+                            row.get::<_, String>("name"),
+                            row.get::<_, Option<String>>("node_type"),
+                            row.get::<_, Option<String>>("file_path"),
+                        ),
+                    )
+                })
+                .collect();
+
+            outgoing_edges = Some(outgoing);
+            incoming_edges = Some(incoming);
+        }
+
+        let edge_values =
+            |edges: &[(String, String)],
+             peers: &HashMap<String, (String, Option<String>, Option<String>)>| {
+                edges
+                    .iter()
+                    .filter_map(|(peer_id, relationship)| {
+                        let (name, kind, file_path) = peers.get(peer_id)?;
+                        Some(serde_json::json!({
+                            "node_id": peer_id,
+                            "name": name,
+                            "kind": kind,
+                            "file_path": file_path,
+                            "relationship": relationship,
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+        // 7) Assemble the rows in fused order.
+        let mut out = Vec::with_capacity(fused.len());
+        for (id, combined_score) in fused {
+            let Some(row) = by_id.get(&id) else {
+                continue;
+            };
+
+            let mut match_sources: Vec<&str> = Vec::new();
+            if vector_scores.contains_key(&id) {
+                match_sources.push("chunk");
+            }
+            if name_ids.iter().any(|name_id| name_id == &id) || text_scores.contains_key(&id) {
+                match_sources.push("text");
+            }
+
+            let mut value = serde_json::json!({
+                "node_id": id.clone(),
+                "name": row.get::<_, String>("name"),
+                "kind": row.get::<_, Option<String>>("node_type"),
+                "language": row.get::<_, Option<String>>("language"),
+                "file_path": row.get::<_, Option<String>>("file_path"),
+                "start_line": row.get::<_, Option<i32>>("start_line").unwrap_or(0),
+                "end_line": row.get::<_, Option<i32>>("end_line").unwrap_or(0),
+                "content": row.get::<_, Option<String>>("content"),
+                "metadata": row.get::<_, Option<serde_json::Value>>("metadata"),
+                "vector_score": vector_scores.get(&id).copied().unwrap_or(0.0),
+                "text_score": text_scores.get(&id).copied().unwrap_or(0.0),
+                "combined_score": combined_score,
+                "match_sources": match_sources,
+                "matched_symbols": [],
+            });
+
+            if let (Some(outgoing), Some(incoming), Some(object)) =
+                (&outgoing_edges, &incoming_edges, value.as_object_mut())
+            {
+                let empty: Vec<(String, String)> = Vec::new();
+                let outgoing_for_node = outgoing.get(&id).unwrap_or(&empty);
+                let incoming_for_node = incoming.get(&id).unwrap_or(&empty);
+                object.insert(
+                    "outgoing_edges".to_string(),
+                    serde_json::Value::Array(edge_values(outgoing_for_node, &peers)),
+                );
+                object.insert(
+                    "incoming_edges".to_string(),
+                    serde_json::Value::Array(edge_values(incoming_for_node, &peers)),
+                );
+            }
+
+            out.push(value);
+        }
+
+        Ok(out)
     }
 }
 
@@ -754,7 +1051,7 @@ impl crate::graph_types::GraphQuery for PgGraph {
 mod tests {
     use super::*;
     use crate::graph_types::GraphQuery;
-    use crate::postgres_storage::{EdgeRow as PgEdgeRow, NodeRow};
+    use crate::postgres_storage::{ChunkRow, EdgeRow as PgEdgeRow, NodeRow};
 
     fn store_or_skip() -> Option<PgStore> {
         if std::env::var("CODEGRAPH_PG_URL").is_err() {
@@ -801,6 +1098,43 @@ mod tests {
             edge_type: edge_type.to_string(),
             metadata: None,
         }
+    }
+
+    /// A 1024-dimension basis vector, the width of `chunks.embedding`.
+    fn unit_vector(index: usize) -> Vec<f32> {
+        let mut vector = vec![0.0; EMBEDDING_DIMENSION];
+        vector[index] = 1.0;
+        vector
+    }
+
+    fn chunk(id: &str, project: &str, parent: &str, embedding: Vec<f32>) -> ChunkRow {
+        ChunkRow {
+            id: id.to_string(),
+            project_id: project.to_string(),
+            chunk_index: 0,
+            text: format!("body of {parent}"),
+            parent_node: parent.to_string(),
+            embedding,
+            embedding_model: "test".to_string(),
+        }
+    }
+
+    fn match_sources(value: &serde_json::Value) -> Vec<String> {
+        value["match_sources"]
+            .as_array()
+            .expect("match_sources array")
+            .iter()
+            .map(|source| source.as_str().expect("string source").to_string())
+            .collect()
+    }
+
+    /// LIKE metacharacters must be escaped, or `a_b` would match `axb`.
+    #[test]
+    fn escape_like_pattern_covers_all_metacharacters() {
+        assert_eq!(escape_like_pattern("plain"), "plain");
+        assert_eq!(escape_like_pattern("a_b"), "a\\_b");
+        assert_eq!(escape_like_pattern("100%"), "100\\%");
+        assert_eq!(escape_like_pattern("a\\b"), "a\\\\b");
     }
 
     /// The hub ranking must be exactly what the pure analysis functions produce.
@@ -1096,10 +1430,10 @@ mod tests {
         assert_eq!(graph.count_nodes_for_project().await.expect("count"), 3);
     }
 
-    /// The unimplemented methods must fail loudly, never return silent empty data.
+    /// The one unimplemented method must fail loudly, never return silent empty data.
     #[tokio::test]
     #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
-    async fn unimplemented_methods_fail_loudly() {
+    async fn circular_dependency_detection_fails_loudly() {
         let Some(store) = store_or_skip() else {
             return;
         };
@@ -1116,16 +1450,262 @@ mod tests {
                 .contains("not implemented for the Postgres backend"),
             "unexpected message: {cycle_error}"
         );
+    }
 
-        let search_error = graph
-            .semantic_search_with_context("query", &[0.0; 4], 4, 5, 0.5, false)
+    /// The vector list reaches node granularity: the closest chunk decides the parent.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn semantic_search_finds_a_vector_match() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("semantic_vector");
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let nodes = vec![node("alpha", &project), node("beta", &project)];
+        let chunks = vec![
+            chunk(
+                &format!("{project}_chunk_alpha"),
+                &project,
+                "alpha",
+                unit_vector(0),
+            ),
+            chunk(
+                &format!("{project}_chunk_beta"),
+                &project,
+                "beta",
+                unit_vector(1),
+            ),
+        ];
+        store.upsert_nodes(&nodes).await.expect("upsert_nodes");
+        store.upsert_chunks(&chunks).await.expect("upsert_chunks");
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
+        let results = graph
+            .semantic_search_with_context(
+                "nothing matches this text",
+                &unit_vector(0),
+                EMBEDDING_DIMENSION,
+                5,
+                0.0,
+                false,
+            )
             .await
-            .expect_err("semantic search must not be silently empty");
+            .expect("semantic_search_with_context");
+
+        assert!(!results.is_empty(), "the vector path must produce a hit");
+        assert_eq!(results[0]["node_id"], "alpha");
         assert!(
-            search_error
-                .to_string()
-                .contains("not implemented for the Postgres backend"),
-            "unexpected message: {search_error}"
+            match_sources(&results[0]).contains(&"chunk".to_string()),
+            "match_sources was {:?}",
+            results[0]["match_sources"]
+        );
+        let vector_score = results[0]["vector_score"]
+            .as_f64()
+            .expect("vector_score number");
+        assert!(
+            vector_score > 0.99,
+            "an exact chunk match must score near 1.0, got {vector_score}"
+        );
+    }
+
+    /// A literal content match survives an embedding that hits nothing.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn semantic_search_finds_a_content_match() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("semantic_content");
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let mut auth = node("rotate_token", &project);
+        auth.content = Some("fn rotate() { /* authentication token rotation */ }".to_string());
+        let nodes = vec![auth, node("unrelated", &project)];
+        store.upsert_nodes(&nodes).await.expect("upsert_nodes");
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
+        let results = graph
+            .semantic_search_with_context(
+                "authentication token rotation",
+                &vec![0.0; EMBEDDING_DIMENSION],
+                EMBEDDING_DIMENSION,
+                5,
+                0.0,
+                false,
+            )
+            .await
+            .expect("semantic_search_with_context");
+
+        let hit = results
+            .iter()
+            .find(|value| value["node_id"] == "rotate_token")
+            .expect("the content match must be returned");
+        assert!(
+            match_sources(hit).contains(&"text".to_string()),
+            "match_sources was {:?}",
+            hit["match_sources"]
+        );
+        assert_eq!(
+            hit["vector_score"].as_f64(),
+            Some(0.0),
+            "a zero query vector must not produce a vector hit"
+        );
+    }
+
+    /// `threshold` filters the vector list, and only the vector list.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn semantic_search_threshold_filters_vector_hits() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("semantic_threshold");
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let nodes = vec![node("gamma", &project)];
+        let chunks = vec![chunk(
+            &format!("{project}_chunk_gamma"),
+            &project,
+            "gamma",
+            unit_vector(0),
+        )];
+        store.upsert_nodes(&nodes).await.expect("upsert_nodes");
+        store.upsert_chunks(&chunks).await.expect("upsert_chunks");
+
+        // 45 degrees away from the chunk vector: cosine similarity ~0.707.
+        let mut query = vec![0.0; EMBEDDING_DIMENSION];
+        query[0] = 1.0;
+        query[1] = 1.0;
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
+        let filtered = graph
+            .semantic_search_with_context(
+                "zzz no text match",
+                &query,
+                EMBEDDING_DIMENSION,
+                5,
+                1.0,
+                false,
+            )
+            .await
+            .expect("semantic_search_with_context");
+        assert!(
+            filtered.is_empty(),
+            "threshold 1.0 must drop a 0.707 similarity, got {filtered:?}"
+        );
+
+        let kept = graph
+            .semantic_search_with_context(
+                "zzz no text match",
+                &query,
+                EMBEDDING_DIMENSION,
+                5,
+                0.0,
+                false,
+            )
+            .await
+            .expect("semantic_search_with_context");
+        assert_eq!(kept.len(), 1, "threshold 0.0 keeps the vector hit");
+        assert_eq!(kept[0]["node_id"], "gamma");
+    }
+
+    /// Edge context is one hop, capped at five per direction, and opt-in.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn semantic_search_attaches_bounded_edge_context() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("semantic_edges");
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let mut hub = node("hub", &project);
+        hub.content = Some("fn hub() {}".to_string());
+        let mut nodes = vec![hub];
+        for index in 0..7 {
+            nodes.push(node(&format!("target{index}"), &project));
+        }
+        let chunks = vec![chunk(
+            &format!("{project}_chunk_hub"),
+            &project,
+            "hub",
+            unit_vector(0),
+        )];
+        let edges: Vec<PgEdgeRow> = (0..7)
+            .map(|index| {
+                edge(
+                    &format!("{project}_edge{index}"),
+                    &project,
+                    "hub",
+                    &format!("target{index}"),
+                    "calls",
+                )
+            })
+            .collect();
+        store.upsert_nodes(&nodes).await.expect("upsert_nodes");
+        store.upsert_chunks(&chunks).await.expect("upsert_chunks");
+        store.upsert_edges(&edges).await.expect("upsert_edges");
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
+        let results = graph
+            .semantic_search_with_context(
+                "nothing matches this text",
+                &unit_vector(0),
+                EMBEDDING_DIMENSION,
+                5,
+                0.0,
+                true,
+            )
+            .await
+            .expect("semantic_search_with_context");
+
+        let hit = results
+            .iter()
+            .find(|value| value["node_id"] == "hub")
+            .expect("the hub must be returned");
+        let outgoing = hit["outgoing_edges"]
+            .as_array()
+            .expect("outgoing_edges array");
+        assert_eq!(outgoing.len(), 5, "seven edges must be capped at five");
+        assert!(hit["incoming_edges"].as_array().is_some());
+
+        let without_context = graph
+            .semantic_search_with_context(
+                "nothing matches this text",
+                &unit_vector(0),
+                EMBEDDING_DIMENSION,
+                5,
+                0.0,
+                false,
+            )
+            .await
+            .expect("semantic_search_with_context");
+        let plain = without_context
+            .iter()
+            .find(|value| value["node_id"] == "hub")
+            .expect("the hub must be returned");
+        assert!(plain.get("outgoing_edges").is_none());
+        assert!(plain.get("incoming_edges").is_none());
+    }
+
+    /// `chunks.embedding` is vector(1024); other widths must be rejected explicitly.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn semantic_search_rejects_a_wrong_dimension() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("semantic_dimension");
+        let graph = PgGraph::new(Arc::new(store), project);
+
+        let error = graph
+            .semantic_search_with_context("query", &[0.0, 0.0, 0.0], 3, 5, 0.5, false)
+            .await
+            .expect_err("a 3-dimension embedding must be rejected");
+        assert!(
+            error.to_string().contains("1024"),
+            "the error must name the 1024-dimension column, got: {error}"
         );
     }
 }
