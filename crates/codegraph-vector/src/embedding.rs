@@ -968,7 +968,8 @@ impl EmbeddingGenerator {
         // Prefer advanced engine when available
         #[cfg(any(feature = "local-embeddings", feature = "openai", feature = "onnx"))]
         if let Some(engine) = &self.advanced {
-            return engine.embed(text).await;
+            // Already-prepared text: skip the chunk pipeline (see embed_prepared_text).
+            return engine.embed_prepared_text(text).await;
         }
 
         // FALLBACK WARNING: Using random hash-based embeddings (no semantic meaning)

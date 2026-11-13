@@ -538,6 +538,26 @@ impl AdvancedEmbeddingGenerator {
             .collect())
     }
 
+    /// Embed one already-prepared text (a search query, or a chunk that was already
+    /// split) without running the node -> chunk pipeline.
+    ///
+    /// `embed_texts` builds a `ChunkPlan` first, and that plan derives a cache key by
+    /// calling `Tokenizer::to_string`, which serialises the whole vocabulary. Measured
+    /// at ~60 ms per call on this model, for a six-token query that never needed
+    /// chunking in the first place. Pre-split text goes straight to the provider.
+    pub async fn embed_prepared_text(&self, text: &str) -> Result<Vec<f32>> {
+        if let Some(pipeline) = &self.pipeline {
+            let config = self.provider_batch_config();
+            let mut vectors = pipeline
+                .generate_prepared_texts(&[text.to_string()], &config)
+                .await?;
+            return Ok(vectors.pop().unwrap_or_default());
+        }
+        self.embed_texts(&[text.to_string()])
+            .await
+            .map(|mut vectors| vectors.pop().unwrap_or_default())
+    }
+
     /// Generate embeddings for CodeNodes; uses provider pipeline or deterministic fallback.
     pub async fn generate_embeddings_for_nodes(&self, nodes: &[CodeNode]) -> Result<Vec<Vec<f32>>> {
         if nodes.is_empty() {

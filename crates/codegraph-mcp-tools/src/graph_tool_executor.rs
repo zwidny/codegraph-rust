@@ -854,11 +854,13 @@ impl GraphToolExecutor {
             .unwrap_or(0.4);
 
         // Step 1: Generate embedding using shared EmbeddingGenerator
+        let t_embed = std::time::Instant::now();
         let query_embedding = self
             .embedding_generator
             .generate_text_embedding(query_text)
             .await
             .map_err(|e| McpError::Protocol(format!("Embedding generation failed: {}", e)))?;
+        let embed_us = t_embed.elapsed().as_micros() as u64;
 
         // Step 2: Get embedding dimension from shared generator (auto-detected)
         let dimension = self.embedding_generator.dimension();
@@ -866,6 +868,7 @@ impl GraphToolExecutor {
         // Step 3: Call semantic search function with graph enrichment (always enabled)
         let include_graph_context = true; // Always enabled per requirements
 
+        let t_search = std::time::Instant::now();
         let candidates = self
             .graph
             .semantic_search_with_context(
@@ -880,6 +883,14 @@ impl GraphToolExecutor {
             .map_err(|e| {
                 McpError::Protocol(format!("semantic_search_with_context failed: {}", e))
             })?;
+
+        let search_us = t_search.elapsed().as_micros() as u64;
+        tracing::debug!(
+            target: "codegraph::semsearch",
+            embed_us,
+            search_us,
+            "semantic search: embedding vs retrieval"
+        );
 
         // Step 4: Apply reranking if configured (Jina OR LM Studio)
         let final_results = self.apply_reranking(query_text, candidates).await?;

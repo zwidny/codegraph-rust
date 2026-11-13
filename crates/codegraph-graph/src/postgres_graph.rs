@@ -860,7 +860,9 @@ impl crate::graph_types::GraphQuery for PgGraph {
         }
 
         let safe_limit = if limit > 0 && limit <= 100 { limit } else { 10 };
+        let t_start = std::time::Instant::now();
         let client = self.store.pool().get().await.map_err(db_err)?;
+        let t_pool = t_start.elapsed();
 
         // 1) Vector list at node granularity: the closest chunk per parent node.
         let vector_limit = i64::try_from(safe_limit * 3).unwrap_or(i64::MAX);
@@ -876,6 +878,7 @@ impl crate::graph_types::GraphQuery for PgGraph {
             .await
             .map_err(db_err)?;
 
+        let t_vector = t_start.elapsed();
         let mut vector_ids: Vec<String> = Vec::with_capacity(vector_rows.len());
         let mut vector_scores: HashMap<String, f64> = HashMap::new();
         for row in &vector_rows {
@@ -918,6 +921,7 @@ impl crate::graph_types::GraphQuery for PgGraph {
             .await?;
         let content_ids: Vec<String> = content_rows.iter().map(|(id, _)| id.clone()).collect();
         let text_scores: HashMap<String, f64> = content_rows.into_iter().collect();
+        let t_text = t_start.elapsed();
 
         // 4) Three-way Reciprocal Rank Fusion, ordered by combined score descending.
         let fused = rrf_fuse_lists(&[&vector_ids, &name_ids, &content_ids], safe_limit);
@@ -935,6 +939,7 @@ impl crate::graph_types::GraphQuery for PgGraph {
             .iter()
             .map(|row| (row.get::<_, String>("id"), row))
             .collect();
+        let t_hydrate = t_start.elapsed();
 
         // 6) Optional one-hop edge context, capped per node and direction.
         let mut outgoing_edges: Option<HashMap<String, Vec<(String, String)>>> = None;
@@ -1078,6 +1083,18 @@ impl crate::graph_types::GraphQuery for PgGraph {
 
             out.push(value);
         }
+
+        tracing::debug!(
+            target: "codegraph::semgraph",
+            // Cumulative marks, so each phase is the difference between neighbours.
+            pool_cum_us = t_pool.as_micros() as u64,
+            vector_cum_us = t_vector.as_micros() as u64,
+            text_cum_us = t_text.as_micros() as u64,
+            hydrate_cum_us = t_hydrate.as_micros() as u64,
+            total_us = t_start.elapsed().as_micros() as u64,
+            hits = out.len(),
+            "postgres semantic search phases"
+        );
 
         Ok(out)
     }
