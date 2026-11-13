@@ -1324,6 +1324,7 @@ impl ProjectIndexer {
             let mut lsp_enrichment_stats = crate::analyzers::lsp::LspEnrichmentStats::default();
             let mut scip_covered: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
+            let fallback_enabled = lsp_fallback_enabled();
             if !scip_specs.is_empty() && analyzer_settings.lsp_enabled() {
                 let start = std::time::Instant::now();
                 for spec in &scip_specs {
@@ -1362,15 +1363,41 @@ impl ProjectIndexer {
                     lsp_enrichment_stats.edges_resolved,
                     start.elapsed()
                 );
-                info!(
-                    "🧠 SCIP coverage: {} of {} scanned files already have compiler-index data; language-server enrichment runs on the remaining {}",
-                    scip_covered.len(),
+                let uncovered = files.len().saturating_sub(scip_covered.len());
+                if fallback_enabled
+                    && analyzer_settings.lsp_enabled()
+                    && !analyzer_languages.is_empty()
+                {
+                    info!(
+                        "🧠 SCIP coverage: {}/{} files; language-server enrichment runs on the remaining {}",
+                        scip_covered.len(),
+                        files.len(),
+                        uncovered
+                    );
+                } else {
+                    info!(
+                        "🧠 SCIP coverage: {}/{} files; {} remain AST-only",
+                        scip_covered.len(),
+                        files.len(),
+                        uncovered
+                    );
+                }
+            }
+
+            if !scip_specs.is_empty() && scip_covered.is_empty() {
+                warn!(
+                    "SCIP indexes were supplied but covered none of the {} scanned files; \
+                     check the `@subdir` path prefix in CODEGRAPH_SCIP_INDEX ({} indexes: {})",
                     files.len(),
-                    files.len().saturating_sub(scip_covered.len())
+                    scip_specs.len(),
+                    scip_specs
+                        .iter()
+                        .map(|spec| spec.path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
 
-            let fallback_enabled = lsp_fallback_enabled();
             if scip_specs.is_empty() && analyzer_settings.lsp_enabled() && !fallback_enabled {
                 warn!(
                     "No SCIP index was supplied and CODEGRAPH_LSP_FALLBACK is off: \
@@ -1381,17 +1408,22 @@ impl ProjectIndexer {
             }
 
             let lsp_files = files_without_scip_coverage(&self.project_root, &files, &scip_covered);
+            // Language servers only run when enrichment is enabled, at least one server is
+            // available and something is actually uncovered. Otherwise every uncovered file
+            // keeps its AST-only result, which `files_without_enrichment` reports.
+            let lsp_fallback_will_run = analyzer_settings.lsp_enabled()
+                && !analyzer_languages.is_empty()
+                && !lsp_files.is_empty()
+                && fallback_enabled;
+            let files_without_enrichment =
+                files_without_enrichment(lsp_fallback_will_run, lsp_files.len());
             if !fallback_enabled && !lsp_files.is_empty() {
                 info!(
                     "🧠 LSP fallback disabled (opt-in via CODEGRAPH_LSP_FALLBACK): {} files without SCIP coverage keep AST-only results",
                     lsp_files.len()
                 );
             }
-            if analyzer_settings.lsp_enabled()
-                && !analyzer_languages.is_empty()
-                && !lsp_files.is_empty()
-                && fallback_enabled
-            {
+            if lsp_fallback_will_run {
                 let start = std::time::Instant::now();
                 info!(
                     "🧠 Language-server analysis starting (mode: {}, languages: {:?})",
@@ -1863,6 +1895,7 @@ impl ProjectIndexer {
                 build_context_edges,
                 lsp_nodes_enriched: lsp_enrichment_stats.nodes_enriched,
                 lsp_edges_resolved: lsp_enrichment_stats.edges_resolved,
+                files_without_enrichment,
                 docs_attached: enrichment_stats.docs_attached,
                 export_edges_added: enrichment_stats.export_edges_added,
                 reexport_edges_added: enrichment_stats.reexport_edges_added,
@@ -4468,6 +4501,11 @@ pub struct IndexStats {
     pub build_context_edges: usize,
     pub lsp_nodes_enriched: usize,
     pub lsp_edges_resolved: usize,
+    /// Files this run could not enrich: no SCIP coverage and (by default) no
+    /// language-server fallback. Zero means every scanned file got compiler-index
+    /// or language-server data.
+    #[serde(default)]
+    pub files_without_enrichment: usize,
     pub docs_attached: usize,
     pub export_edges_added: usize,
     pub reexport_edges_added: usize,
@@ -4656,6 +4694,16 @@ pub(crate) fn files_without_scip_coverage(
         })
         .map(|(path, _)| path.clone())
         .collect()
+}
+
+/// Files this run leaves AST-only: the scanned files no SCIP index covers, unless the
+/// language-server fallback actually ran over them.
+///
+/// `fallback_enabled` means the fallback is *going to run* for these files, not merely
+/// that `CODEGRAPH_LSP_FALLBACK` is set: a run with no language server or no uncovered
+/// file still reports the AST-only count.
+fn files_without_enrichment(fallback_enabled: bool, lsp_files: usize) -> usize {
+    if fallback_enabled { 0 } else { lsp_files }
 }
 
 /// Whether files without SCIP coverage may fall back to a language server.
@@ -5099,6 +5147,25 @@ mod scip_coverage_tests {
             remaining,
             vec![PathBuf::from("src/a.rs"), PathBuf::from("web/c.ts")],
             "filtering must preserve the scanned order of the remaining files"
+        );
+    }
+
+    #[test]
+    fn files_without_enrichment_is_zero_when_fallback_ran() {
+        assert_eq!(
+            files_without_enrichment(true, 287),
+            0,
+            "files the language-server fallback actually processed are not AST-only"
+        );
+        assert_eq!(
+            files_without_enrichment(false, 287),
+            287,
+            "without the fallback every uncovered file stays AST-only"
+        );
+        assert_eq!(
+            files_without_enrichment(false, 0),
+            0,
+            "full SCIP coverage reports no AST-only file"
         );
     }
 }
