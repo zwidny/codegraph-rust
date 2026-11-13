@@ -1061,6 +1061,14 @@ impl PgStore {
         Ok(Self { pool })
     }
 
+    /// Crate-internal access to the connection pool.
+    ///
+    /// The graph query layer (`postgres_graph`) keeps its own graph-only SQL constants;
+    /// this accessor exists so it can run them without duplicating storage helpers.
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     /// Apply the full storage DDL (chunks, edges, nodes, symbol embeddings). Safe to
     /// run repeatedly.
     pub async fn ensure_schema(&self) -> Result<()> {

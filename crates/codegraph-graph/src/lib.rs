@@ -49,6 +49,8 @@ pub mod graph_types;
 pub mod storage;
 
 #[cfg(feature = "postgres")]
+pub mod postgres_graph;
+#[cfg(feature = "postgres")]
 pub mod postgres_storage;
 
 #[cfg(feature = "surrealdb")]
