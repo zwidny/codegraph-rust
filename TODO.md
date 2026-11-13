@@ -1,6 +1,6 @@
 # TODO — indexing performance & LSP → SCIP migration
 
-Context for a fresh session. State below reflects commit `291192f` (2026-11-12).
+Context for a fresh session. State below reflects commit `5a29ce1` (2026-11-12).
 
 ## Where things stand
 
@@ -100,6 +100,33 @@ Direct measurements that rule out the usual suspects:
 - Skipping inference entirely (`CODEGRAPH_EMBEDDING_POLICY=deferred`) needs 115 s and leaves
   `chunks=0`, `embedding_status=pending`; reconcile then costs 26 s (up from 4–11 s) to delete
   the missing rows. Useful for "graph now, vectors later", not for a one-shot build.
+
+### Measured: `symbol_embeddings` persist is not batch-, cache- or HNSW-bound
+
+Four EasyTier runs with `CODEGRAPH_TRACE_SYMBOL_EMBED=1`, ~57,400 symbol names each:
+
+| run | outer batch | DB batch | 1024 HNSW index | `persist` |
+|---|---|---|---|---|
+| 1 | 64 | 128 | present | 121,645 ms |
+| 2 | 64 | 512 | present | 117,443 ms |
+| 3 | 512 | 512 | present | 118,986 ms |
+| 4 | 512 | 512 | **dropped, rebuilt after** | 117,402 ms |
+
+All four land in 117–122 s ≈ **2.0 ms/row**, while `chunks` writes 75,376 rows at 0.3–0.8 ms/row.
+
+Everything that looked plausible was measured and falsified:
+
+- **batch count**: 897 → 113 batches changed nothing (so `CODEGRAPH_SYMBOL_BATCH_SIZE` and
+  `CODEGRAPH_SYMBOL_DB_BATCH_SIZE` are both irrelevant here)
+- **HNSW per-insert maintenance**: dropping `idx_chunks_embedding_1024` and
+  `idx_symbol_embeddings_vector_1024` before the write and rebuilding them afterwards (36 s)
+  changed nothing; the rebuild was pure extra cost, so that change was reverted
+- **disk cache reads**: parallelising them saved 5 s (reverted)
+- **JSON serialisation** of 1024-d vectors: 190–218 ms total (not the cost)
+
+Remaining candidates, none verified: the composite index
+`idx_symbol_embeddings_project_symbol`, the wider row (7 extra fields vs chunks), or a
+storage-level property of that table. **Do not re-run the batch or HNSW experiments.**
 
 ### What was learned (do not re-derive)
 
