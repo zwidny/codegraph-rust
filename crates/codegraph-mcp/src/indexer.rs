@@ -4,7 +4,7 @@
 
 use crate::analyzers::{AnalyzerSettings, find_tool_on_path, required_tools_for_languages};
 use crate::estimation::parse_files_with_unified_extraction as shared_unified_parse;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use codegraph_core::{CodeNode, EdgeRelationship, EdgeType, NodeId, NodeType};
 use codegraph_graph::ChunkEmbeddingRecord;
 use codegraph_graph::storage::IndexStorage;
@@ -25,7 +25,6 @@ use num_cpus;
 use rayon::prelude::*;
 use regex::Regex;
 use rustc_demangle::try_demangle;
-use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
@@ -115,23 +114,6 @@ impl SurrealEmbeddingColumn {
             SurrealEmbeddingColumn::Embedding3072 => 3072,
             SurrealEmbeddingColumn::Embedding4096 => 4096,
         }
-    }
-}
-
-fn extract_count(values: Vec<JsonValue>) -> Result<i64> {
-    let Some(first) = values.into_iter().next() else {
-        return Ok(0);
-    };
-
-    match first {
-        JsonValue::Number(n) => n
-            .as_i64()
-            .ok_or_else(|| anyhow!("Count value is not an integer: {}", n)),
-        JsonValue::Object(map) => map
-            .get("count")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow!("Count object missing integer 'count' field")),
-        other => Err(anyhow!("Unexpected count shape: {}", other)),
     }
 }
 
@@ -235,6 +217,9 @@ pub struct ProjectIndexer {
     progress: MultiProgress,
     parser: TreeSitterParser,
     surreal: Arc<TokioMutex<SurrealDbStorage>>,
+    /// Backend-neutral view of the same store `surreal` points at, so the
+    /// indexing run no longer issues SurrealQL directly.
+    storage: Arc<dyn codegraph_graph::storage::IndexStorage>,
     surreal_writer: Option<SurrealWriterHandle>,
     project_id: String,
     organization_id: Option<String>,
@@ -390,6 +375,11 @@ impl ProjectIndexer {
                 let storage = handle.lock().await.clone();
                 storage_pool.push(Arc::new(storage) as Arc<dyn IndexStorage>);
             }
+            let storage = Arc::clone(
+                storage_pool
+                    .first()
+                    .ok_or_else(|| anyhow!("surreal storage pool is empty"))?,
+            );
             let surreal_writer = SurrealWriterHandle::new(storage_pool);
             let project_id = std::env::var("CODEGRAPH_PROJECT_ID")
                 .unwrap_or_else(|_| project_root.display().to_string());
@@ -604,6 +594,7 @@ impl ProjectIndexer {
                 progress: multi_progress,
                 parser,
                 surreal,
+                storage,
                 surreal_writer: Some(surreal_writer),
                 project_id,
                 organization_id,
@@ -872,14 +863,8 @@ impl ProjectIndexer {
                     ))
                 };
             let mut input_fingerprint = make_fingerprint(&external_support)?;
-            let mut response = self.surreal.lock().await.db().query(
-            "SELECT metadata.input_fingerprint AS fingerprint FROM project_metadata WHERE project_id = $project"
-        ).bind(("project", self.project_id.clone())).await?.check()?;
-            let markers: Vec<serde_json::Value> = response.take(0)?;
-            let marker = markers
-                .first()
-                .and_then(|v| v.get("fingerprint"))
-                .and_then(|v| v.as_str());
+            let stored_fingerprint = self.storage.project_fingerprint(&self.project_id).await?;
+            let marker = stored_fingerprint.as_deref();
             let previous = state_cache
                 .get::<crate::reconciliation::Catalog>(&self.project_id)
                 .filter(|state| !force && marker == Some(state.fingerprint.as_str()));
@@ -1695,14 +1680,9 @@ impl ProjectIndexer {
             // the last usable graph. A failed parse must never erase the previous index.
             self.flush_surreal_writer().await?;
             // Remove the ready marker before the first mutation; interrupted runs cannot skip.
-            self.surreal
-                .lock()
-                .await
-                .db()
-                .query("DELETE project_metadata WHERE project_id = $project")
-                .bind(("project", self.project_id.clone()))
-                .await?
-                .check()?;
+            self.storage
+                .delete_project_metadata(&self.project_id)
+                .await?;
             // Per-file node ids, used by the per-file reconciliation below. Node ids
             // embed the source line number, so moving a line orphans the old id even
             // when the file still exists.
@@ -2078,15 +2058,13 @@ impl ProjectIndexer {
             let catalog = if reconcile_scope.is_some() {
                 let excluded: Vec<String> = fresh_nodes_by_file.keys().cloned().collect();
                 let rows = self
-                    .surreal
-                    .lock()
-                    .await
-                    .load_symbols_excluding(&self.project_id, &excluded)
+                    .storage
+                    .symbols_excluding_files(&self.project_id, &excluded)
                     .await?;
                 let external: Vec<crate::resolution::ExternalSymbol> = rows
                     .into_iter()
                     .filter_map(|row| {
-                        let id = codegraph_core::NodeId::parse_str(decode_node_id(&row.id)).ok()?;
+                        let id = codegraph_core::NodeId::parse_str(&row.id).ok()?;
                         Some(crate::resolution::ExternalSymbol {
                             id,
                             file: row.file_path,
@@ -2491,10 +2469,8 @@ impl ProjectIndexer {
                 self.redirect_inbound_edges(&fresh_nodes_by_file, &new_ids, &by_identity)
                     .await?;
             }
-            self.surreal
-                .lock()
-                .await
-                .reconcile_catalog_by_file(
+            self.storage
+                .reconcile(
                     &self.project_id,
                     &fresh_nodes_by_file,
                     &next_catalog.chunks,
@@ -2524,12 +2500,14 @@ impl ProjectIndexer {
                     all_files.len()
                 );
             }
-            stats.vector_index_ready = codegraph_graph::vector_indexes::ensure_ready(
-                &self.surreal.lock().await.db(),
-                self.vector_dim,
-                &Self::vector_tables(self.policies),
-            )
-            .await?;
+            let tables: Vec<String> = Self::vector_tables(self.policies)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            stats.vector_index_ready = self
+                .storage
+                .ensure_vector_indexes(self.vector_dim, &tables)
+                .await?;
             stats.index_ms = start.elapsed().as_millis() as u64;
             phase_ms.insert(
                 "durable_reconcile_and_indexes".into(),
@@ -2900,39 +2878,15 @@ impl ProjectIndexer {
     }
 
     async fn is_indexed(&self, _path: &Path) -> Result<bool> {
-        let db = {
-            let storage = self.surreal.lock().await;
-            storage.db()
-        };
-
-        let mut response = db
-            .query(
-                "SELECT count() AS count FROM project_metadata WHERE project_id = $project_id GROUP ALL;",
-            )
-            .bind(("project_id", self.project_id.clone()))
-            .await
-            .context("Failed to query project_metadata")?;
-        let counts: Vec<JsonValue> = response.take(0)?;
-        let count = extract_count(counts)?;
-        Ok(count > 0)
+        Ok(self.storage.has_project_metadata(&self.project_id).await?)
     }
 
     async fn has_file_metadata(&self) -> Result<bool> {
-        let db = {
-            let storage = self.surreal.lock().await;
-            storage.db()
-        };
-
-        let mut response = db
-            .query(
-                "SELECT count() AS count FROM file_metadata WHERE project_id = $project_id GROUP ALL;",
-            )
-            .bind(("project_id", self.project_id.clone()))
-            .await
-            .context("Failed to query file_metadata count")?;
-        let counts: Vec<JsonValue> = response.take(0)?;
-        let count = extract_count(counts)?;
-        Ok(count > 0)
+        Ok(!self
+            .storage
+            .file_metadata(&self.project_id)
+            .await?
+            .is_empty())
     }
 
     /// Calculate SHA-256 hash of file content
@@ -2982,11 +2936,7 @@ impl ProjectIndexer {
         current_files: &[PathBuf],
         snapshots: &codegraph_parser::SourceSnapshots,
     ) -> Result<Vec<FileChange>> {
-        let storage = self.surreal.lock().await;
-        let stored_metadata = storage
-            .get_file_metadata_for_project(&self.project_id)
-            .await?;
-        drop(storage);
+        let stored_metadata = self.storage.file_metadata(&self.project_id).await?;
 
         // Create lookup map of stored files
         let stored_map: HashMap<String, FileMetadataRecord> = stored_metadata
@@ -3232,29 +3182,15 @@ impl ProjectIndexer {
         self.enqueue_nodes_chunk(chunk).await
     }
 
+    /// Name kept for history; it now reads through IndexStorage so it is backend-neutral.
     async fn log_surreal_node_count(&self, expected: usize) {
-        let db = {
-            let storage = self.surreal.lock().await;
-            storage.db()
-        };
-
-        match db
-            .query("SELECT count() AS count FROM nodes WHERE project_id = $project_id GROUP ALL;")
-            .bind(("project_id", self.project_id.clone()))
-            .await
-        {
-            Ok(mut resp) => match resp.take::<Vec<JsonValue>>(0) {
-                Ok(rows) => match extract_count(rows) {
-                    Ok(count) => {
-                        info!(
-                            "🗄️ SurrealDB nodes persisted: {} (expected ≈ {})",
-                            count, expected
-                        );
-                    }
-                    Err(e) => warn!("⚠️ Failed to interpret SurrealDB node count: {}", e),
-                },
-                Err(e) => warn!("⚠️ Failed to read SurrealDB node count: {}", e),
-            },
+        match self.storage.node_count(&self.project_id).await {
+            Ok(count) => {
+                info!(
+                    "🗄️ SurrealDB nodes persisted: {} (expected ≈ {})",
+                    count, expected
+                );
+            }
             Err(e) => {
                 warn!("⚠️ SurrealDB node count query failed: {}", e);
             }
@@ -3265,30 +3201,16 @@ impl ProjectIndexer {
         Arc::clone(&self.surreal)
     }
 
+    /// Name kept for history; it now reads through IndexStorage so it is backend-neutral.
     #[cfg(feature = "embeddings")]
     async fn log_surreal_chunk_count(&self, expected: usize) {
-        let db = {
-            let storage = self.surreal.lock().await;
-            storage.db()
-        };
-
-        match db
-            .query("SELECT count() AS count FROM chunks WHERE project_id = $project_id GROUP ALL;")
-            .bind(("project_id", self.project_id.clone()))
-            .await
-        {
-            Ok(mut resp) => match resp.take::<Vec<JsonValue>>(0) {
-                Ok(rows) => match extract_count(rows) {
-                    Ok(count) => {
-                        info!(
-                            "🧩 SurrealDB chunks persisted: {} (expected ≈ {})",
-                            count, expected
-                        );
-                    }
-                    Err(e) => warn!("⚠️ Failed to interpret SurrealDB chunk count: {}", e),
-                },
-                Err(e) => warn!("⚠️ Failed to read SurrealDB chunk count: {}", e),
-            },
+        match self.storage.chunk_count(&self.project_id).await {
+            Ok(count) => {
+                info!(
+                    "🧩 SurrealDB chunks persisted: {} (expected ≈ {})",
+                    count, expected
+                );
+            }
             Err(e) => {
                 warn!("⚠️ SurrealDB chunk count query failed: {}", e);
             }
@@ -3315,35 +3237,21 @@ impl ProjectIndexer {
         Ok(rows.into_iter().next())
     }
 
+    /// Name kept for history; it now reads through IndexStorage so it is backend-neutral.
     async fn log_surreal_edge_count(&self, expected: usize) {
-        let db = {
-            let storage = self.surreal.lock().await;
-            storage.db()
-        };
-
-        match db
-            .query("SELECT count() AS count FROM edges WHERE project_id = $project_id GROUP ALL;")
-            .bind(("project_id", self.project_id.clone()))
-            .await
-        {
-            Ok(mut resp) => match resp.take::<Vec<JsonValue>>(0) {
-                Ok(rows) => match extract_count(rows) {
-                    Ok(count) => {
-                        info!(
-                            "🗄️ SurrealDB edges persisted: {} (expected ≈ {})",
-                            count, expected
-                        );
-                        if count < expected as i64 {
-                            warn!(
-                                "⚠️ Edge count ({}) is lower than resolved edges ({}). Verify SurrealDB schema and filters.",
-                                count, expected
-                            );
-                        }
-                    }
-                    Err(e) => warn!("⚠️ Failed to interpret SurrealDB edge count: {}", e),
-                },
-                Err(e) => warn!("⚠️ Failed to read SurrealDB edge count: {}", e),
-            },
+        match self.storage.edge_count(&self.project_id).await {
+            Ok(count) => {
+                info!(
+                    "🗄️ SurrealDB edges persisted: {} (expected ≈ {})",
+                    count, expected
+                );
+                if count < expected as i64 {
+                    warn!(
+                        "⚠️ Edge count ({}) is lower than resolved edges ({}). Verify SurrealDB schema and filters.",
+                        count, expected
+                    );
+                }
+            }
             Err(e) => warn!("⚠️ SurrealDB edge count query failed: {}", e),
         }
     }
@@ -3353,22 +3261,11 @@ impl ProjectIndexer {
             return Ok(());
         }
 
-        let db = {
-            let storage = self.surreal.lock().await;
-            storage.db()
-        };
-
         let mut last_count = 0i64;
+        let mut stored = Vec::new();
         for attempt in 1..=3 {
-            let mut resp = db
-                .query(
-                    "SELECT count() AS count FROM file_metadata WHERE project_id = $project_id GROUP ALL;",
-                )
-                .bind(("project_id", self.project_id.clone()))
-                .await
-                .context("Failed to verify file_metadata count")?;
-            let counts: Vec<JsonValue> = resp.take(0)?;
-            last_count = extract_count(counts)?;
+            stored = self.storage.file_metadata(&self.project_id).await?;
+            last_count = stored.len() as i64;
 
             if last_count >= expected_files as i64 {
                 return Ok(());
@@ -3380,19 +3277,10 @@ impl ProjectIndexer {
         }
 
         // Fetch a small sample to aid debugging
-        let mut sample_resp = db
-            .query("SELECT file_path FROM file_metadata WHERE project_id = $project_id LIMIT 5")
-            .bind(("project_id", self.project_id.clone()))
-            .await
-            .context("Failed to collect sample file_metadata rows")?;
-        let sample_rows: Vec<JsonValue> = sample_resp.take(0).unwrap_or_default();
-        let sample_paths: Vec<String> = sample_rows
+        let sample_paths: Vec<String> = stored
             .into_iter()
-            .filter_map(|row| {
-                row.get("file_path")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
+            .take(5)
+            .map(|row| row.file_path)
             .collect();
 
         Err(anyhow!(
@@ -3405,28 +3293,13 @@ impl ProjectIndexer {
     }
 
     async fn verify_project_metadata_present(&self) -> Result<()> {
-        let db = {
-            let storage = self.surreal.lock().await;
-            storage.db()
-        };
-
-        let mut resp = db
-            .query(
-                "SELECT count() AS count FROM project_metadata WHERE project_id = $project_id GROUP ALL;",
-            )
-            .bind(("project_id", self.project_id.clone()))
-            .await
-            .context("Failed to verify project_metadata count")?;
-        let rows: Vec<JsonValue> = resp.take(0)?;
-        let count = extract_count(rows)?;
-        if count < 1 {
-            Err(anyhow!(
+        if !self.storage.has_project_metadata(&self.project_id).await? {
+            bail!(
                 "project_metadata missing for project {}; ensure schema applied and permissions allow writes",
                 self.project_id
-            ))
-        } else {
-            Ok(())
+            );
         }
+        Ok(())
     }
 
     async fn persist_node_embeddings(&self, nodes: &[CodeNode]) -> Result<()> {
@@ -3914,44 +3787,19 @@ impl ProjectIndexer {
             return Ok(());
         }
 
-        let storage = self.surreal.lock().await;
-        let db = storage.db();
-        let mut response = db
-            .query(
-                "SELECT <string> id AS id, file_path, name, node_type FROM nodes \
-                 WHERE project_id = $project AND file_path IN $files;",
-            )
-            .bind(("project", self.project_id.clone()))
-            .bind(("files", files))
-            .await?
-            .check()?;
-        let rows: Vec<serde_json::Value> = response.take(0)?;
+        let rows = self
+            .storage
+            .nodes_in_files(&self.project_id, &files)
+            .await?;
 
         let mut updates: Vec<(String, String)> = Vec::new();
         for row in rows {
-            let Some(raw_id) = row.get("id").and_then(|value| value.as_str()) else {
-                continue;
-            };
-            let old = decode_node_id(raw_id).to_string();
+            let old = row.id;
             let old_id = codegraph_core::NodeId::parse_str(&old).ok();
             if old_id.is_some_and(|id| new_ids.contains(&id)) {
                 continue; // already a current id
             }
-            let file = row
-                .get("file_path")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let name = row
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let kind = row
-                .get("node_type")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            if let Some(new_id) =
-                by_identity.get(&(file.to_string(), name.to_string(), kind.to_string()))
-            {
+            if let Some(new_id) = by_identity.get(&(row.file_path, row.name, row.node_type)) {
                 let new = new_id.to_string();
                 if new != old {
                     updates.push((old, new));
@@ -3960,15 +3808,9 @@ impl ProjectIndexer {
         }
 
         for (old, new) in updates {
-            db.query(
-                "UPDATE edges SET to = type::record('nodes', $new) \
-                 WHERE project_id = $project AND to = type::record('nodes', $old);",
-            )
-            .bind(("project", self.project_id.clone()))
-            .bind(("old", old))
-            .bind(("new", new))
-            .await?
-            .check()?;
+            self.storage
+                .retarget_edges(&self.project_id, &old, &new)
+                .await?;
         }
 
         Ok(())
@@ -4598,15 +4440,6 @@ fn available_memory_mb() -> Option<u64> {
     {
         None
     }
-}
-
-/// Strip the record prefix and quoting from a `nodes` id returned by SurrealDB.
-fn decode_node_id(raw: &str) -> &str {
-    raw.strip_prefix("nodes:")
-        .unwrap_or(raw)
-        .trim_matches('`')
-        .trim_matches('⟨')
-        .trim_matches('⟩')
 }
 
 /// Normalize a source path to a project-relative, posix-style key.
