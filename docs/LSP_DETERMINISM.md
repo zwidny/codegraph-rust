@@ -1,8 +1,8 @@
 # Indexing is not deterministic when LSP enrichment is enabled
 
-Status: **mitigated** — SCIP plus `CODEGRAPH_LSP_FALLBACK=0` removes the language server from
-the path entirely. See [Recommendation](#recommendation). The analysis below still describes
-the mechanism.
+Status: **mitigated** — SCIP is the default enrichment path and the language-server fallback is
+opt-in (`CODEGRAPH_LSP_FALLBACK=1`), so the language server is out of the path by default.
+See [Recommendation](#recommendation). The analysis below still describes the mechanism.
 
 ## Symptom
 
@@ -115,13 +115,24 @@ timing-dependent.
 
 ## Recommendation
 
-**Use a compiler index for every language and turn the fallback off.**
+**Use a compiler index for every language. The fallback is already off by default, so there is
+nothing to disable.**
 
 ```bash
 export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"   # rust + ts + go
-export CODEGRAPH_LSP_FALLBACK=0
 codegraph index . --index-tier full
 ```
+
+Files that no supplied SCIP index covers keep AST-only results; the language server does not
+start for them. If you genuinely need language-server enrichment for one run, opt in
+explicitly:
+
+```bash
+CODEGRAPH_LSP_FALLBACK=1 codegraph index . --index-tier full
+```
+
+(`CODEGRAPH_LSP_FALLBACK` accepts `1`/`true`/`on`/`yes`; any other value, or leaving it unset,
+keeps the fallback off.)
 
 This is option 4, and it is what the measurements now support. `full` still keeps
 the reference edges and the dataflow analyzers; only the language server is gone.
@@ -146,9 +157,11 @@ Rejected alternatives:
 3. Stop feeding LSP data into resolution while keeping the server — keeps 44 s of
    latency for enrichment that no longer affects the graph.
 
-Remaining gap: Kotlin (13 files) needs `scip-java` and JDK 11+, C (1 file) needs
-`compile_commands.json`. Those files stay AST-only until they get an index; with
-`CODEGRAPH_LSP_FALLBACK=0` they no longer start a server.
+Remaining gap: Kotlin (13 files) needs the Android SDK — those `.kt` files live in Android
+projects such as `src-tauri/gen/android` and `easytier-contrib/...`, and `scip-java` needs a
+full Gradle + Android SDK build to index them. C (1 file) needs `compile_commands.json`.
+Both stay AST-only until they get an index; the language-server fallback no longer starts for
+them unless `CODEGRAPH_LSP_FALLBACK=1` is set.
 
 ## Reproducing
 

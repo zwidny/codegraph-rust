@@ -926,7 +926,10 @@ impl ProjectIndexer {
                         self.config.scip_strict,
                     )?;
                     if entries.is_empty() {
-                        warn!("--scip-auto produced no indexes; falling back to language servers");
+                        warn!(
+                            "--scip-auto produced no indexes; no SCIP enrichment will run \
+                             (set CODEGRAPH_LSP_FALLBACK=1 to fall back to language servers)"
+                        );
                         Vec::new()
                     } else {
                         info!(
@@ -944,8 +947,9 @@ impl ProjectIndexer {
             // runs `codegraph index` should still learn that SCIP exists.
             if scip_specs.is_empty() {
                 info!(
-                    "💡 hint: no SCIP index supplied, so symbol analysis falls back to one \
-                     language-server round-trip per file (about 21 minutes per 10k files). \
+                    "💡 hint: no SCIP index supplied, so no compiler-index enrichment will run \
+                     (the language-server fallback is opt-in via CODEGRAPH_LSP_FALLBACK=1, about \
+                     21 minutes per 10k files). \
                      Generate one (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`) \
                      and set CODEGRAPH_SCIP_INDEX, or run scripts/scip-index.sh. \
                      See `codegraph index --help`."
@@ -1366,11 +1370,20 @@ impl ProjectIndexer {
                 );
             }
 
-            let lsp_files = files_without_scip_coverage(&self.project_root, &files, &scip_covered);
             let fallback_enabled = lsp_fallback_enabled();
+            if scip_specs.is_empty() && analyzer_settings.lsp_enabled() && !fallback_enabled {
+                warn!(
+                    "No SCIP index was supplied and CODEGRAPH_LSP_FALLBACK is off: \
+                     no compiler-index or language-server enrichment will run. \
+                     Generate indexes with `scripts/scip-index.sh --export` and set \
+                     CODEGRAPH_SCIP_INDEX, or pass CODEGRAPH_LSP_FALLBACK=1 for one run."
+                );
+            }
+
+            let lsp_files = files_without_scip_coverage(&self.project_root, &files, &scip_covered);
             if !fallback_enabled && !lsp_files.is_empty() {
                 info!(
-                    "🧠 LSP fallback disabled (CODEGRAPH_LSP_FALLBACK): {} files without SCIP coverage keep AST-only results",
+                    "🧠 LSP fallback disabled (opt-in via CODEGRAPH_LSP_FALLBACK): {} files without SCIP coverage keep AST-only results",
                     lsp_files.len()
                 );
             }
@@ -4647,18 +4660,17 @@ pub(crate) fn files_without_scip_coverage(
 
 /// Whether files without SCIP coverage may fall back to a language server.
 ///
-/// On by default. `CODEGRAPH_LSP_FALLBACK=0|false|off|no` turns it off: those
-/// files keep AST-only results instead of starting a language server.
+/// Off by default: a compiler index is deterministic, and on EasyTier the
+/// language-server fallback cost 44 s of a 65 s full index for 0.48% more edges
+/// (see docs/LSP_DETERMINISM.md).
 ///
-/// On EasyTier this skips 287 files and roughly 35 s of a 65 s full index
-/// (kotlin-language-server alone needs 24 s to initialise), and removes the
-/// language-server non-determinism documented in docs/LSP_DETERMINISM.md.
+/// `CODEGRAPH_LSP_FALLBACK=1|true|on|yes` re-enables it for one run.
 fn lsp_fallback_enabled() -> bool {
-    !matches!(
+    matches!(
         std::env::var("CODEGRAPH_LSP_FALLBACK")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if value == "0" || value == "false" || value == "off" || value == "no"
+        Some(value) if value == "1" || value == "true" || value == "on" || value == "yes"
     )
 }
 
@@ -5125,32 +5137,32 @@ mod lsp_fallback_tests {
     }
 
     #[test]
-    fn lsp_fallback_defaults_to_enabled() {
+    fn lsp_fallback_defaults_to_disabled() {
         let _guard = FallbackEnvGuard::new(None);
         assert!(
-            lsp_fallback_enabled(),
-            "unset CODEGRAPH_LSP_FALLBACK must keep the language-server fallback enabled"
+            !lsp_fallback_enabled(),
+            "unset CODEGRAPH_LSP_FALLBACK must keep the language-server fallback off"
         );
     }
 
     #[test]
-    fn lsp_fallback_accepts_disabling_values() {
-        for value in ["0", "false", "OFF", " no "] {
+    fn lsp_fallback_accepts_enabling_values() {
+        for value in ["1", "true", "ON", " yes "] {
             let _guard = FallbackEnvGuard::new(Some(value));
             assert!(
-                !lsp_fallback_enabled(),
-                "CODEGRAPH_LSP_FALLBACK={value:?} must disable the language-server fallback"
+                lsp_fallback_enabled(),
+                "CODEGRAPH_LSP_FALLBACK={value:?} must enable the language-server fallback"
             );
         }
     }
 
     #[test]
-    fn lsp_fallback_keeps_enabled_for_other_values() {
-        for value in ["1", "true", "yes", "anything"] {
+    fn lsp_fallback_keeps_disabled_for_other_values() {
+        for value in ["0", "false", "anything"] {
             let _guard = FallbackEnvGuard::new(Some(value));
             assert!(
-                lsp_fallback_enabled(),
-                "CODEGRAPH_LSP_FALLBACK={value:?} must keep the language-server fallback enabled"
+                !lsp_fallback_enabled(),
+                "CODEGRAPH_LSP_FALLBACK={value:?} must leave the language-server fallback off"
             );
         }
     }
