@@ -160,6 +160,38 @@ available from the corpus) rather than relying on `ts_rank_cd`. That is a small 
 `AnalysisCore` and would also make the ranking backend-independent — which is the stated goal of
 `docs/INTERNAL_FUNCTION_MIGRATION.md`.
 
+### 4. Analyzer parity: EDGENGRAM and SNOWBALL are reproducible
+
+`code_identifier` uses `TOKENIZERS CLASS, CAMEL, PUNCT FILTERS LOWERCASE, ASCII, EDGENGRAM(2,12)`
+and `code_text` uses `TOKENIZERS BLANK, CLASS, CAMEL, PUNCT FILTERS LOWERCASE, ASCII,
+SNOWBALL(ENGLISH)`. Both behaviours matter for search quality, so both were checked.
+
+SurrealDB, `project_id` scope:
+
+| Probe | Result |
+|---|---|
+| `name @1@ 'emb'` | matches `embedding_dimension`, `get_embedding`, `generate_text_embedding` (prefix, from edgengram) |
+| `name @1@ 'beddin'` | **empty** — edgengram is an edge n-gram, not an infix n-gram |
+| `content @1@ 'embeddings'` | 886 |
+| `content @1@ 'embedding'` | 886 (same set: snowball folds the plural) |
+
+Postgres equivalent, measured on the same 12,887 nodes:
+
+| Probe | Result |
+|---|---|
+| `name_en @@ to_tsquery('english','emb:*')` | `crate::embedding_config::EmbeddingModelConfig`, `embed_resilient_...`, `get_embedding` — same class of matches |
+| `content_en @@ to_tsquery('english','embeddings')` | 657 |
+| `content_en @@ to_tsquery('english','embedding')` | 657 (same set: `english` config has snowball) |
+
+So neither custom analyzer needs re-implementing:
+
+- **EDGENGRAM(2,12)** → append `:*` to each query term (`emb:*`); prefix semantics match, infix
+  never matched on SurrealDB either.
+- **SNOWBALL(ENGLISH)** → use the `english` text-search configuration instead of `simple`.
+
+The absolute counts differ (657 vs 886) because the fixtures index different column sets
+(SurrealDB's `code_text` covers name+content in one analyzer; the probe indexed content only).
+
 ## What SurrealDB is actually used for here
 
 Inventory of the current schema and queries (8 tables, 55 indexes, 28 HNSW definitions,
@@ -201,10 +233,16 @@ Estimated 2-3 weeks. All three validations are done:
 - full-text recall matches (96% vs 100% precision) but **ranking does not** (9% top-10
   overlap), because BM25 and `ts_rank_cd` are different models.
 
-The one design decision this forces: implement BM25 in Rust (`AnalysisCore`) and feed the
-`tsvector` corpus, instead of using `ts_rank_cd`. That keeps ranking backend-independent and
-stable across the migration — which is the same goal `docs/INTERNAL_FUNCTION_MIGRATION.md`
-already states ("Backend lock-in").
+Analyzer parity is also confirmed (section 4): EDGENGRAM maps to a `:*` prefix term and
+SNOWBALL to the `english` configuration, so neither custom analyzer has to be re-implemented.
+
+The only design decision left is ranking: BM25 (SurrealDB) vs `ts_rank_cd` (Postgres) rank
+differently (9% top-10 overlap), so the fused hybrid order will change. Two options:
+
+1. Accept it — recall is equal (96% vs 100% precision), only ordering shifts.
+2. Implement BM25 in Rust (`AnalysisCore`) over the `tsvector` corpus so ordering is
+   backend-independent, which is the goal `docs/INTERNAL_FUNCTION_MIGRATION.md` already states
+   ("Backend lock-in"). This is a scoring function (~100 lines), not an analyzer rewrite.
 
 ## Expected effect on indexing
 
