@@ -98,6 +98,46 @@ Two methodology notes that cost time and should not be repeated:
   benchmark.** 1,024 `rand()` calls per row cost 2.4-2.9 ms, which masked the real storage cost
   (0.36 ms/row) in several early experiments. Always use `array::repeat(const, N)`.
 
+## Prerequisite validations (both done)
+
+Before any migration code, two things had to hold: the graph queries had to translate, and
+retrieval quality had to survive.
+
+### 1. Graph traversal, both directions
+
+Same graph (29,220 nodes / 97,845 edges), same node (`'calls'` edges only):
+
+| Query | SurrealDB | Postgres | Speedup |
+|---|---|---|---|
+| reverse deps, depth 1 (1,324 rows) | 420 ms | **1.7 ms** | 247x |
+| reverse deps, depth 3 | 2,040 ms | **59.7 ms** | 34x |
+| forward call chain, depth 1 (379 callees) | 940 ms | **1.47 ms** | 640x |
+| forward call chain, depth 3 | 2,530 ms | **26.0 ms** | 97x |
+
+SurrealDB's `fn::*` walkers recurse through `array::fold` / `fn::expand` (SurrealQL array
+operations with a 1 MiB output cap), not an index walk; the forward direction is worst because
+it additionally tracks the path at every step. Recursive CTEs with an index on the join column
+are 1–2 orders of magnitude cheaper.
+
+### 2. Vector retrieval quality
+
+29,538 real chunk embeddings (1024-d) loaded into both backends, HNSW with the same
+`m=12 / ef_construction=150`, `ef_search = 40` on both sides.
+
+- Top-10 overlap between backends: mean **8.1/10** across 10 queries, but three queries
+  overlapped 1–3/10.
+- Against exact (`ORDER BY <=>` with sequential scan as ground truth), both approximations are
+  equally imprecise: **SurrealDB 6.8/10, Postgres 6.5/10** recall@10, and the three low-overlap
+  queries score 0–1/10 against exact **on both sides**.
+
+Conclusion: the low-overlap pairs are a property of HNSW on this data distribution (many
+near-duplicate chunk vectors), not a Postgres deficiency. Retrieval quality does not regress.
+
+**Not yet measured**: full-text ranking. SurrealDB uses BM25; Postgres `ts_rank_cd` is a
+coverage ranking, so top-10 lists will differ even when recall is comparable. The hybrid path
+(vector + full text + RRF) therefore needs a relevance comparison on 20 real queries before the
+switch — plan for RRF fusion in SQL or the application.
+
 ## What SurrealDB is actually used for here
 
 Inventory of the current schema and queries (8 tables, 55 indexes, 28 HNSW definitions,
@@ -132,12 +172,10 @@ part that talks to the database:
 | Multi-tenancy | namespace/database | Postgres schema per project |
 | Reconciliation | node/chunk/edge sweep | same logic, PG SQL |
 
-Estimated 2-3 weeks, with two prerequisite validations before any code is written:
-
-1. **Hybrid ranking equivalence**: 20 real queries, compare vector + BM25 + RRF results
-   between backends; relevance must not regress.
-2. **Forward call chains** (`trace_call_chain`): the depth-3 reverse test covered one direction
-   only; confirm the forward direction and the mixed direction on the same graph.
+Estimated 2-3 weeks. Both prerequisite validations are done (see above): graph traversal is
+34-640x faster in both directions, and vector recall matches (6.8 vs 6.5 out of 10 against
+exact). The only remaining unknown is full-text **ranking** — `ts_rank_cd` is not BM25, so a
+20-query relevance comparison of the hybrid path is still required before the switch.
 
 ## Expected effect on indexing
 
