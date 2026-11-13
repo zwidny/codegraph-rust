@@ -123,10 +123,28 @@ Everything that looked plausible was measured and falsified:
   changed nothing; the rebuild was pure extra cost, so that change was reverted
 - **disk cache reads**: parallelising them saved 5 s (reverted)
 - **JSON serialisation** of 1024-d vectors: 190–218 ms total (not the cost)
+- **REFERENCE fields**: inserting 1,000 rows with `node_id` (and additionally
+  `source_edge_id`) pointing at real rows costs the same 1.7–2.3 ms/row as omitting both
 
-Remaining candidates, none verified: the composite index
-`idx_symbol_embeddings_project_symbol`, the wider row (7 extra fields vs chunks), or a
-storage-level property of that table. **Do not re-run the batch or HNSW experiments.**
+### The ceiling: ~631 rows/s through 4 connections
+
+Direct HTTP measurement against the running SurrealDB, 1,000 rows with 1024-d vectors:
+
+| client concurrency | time | throughput |
+|---|---|---|
+| 4 requests × 250 rows, serial | 5.39 s | 186 rows/s |
+| 4 requests × 250 rows, concurrent | 1.59 s | **631 rows/s** |
+
+`symbol_embeddings` writes at **489 rows/s** (57,434 rows / 117.4 s) = 77% of that ceiling.
+Theoretical best for this volume is ~91 s, so only ~26 s is left and none of it is recoverable
+client-side.
+
+**The "chunks at 0.31 ms/row" figure was a measurement artefact.** That window
+(`nodes persisted` → `chunks persisted`) overlaps with concurrent embedding work; it is not
+pure write time. Overall the run acknowledged 477,248 rows (nodes + edges + chunks + symbols).
+
+Conclusion: **stop optimising this path in the client.** Only fewer rows or a faster store
+changes it. **Do not re-run the batch, HNSW, REFERENCE or concurrency experiments.**
 
 ### What was learned (do not re-derive)
 
