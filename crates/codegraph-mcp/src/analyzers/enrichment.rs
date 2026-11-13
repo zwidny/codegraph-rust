@@ -251,7 +251,9 @@ fn rust_visibility(lines: &[String], line_1based: u32) -> Option<&'static str> {
 
 fn cfg_feature(lines: &[String], line_1based: u32) -> Option<String> {
     let idx = (line_1based as usize).saturating_sub(1);
-    let start = idx.saturating_sub(3);
+    // A recorded line can outlive its source text (stale analyzer input, a file
+    // that shrank). Clamp rather than slice past the end: start > end panics.
+    let start = idx.saturating_sub(3).min(lines.len());
     let end = idx.min(lines.len());
 
     for l in &lines[start..end] {
@@ -370,6 +372,15 @@ fn normalize_project_path(project_root: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use codegraph_core::Location;
+
+    #[test]
+    fn cfg_feature_tolerates_a_line_past_the_end_of_the_source() {
+        // Regression: a node whose recorded line outlives its source text used to
+        // panic with "range start index 50 out of range for slice of length 0".
+        assert_eq!(cfg_feature(&[], 54), None);
+        let short = vec!["fn f() {}".to_string()];
+        assert_eq!(cfg_feature(&short, 50), None);
+    }
 
     #[test]
     fn rust_doc_comments_attach_to_nodes() {
