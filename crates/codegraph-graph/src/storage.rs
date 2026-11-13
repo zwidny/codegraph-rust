@@ -287,6 +287,67 @@ pub struct SymbolInProject {
     pub qualified_name: Option<String>,
 }
 
+/// One node matched by a name lookup, as `codegraph query` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolMatch {
+    pub name: String,
+    pub node_type: Option<String>,
+    pub language: Option<String>,
+    pub file_path: String,
+    pub start_line: Option<i32>,
+    pub end_line: Option<i32>,
+}
+
+/// One caller or callee edge, projected for `codegraph query --callers/--callees`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRelation {
+    pub symbol: String,
+    pub node_type: Option<String>,
+    pub file: String,
+    pub line: Option<i32>,
+    /// `edges.metadata["resolution_method"]` when the edge carries it.
+    pub resolution: Option<String>,
+}
+
+/// Node identity used by `codegraph plan verify` and `plan show`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentityRow {
+    pub id: String,
+    pub name: String,
+    pub file_path: String,
+    /// Already decoded: SurrealDB stores a compressed JSON string, Postgres a
+    /// `jsonb` value. `None` when the node has no metadata.
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Ceiling every name/edge lookup applies to its caller-supplied `limit`.
+///
+/// `limit <= 0` means "no explicit bound" and maps to the ceiling instead of
+/// asking either backend for zero rows.
+// Only the two backend modules apply the clamp today; without either feature the
+// helper is unreachable, so keep the default build warning-free.
+#[cfg_attr(
+    not(any(feature = "surrealdb", feature = "postgres")),
+    allow(dead_code)
+)]
+pub(crate) const LOOKUP_LIMIT_MAX: i64 = 1000;
+
+/// Clamp a lookup `limit` to `1..=1000`, treating `<= 0` as the ceiling.
+///
+/// Both backends apply the same rule so `codegraph query --limit` behaves
+/// identically over SurrealQL `LIMIT` and Postgres `LIMIT`.
+#[cfg_attr(
+    not(any(feature = "surrealdb", feature = "postgres")),
+    allow(dead_code)
+)]
+pub(crate) fn clamp_lookup_limit(limit: i64) -> i64 {
+    if limit <= 0 {
+        LOOKUP_LIMIT_MAX
+    } else {
+        limit.min(LOOKUP_LIMIT_MAX)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeEmbeddingRecord {
     pub id: String,
@@ -583,6 +644,51 @@ pub trait IndexStorage: Send + Sync {
     /// tables to check; backends that create indexes in their DDL may ignore it.
     /// Returns whether the indexes are ready.
     async fn ensure_vector_indexes(&self, dimension: usize, tables: &[String]) -> Result<bool>;
+
+    /// Exact-or-prefix match on node name, ordered by name for determinism.
+    ///
+    /// `limit` is clamped to `1..=1000`; `limit <= 0` means 1000.
+    async fn find_nodes_by_name(
+        &self,
+        project_id: &str,
+        symbol: &str,
+        limit: i64,
+    ) -> Result<Vec<SymbolMatch>>;
+
+    /// Callers: edges with `edge_type = 'calls'` whose target node has this name.
+    ///
+    /// `limit` is clamped to `1..=1000`; `limit <= 0` means 1000.
+    async fn callers_of_name(
+        &self,
+        project_id: &str,
+        target: &str,
+        limit: i64,
+    ) -> Result<Vec<CallRelation>>;
+
+    /// Callees: the mirror image of [`IndexStorage::callers_of_name`].
+    async fn callees_of_name(
+        &self,
+        project_id: &str,
+        target: &str,
+        limit: i64,
+    ) -> Result<Vec<CallRelation>>;
+
+    /// Every node's id, name and file path, for `plan verify`.
+    async fn node_identities(&self, project_id: &str) -> Result<Vec<NodeIdentityRow>>;
+
+    /// Every edge's endpoints, for `plan verify`.
+    async fn edge_endpoints(&self, project_id: &str) -> Result<Vec<(String, String)>>;
+
+    /// Every node's id, name and decoded metadata, for `plan show`.
+    async fn nodes_with_metadata(&self, project_id: &str) -> Result<Vec<NodeIdentityRow>>;
+
+    /// `project_metadata.metadata` as a JSON value (`plan` stores constraints there).
+    async fn project_metadata_value(&self, project_id: &str) -> Result<Option<serde_json::Value>>;
+
+    /// Delete every row of this project from all six tables, in one transaction.
+    /// Used by `plan store --force` and `plan drop`; the caller is responsible for
+    /// only passing `plan:`-scoped ids.
+    async fn delete_project(&self, project_id: &str) -> Result<u64>;
 }
 
 #[cfg(test)]

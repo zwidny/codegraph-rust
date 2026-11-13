@@ -534,6 +534,87 @@ const RETARGET_EDGES_SQL: &str = r#"
 UPDATE edges SET to_id = $3 WHERE project_id = $1 AND to_id = $2
 "#;
 
+/// Name lookup for `codegraph query`.
+///
+/// `left(name, char_length($2)) = $2` is deliberate: a `LIKE $2 || '%'` pattern
+/// would treat `%` and `_` *inside* the symbol name as wildcards, so querying a
+/// symbol such as `a_b` would also match `axb`.
+const FIND_NODES_BY_NAME_SQL: &str = r#"
+SELECT name, node_type, language, file_path, start_line, end_line
+FROM nodes
+WHERE project_id = $1 AND (name = $2 OR left(name, char_length($2)) = $2)
+ORDER BY name ASC
+LIMIT $3
+"#;
+
+/// Callers of every node named `$2`, over `calls` edges.
+///
+/// The *target* (`e.to_id`) is the node that must be named `$2`; the row returned
+/// describes the *caller* (`e.from_id`). Both endpoints are joined (and both carry
+/// the `project_id` predicate) so a cross-project id collision cannot leak a row.
+const CALLERS_OF_NAME_SQL: &str = r#"
+SELECT caller.name, caller.node_type, caller.file_path, caller.start_line,
+       e.metadata->>'resolution_method'
+FROM edges e
+JOIN nodes target ON target.id = e.to_id
+JOIN nodes caller ON caller.id = e.from_id
+WHERE e.project_id = $1
+  AND e.edge_type = 'calls'
+  AND target.project_id = $1 AND target.name = $2
+  AND caller.project_id = $1
+ORDER BY caller.name ASC
+LIMIT $3
+"#;
+
+/// Callees: [`CALLERS_OF_NAME_SQL`] with the roles swapped. The filter names the
+/// *source* (`e.from_id`) and the row describes the *callee* (`e.to_id`).
+const CALLEES_OF_NAME_SQL: &str = r#"
+SELECT callee.name, callee.node_type, callee.file_path, callee.start_line,
+       e.metadata->>'resolution_method'
+FROM edges e
+JOIN nodes target ON target.id = e.from_id
+JOIN nodes callee ON callee.id = e.to_id
+WHERE e.project_id = $1
+  AND e.edge_type = 'calls'
+  AND target.project_id = $1 AND target.name = $2
+  AND callee.project_id = $1
+ORDER BY callee.name ASC
+LIMIT $3
+"#;
+
+/// Node identities for `plan verify`. A NULL `file_path` becomes an empty string.
+const NODE_IDENTITIES_SQL: &str = r#"
+SELECT id, name, COALESCE(file_path, '') FROM nodes WHERE project_id = $1 ORDER BY id
+"#;
+
+/// Edge endpoints for `plan verify`. Both ids are bare strings on this backend.
+const EDGE_ENDPOINTS_SQL: &str = r#"
+SELECT from_id, to_id FROM edges WHERE project_id = $1 ORDER BY id
+"#;
+
+/// Node metadata for `plan show`. Postgres stores it as `jsonb`, so it decodes
+/// directly into `serde_json::Value` with no decompression step.
+const NODES_WITH_METADATA_SQL: &str = r#"
+SELECT id, name, metadata FROM nodes WHERE project_id = $1 ORDER BY id
+"#;
+
+/// The whole `project_metadata.metadata` object (plans keep `plan_constraints`
+/// inside it).
+const PROJECT_METADATA_VALUE_SQL: &str = r#"
+SELECT metadata FROM project_metadata WHERE project_id = $1
+"#;
+
+/// Statements [`crate::storage::IndexStorage::delete_project`] runs, in order.
+/// The order matches `SurrealDbStorage::clean_project_data`.
+const DELETE_PROJECT_ORDER: [&str; 6] = [
+    "DELETE FROM edges WHERE project_id = $1",
+    "DELETE FROM chunks WHERE project_id = $1",
+    "DELETE FROM symbol_embeddings WHERE project_id = $1",
+    "DELETE FROM nodes WHERE project_id = $1",
+    "DELETE FROM file_metadata WHERE project_id = $1",
+    "DELETE FROM project_metadata WHERE project_id = $1",
+];
+
 /// Node ids living in the files a delete request names.
 const NODE_IDS_BY_FILE_SQL: &str = r#"
 SELECT id FROM nodes WHERE project_id = $1 AND file_path = ANY($2)
@@ -648,6 +729,18 @@ const UPSERT_BATCH_SIZE: usize = 5000;
 
 fn db_err<E: std::fmt::Display>(error: E) -> CodeGraphError {
     CodeGraphError::Database(error.to_string())
+}
+
+/// Project a caller/callee row (`CALLERS_OF_NAME_SQL` / `CALLEES_OF_NAME_SQL`) into
+/// [`crate::storage::CallRelation`]. A NULL `file_path` becomes an empty string.
+fn call_relation_from_row(row: tokio_postgres::Row) -> crate::storage::CallRelation {
+    crate::storage::CallRelation {
+        symbol: row.get(0),
+        node_type: row.get(1),
+        file: row.get::<_, Option<String>>(2).unwrap_or_default(),
+        line: row.get(3),
+        resolution: row.get(4),
+    }
 }
 
 /// Render a vector in pgvector's text input format: `[0.1,0.25,-1.5]`.
@@ -2193,6 +2286,154 @@ impl crate::storage::IndexStorage for PgStore {
         _tables: &[String],
     ) -> anyhow::Result<bool> {
         Ok(true)
+    }
+
+    /// Exact-or-prefix name match ordered by name. A NULL `file_path` decodes as
+    /// an empty string, mirroring [`Self::node_identities`].
+    async fn find_nodes_by_name(
+        &self,
+        project_id: &str,
+        symbol: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::SymbolMatch>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(FIND_NODES_BY_NAME_SQL, &[&project_id, &symbol, &limit])
+            .await
+            .map_err(db_err)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::SymbolMatch {
+                name: row.get(0),
+                node_type: row.get(1),
+                language: row.get(2),
+                file_path: row.get::<_, Option<String>>(3).unwrap_or_default(),
+                start_line: row.get(4),
+                end_line: row.get(5),
+            })
+            .collect())
+    }
+
+    /// Callers of every node named `target`, with the edge's `resolution_method`.
+    async fn callers_of_name(
+        &self,
+        project_id: &str,
+        target: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::CallRelation>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(CALLERS_OF_NAME_SQL, &[&project_id, &target, &limit])
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(call_relation_from_row).collect())
+    }
+
+    /// Callees of every node named `target`: the mirror image of
+    /// [`Self::callers_of_name`].
+    async fn callees_of_name(
+        &self,
+        project_id: &str,
+        target: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::CallRelation>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(CALLEES_OF_NAME_SQL, &[&project_id, &target, &limit])
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(call_relation_from_row).collect())
+    }
+
+    /// Node identities for `plan verify`; `metadata` is always `None` here.
+    async fn node_identities(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::storage::NodeIdentityRow>> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(NODE_IDENTITIES_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::NodeIdentityRow {
+                id: row.get(0),
+                name: row.get(1),
+                file_path: row.get(2),
+                metadata: None,
+            })
+            .collect())
+    }
+
+    /// Edge endpoints for `plan verify`; Postgres ids are already bare strings.
+    async fn edge_endpoints(&self, project_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(EDGE_ENDPOINTS_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Node metadata for `plan show`, decoded from `jsonb` by tokio-postgres.
+    async fn nodes_with_metadata(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::storage::NodeIdentityRow>> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(NODES_WITH_METADATA_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::NodeIdentityRow {
+                id: row.get(0),
+                name: row.get(1),
+                file_path: String::new(),
+                metadata: row.get(2),
+            })
+            .collect())
+    }
+
+    /// The whole `project_metadata.metadata` object; `None` when the project has
+    /// no metadata row at all.
+    async fn project_metadata_value(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let row = client
+            .query_opt(PROJECT_METADATA_VALUE_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|row| row.get::<_, Option<serde_json::Value>>(0)))
+    }
+
+    /// Delete every row of `project_id` from the six project-scoped tables in one
+    /// transaction and return the summed affected-row count.
+    async fn delete_project(&self, project_id: &str) -> anyhow::Result<u64> {
+        let mut client = self.pool.get().await.map_err(db_err)?;
+        let transaction = client.transaction().await.map_err(db_err)?;
+        let mut deleted: u64 = 0;
+        for sql in DELETE_PROJECT_ORDER {
+            deleted += transaction
+                .execute(sql, &[&project_id])
+                .await
+                .map_err(db_err)?;
+        }
+        transaction.commit().await.map_err(db_err)?;
+        Ok(deleted)
     }
 }
 
@@ -4055,6 +4296,355 @@ mod tests {
             .await
             .expect("ensure_vector_indexes");
         assert!(ready, "Postgres builds its HNSW indexes in SCHEMA_DDL");
+    }
+
+    // ---- `query` / `plan` parity methods ----
+
+    fn named_node(id: &str, project: &str, name: &str) -> NodeRow {
+        let mut row = node_in(id, project, "src/lib.rs");
+        row.name = name.to_string();
+        row
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn find_nodes_by_name_matches_exact_and_prefix() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("query_names");
+        store
+            .upsert_nodes(&[
+                named_node("q_parse", &project, "parse"),
+                named_node("q_parse_config", &project, "parse_config"),
+                named_node("q_other", &project, "other"),
+            ])
+            .await
+            .expect("upsert nodes");
+
+        let exact = store
+            .find_nodes_by_name(&project, "parse", 100)
+            .await
+            .expect("find parse");
+        let names: Vec<&str> = exact.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["parse", "parse_config"],
+            "exact plus prefix, ordered by name"
+        );
+
+        let prefix = store
+            .find_nodes_by_name(&project, "par", 100)
+            .await
+            .expect("find par");
+        // Only `parse` and `parse_config` start with `par`; `other` does not, so
+        // the prefix set is exactly the two nodes `parse` already returned.
+        assert_eq!(prefix.len(), 2, "every name starting with `par` matches");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn find_nodes_by_name_treats_sql_wildcards_literally() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("query_wildcards");
+        store
+            .upsert_nodes(&[
+                named_node("q_underscore", &project, "a_b"),
+                named_node("q_x", &project, "axb"),
+            ])
+            .await
+            .expect("upsert nodes");
+
+        let rows = store
+            .find_nodes_by_name(&project, "a_", 100)
+            .await
+            .expect("find a_");
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a_b"],
+            "`left(...)` must not treat `_` as a LIKE wildcard"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn callers_of_name_returns_resolution_method() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("query_callers");
+        store
+            .upsert_nodes(&[
+                named_node("q_caller", &project, "caller"),
+                named_node("q_target", &project, "target"),
+            ])
+            .await
+            .expect("upsert nodes");
+        let mut edge = edge_row("q_caller_edge", &project, "q_caller", "q_target");
+        edge.metadata = Some(serde_json::json!({"resolution_method": "exact"}));
+        store.upsert_edges(&[edge]).await.expect("upsert edge");
+
+        let callers = store
+            .callers_of_name(&project, "target", 100)
+            .await
+            .expect("callers_of_name");
+        assert_eq!(callers.len(), 1, "one caller of target");
+        assert_eq!(callers[0].symbol, "caller");
+        assert_eq!(
+            callers[0].resolution.as_deref(),
+            Some("exact"),
+            "edges.metadata->>'resolution_method' must surface"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn callees_of_name_mirrors_callers() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("query_callees");
+        store
+            .upsert_nodes(&[
+                named_node("q_caller", &project, "caller"),
+                named_node("q_target", &project, "target"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_edges(&[edge_row("q_caller_edge", &project, "q_caller", "q_target")])
+            .await
+            .expect("upsert edge");
+
+        let callees = store
+            .callees_of_name(&project, "caller", 100)
+            .await
+            .expect("callees_of_name");
+        assert_eq!(callees.len(), 1, "one callee of caller");
+        assert_eq!(callees[0].symbol, "target");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn node_identities_and_edge_endpoints_cover_the_project() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("plan_verify");
+        store
+            .upsert_nodes(&[
+                node_in("pv_a", &project, "a.rs"),
+                node_in("pv_b", &project, "b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_edges(&[edge_row("pv_edge", &project, "pv_a", "pv_b")])
+            .await
+            .expect("upsert edge");
+
+        let identities = store
+            .node_identities(&project)
+            .await
+            .expect("node_identities");
+        assert_eq!(identities.len(), 2, "two node identities");
+        assert!(
+            identities.iter().all(|row| row.metadata.is_none()),
+            "verify only needs identities"
+        );
+        let mut ids: Vec<&str> = identities.iter().map(|row| row.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["pv_a", "pv_b"]);
+
+        let endpoints = store
+            .edge_endpoints(&project)
+            .await
+            .expect("edge_endpoints");
+        assert_eq!(
+            endpoints,
+            vec![("pv_a".to_string(), "pv_b".to_string())],
+            "one endpoint pair, ids not prefixed"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn nodes_with_metadata_returns_jsonb() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("plan_show");
+        let mut with_meta = node_in("ps_meta", &project, "plan.yaml");
+        with_meta.metadata = Some(serde_json::json!({"qualified_name": "module::draft"}));
+        let without_meta = node_in("ps_bare", &project, "plan.yaml");
+        store
+            .upsert_nodes(&[with_meta, without_meta])
+            .await
+            .expect("upsert nodes");
+
+        let rows = store
+            .nodes_with_metadata(&project)
+            .await
+            .expect("nodes_with_metadata");
+        let meta = rows
+            .iter()
+            .find(|row| row.id == "ps_meta")
+            .expect("node with metadata");
+        assert_eq!(
+            meta.metadata
+                .as_ref()
+                .and_then(|value| value.get("qualified_name")),
+            Some(&serde_json::json!("module::draft")),
+            "jsonb decodes directly into serde_json::Value"
+        );
+        let bare = rows
+            .iter()
+            .find(|row| row.id == "ps_bare")
+            .expect("node without metadata");
+        assert!(bare.metadata.is_none(), "NULL jsonb decodes as None");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn project_metadata_value_roundtrips() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("plan_constraints");
+        let mut record = project_meta(&project, "plan", 0);
+        record.metadata = serde_json::json!({"plan_constraints": []});
+        store
+            .upsert_project_metadata(&record)
+            .await
+            .expect("upsert project metadata");
+
+        let metadata = crate::storage::IndexStorage::project_metadata_value(&store, &project)
+            .await
+            .expect("project_metadata_value")
+            .expect("project metadata row exists");
+        assert_eq!(
+            metadata,
+            serde_json::json!({"plan_constraints": []}),
+            "the whole metadata object round-trips"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn delete_project_clears_all_six_tables() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("plan_delete");
+        let survivor = project_id("plan_delete_survivor");
+
+        store
+            .upsert_nodes(&[
+                node_in("dp_a", &project, "a.rs"),
+                node_in("dp_b", &project, "b.rs"),
+                node_in("dp_keep", &survivor, "a.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_edges(&[edge_row("dp_edge", &project, "dp_a", "dp_b")])
+            .await
+            .expect("upsert edge");
+        store
+            .upsert_chunks(&[chunk("dp_chunk", &project, vec![0.5f32; 1024])])
+            .await
+            .expect("upsert chunk");
+        store
+            .upsert_symbol_embeddings(&[symbol_embedding(
+                "dp_sym",
+                &project,
+                "normalized",
+                unit_vector(0),
+            )])
+            .await
+            .expect("upsert symbol");
+        store
+            .upsert_file_metadata(&[file_meta(&project, "src/a.rs", "hash_a")])
+            .await
+            .expect("upsert file metadata");
+        store
+            .upsert_project_metadata(&project_meta(&project, "plan", 2))
+            .await
+            .expect("upsert project metadata");
+        store
+            .upsert_project_metadata(&project_meta(&survivor, "survivor", 1))
+            .await
+            .expect("upsert survivor metadata");
+
+        let deleted = store
+            .delete_project(&project)
+            .await
+            .expect("delete_project");
+        // dp_a + dp_b (2 nodes) + 1 edge + 1 chunk + 1 symbol + 1 file_metadata
+        // + 1 project_metadata. `dp_keep` belongs to `survivor`, not this project.
+        assert_eq!(deleted, 7, "two nodes plus one row from each other table");
+
+        assert_eq!(store.node_count(&project).await.expect("node_count"), 0);
+        assert_eq!(store.edge_count(&project).await.expect("edge_count"), 0);
+        assert_eq!(store.chunk_count(&project).await.expect("chunk_count"), 0);
+
+        let client = store.pool.get().await.expect("pool get");
+        for table in ["symbol_embeddings", "file_metadata", "project_metadata"] {
+            let remaining: i64 = client
+                .query_one(
+                    &format!("SELECT count(*) FROM {table} WHERE project_id = $1"),
+                    &[&project],
+                )
+                .await
+                .expect("count remaining rows")
+                .get(0);
+            assert_eq!(
+                remaining, 0,
+                "{table} must be empty for the deleted project"
+            );
+        }
+
+        assert_eq!(
+            store
+                .node_count(&survivor)
+                .await
+                .expect("survivor node_count"),
+            1,
+            "another project's rows are untouched"
+        );
+        assert!(
+            crate::storage::IndexStorage::project_metadata_value(&store, &survivor)
+                .await
+                .expect("survivor metadata")
+                .is_some(),
+            "another project's metadata row survives"
+        );
     }
 }
 

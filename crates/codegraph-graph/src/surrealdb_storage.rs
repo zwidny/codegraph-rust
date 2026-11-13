@@ -2756,6 +2756,28 @@ fn decode_node_id(raw: &str) -> &str {
         .trim_matches('⟩')
 }
 
+/// A SurrealDB string column as an owned `String`, defaulting to empty.
+fn json_string(row: &JsonValue, key: &str) -> String {
+    row.get(key)
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A nullable SurrealDB string column; absent or non-string values are `None`.
+fn json_optional_string(row: &JsonValue, key: &str) -> Option<String> {
+    row.get(key).and_then(JsonValue::as_str).map(str::to_string)
+}
+
+/// A nullable SurrealDB integer column. `nodes.start_line`/`end_line` are
+/// `option<number>`, so a value outside `i32` is treated as absent rather than
+/// wrapped.
+fn json_optional_i32(row: &JsonValue, key: &str) -> Option<i32> {
+    row.get(key)
+        .and_then(JsonValue::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
 /// Count rows of one project-scoped table.
 async fn surreal_count(
     db: Arc<Surreal<Any>>,
@@ -3119,6 +3141,276 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
             .collect();
         let tables = tables?;
         Ok(crate::vector_indexes::ensure_ready(&self.db(), dimension, &tables).await?)
+    }
+
+    /// Port of the SurrealQL `codegraph query` used to run inline. `ORDER BY name`
+    /// was added here (the original had no ordering, so equal-prefix results came
+    /// back in an unspecified order) to match the Postgres backend.
+    async fn find_nodes_by_name(
+        &self,
+        project_id: &str,
+        symbol: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::SymbolMatch>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT name, node_type, language, file_path, start_line, end_line
+                FROM nodes
+                WHERE project_id = $project
+                  AND (name = $symbol OR string::starts_with(name, $symbol))
+                ORDER BY name ASC
+                LIMIT $limit;
+                "#,
+            )
+            .bind(("project", project_id.to_string()))
+            .bind(("symbol", symbol.to_string()))
+            .bind(("limit", limit))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("symbol lookup failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("symbol lookup failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("symbol lookup decode failed: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::SymbolMatch {
+                name: json_string(&row, "name"),
+                node_type: json_optional_string(&row, "node_type"),
+                language: json_optional_string(&row, "language"),
+                file_path: json_string(&row, "file_path"),
+                start_line: json_optional_i32(&row, "start_line"),
+                end_line: json_optional_i32(&row, "end_line"),
+            })
+            .collect())
+    }
+
+    /// Callers of every node named `target`, over `calls` edges.
+    async fn callers_of_name(
+        &self,
+        project_id: &str,
+        target: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::CallRelation>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT
+                    from.name AS symbol,
+                    from.node_type AS node_type,
+                    from.file_path AS file,
+                    from.start_line AS line,
+                    metadata.resolution_method AS resolution
+                FROM edges
+                WHERE project_id = $project
+                  AND to.name = $target
+                  AND edge_type = 'calls'
+                LIMIT $limit;
+                "#,
+            )
+            .bind(("project", project_id.to_string()))
+            .bind(("target", target.to_string()))
+            .bind(("limit", limit))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("callers lookup failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("callers lookup failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("callers lookup decode failed: {e}")))?;
+        Ok(rows.into_iter().map(call_relation_from_row).collect())
+    }
+
+    /// Callees of every node named `target`: the mirror image of
+    /// [`Self::callers_of_name`].
+    async fn callees_of_name(
+        &self,
+        project_id: &str,
+        target: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::CallRelation>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT
+                    to.name AS symbol,
+                    to.node_type AS node_type,
+                    to.file_path AS file,
+                    to.start_line AS line,
+                    metadata.resolution_method AS resolution
+                FROM edges
+                WHERE project_id = $project
+                  AND from.name = $target
+                  AND edge_type = 'calls'
+                LIMIT $limit;
+                "#,
+            )
+            .bind(("project", project_id.to_string()))
+            .bind(("target", target.to_string()))
+            .bind(("limit", limit))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("callees lookup failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("callees lookup failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("callees lookup decode failed: {e}")))?;
+        Ok(rows.into_iter().map(call_relation_from_row).collect())
+    }
+
+    /// Node ids, names and file paths for `plan verify`. `metadata` is always
+    /// `None` here: `verify` only compares identities.
+    async fn node_identities(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::storage::NodeIdentityRow>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT <string> id AS id, name, file_path FROM nodes \
+                 WHERE project_id = $project;",
+            )
+            .bind(("project", project_id.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("node identities failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("node identities failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("node identities decode: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::NodeIdentityRow {
+                id: decode_node_id(&json_string(&row, "id")).to_string(),
+                name: json_string(&row, "name"),
+                file_path: json_string(&row, "file_path"),
+                metadata: None,
+            })
+            .collect())
+    }
+
+    /// Every edge's endpoints, decoded from their `nodes:` record form.
+    async fn edge_endpoints(&self, project_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT <string> from AS from_id, <string> to AS to_id FROM edges \
+                 WHERE project_id = $project;",
+            )
+            .bind(("project", project_id.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("edge endpoints failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("edge endpoints failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("edge endpoints decode: {e}")))?;
+
+        // SurrealDB renders the endpoints as `nodes:<id>`; `plan verify` maps them
+        // against `node_identities` ids, which are decoded, so strip the prefix.
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    decode_node_id(&json_string(&row, "from_id")).to_string(),
+                    decode_node_id(&json_string(&row, "to_id")).to_string(),
+                )
+            })
+            .collect())
+    }
+
+    /// Node ids, names and decoded metadata for `plan show`.
+    ///
+    /// SurrealDB stores `nodes.metadata` as a compressed JSON string. A blob that
+    /// cannot be decompressed is reported as `None`; the caller then renders the
+    /// node without `layer`/`draft_kind` rather than failing the whole command.
+    async fn nodes_with_metadata(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::storage::NodeIdentityRow>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT <string>id AS rid, name, metadata FROM nodes \
+                 WHERE project_id = $project",
+            )
+            .bind(("project", project_id.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("plan nodes failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("plan nodes failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("plan nodes decode: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::NodeIdentityRow {
+                id: decode_node_id(&json_string(&row, "rid")).to_string(),
+                name: json_string(&row, "name"),
+                file_path: String::new(),
+                metadata: row
+                    .get("metadata")
+                    .and_then(JsonValue::as_str)
+                    .and_then(|encoded| codegraph_core::decompress_json(encoded).ok()),
+            })
+            .collect())
+    }
+
+    /// The whole `project_metadata.metadata` object. `plan` stores its constraints
+    /// under `metadata.plan_constraints`; returning the object keeps that decision
+    /// out of this layer.
+    async fn project_metadata_value(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let mut response = self
+            .db
+            .query("SELECT metadata FROM project_metadata WHERE project_id = $project LIMIT 1;")
+            .bind(("project", project_id.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("project metadata failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("project metadata failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("project metadata decode: {e}")))?;
+        let Some(value) = rows
+            .first()
+            .and_then(|row| row.get("metadata"))
+            .filter(|value| !value.is_null())
+        else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_value(value.clone()).ok())
+    }
+
+    /// Delegates to [`SurrealDbStorage::clean_project_data`], which deletes the six
+    /// project-scoped tables in one transaction. That statement reports no affected
+    /// rows, so this returns 0 by contract instead of inventing a count.
+    async fn delete_project(&self, project_id: &str) -> anyhow::Result<u64> {
+        self.clean_project_data(project_id).await?;
+        Ok(0)
+    }
+}
+
+/// Project a caller/callee row into [`crate::storage::CallRelation`].
+fn call_relation_from_row(row: JsonValue) -> crate::storage::CallRelation {
+    crate::storage::CallRelation {
+        symbol: json_string(&row, "symbol"),
+        node_type: json_optional_string(&row, "node_type"),
+        file: json_string(&row, "file"),
+        line: json_optional_i32(&row, "line"),
+        resolution: json_optional_string(&row, "resolution"),
     }
 }
 
