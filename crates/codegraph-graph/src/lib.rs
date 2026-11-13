@@ -45,6 +45,7 @@ fn serde_compatible_value(value: surrealdb::types::Value) -> surrealdb::types::V
 
 pub mod analysis;
 pub mod edge;
+pub mod storage;
 
 #[cfg(feature = "postgres")]
 pub mod postgres_storage;

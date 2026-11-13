@@ -48,6 +48,12 @@
 //! and recreate it, then re-index) before reconciliation is used; this module never
 //! attempts `ADD PRIMARY KEY`.
 
+use crate::edge::CodeEdge;
+use crate::storage::{
+    ChunkEmbeddingRecord, FileMetadataRecord, ReconcileOutcome, SymbolEmbeddingRecord,
+};
+use async_trait::async_trait;
+use codegraph_core::CodeNode;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codegraph_core::{CodeGraphError, Result};
@@ -1476,6 +1482,271 @@ impl PgStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Backend-neutral adapter
+// ---------------------------------------------------------------------------
+
+/// Pick the vector from whichever embedding column is populated. `1024` wins when
+/// several are set (the pgvector schema declares `vector(1024)`), otherwise the
+/// first populated column in ascending dimension order is used.
+fn pick_embedding(
+    embedding_384: &Option<Vec<f32>>,
+    embedding_768: &Option<Vec<f32>>,
+    embedding_1024: &Option<Vec<f32>>,
+    embedding_1536: &Option<Vec<f32>>,
+    embedding_2048: &Option<Vec<f32>>,
+    embedding_2560: &Option<Vec<f32>>,
+    embedding_3072: &Option<Vec<f32>>,
+    embedding_4096: &Option<Vec<f32>>,
+) -> Option<Vec<f32>> {
+    if let Some(values) = embedding_1024 {
+        return Some(values.clone());
+    }
+    [
+        embedding_384,
+        embedding_768,
+        embedding_1536,
+        embedding_2048,
+        embedding_2560,
+        embedding_3072,
+        embedding_4096,
+    ]
+    .into_iter()
+    .find_map(|values| values.clone())
+}
+
+/// Map a domain node onto a `nodes` row.
+///
+/// `project_id` comes from `metadata.attributes["project_id"]` (the same key
+/// `SurrealDbStorage::node_to_surreal` reads). Nodes that were never annotated by
+/// the indexer therefore map to an empty project id.
+pub(crate) fn code_node_to_row(node: &CodeNode) -> NodeRow {
+    let attributes = &node.metadata.attributes;
+    NodeRow {
+        id: node.id.to_string(),
+        project_id: attributes.get("project_id").cloned().unwrap_or_default(),
+        name: node.name.to_string(),
+        node_type: node.node_type.as_ref().map(|value| format!("{:?}", value)),
+        language: node.language.as_ref().map(|value| format!("{:?}", value)),
+        file_path: Some(node.location.file_path.clone()),
+        start_line: Some(node.location.line as i32),
+        end_line: node.location.end_line.map(|line| line as i32),
+        content: node.content.as_ref().map(|content| content.to_string()),
+        complexity: node.complexity.map(|value| value as f64),
+        chunk_count: attributes
+            .get("chunk_count")
+            .and_then(|value| value.parse::<i32>().ok()),
+        embedding_model: attributes.get("embedding_model").cloned(),
+        embedding: node.embedding.clone(),
+        metadata: if attributes.is_empty() {
+            None
+        } else {
+            serde_json::to_value(attributes).ok()
+        },
+    }
+}
+
+/// Map a domain edge onto an `edges` row.
+pub(crate) fn code_edge_to_row(edge: &CodeEdge) -> EdgeRow {
+    EdgeRow {
+        id: edge.id.to_string(),
+        project_id: edge.project_id.clone().unwrap_or_default(),
+        from_id: edge.from.to_string(),
+        to_id: edge.to.to_string(),
+        edge_type: edge.edge_type.to_string(),
+    }
+}
+
+/// Map a chunk record onto a `chunks` row.
+///
+/// The record's `text` may be base64-compressed by `ChunkEmbeddingRecord::new`;
+/// Postgres stores plain text for its generated `content_tsv`, so it is
+/// decompressed when possible. A record with no populated embedding yields an
+/// empty vector: [`ChunkRow::embedding`] is not optional.
+pub(crate) fn chunk_record_to_row(record: &ChunkEmbeddingRecord) -> ChunkRow {
+    let embedding = pick_embedding(
+        &record.embedding_384,
+        &record.embedding_768,
+        &record.embedding_1024,
+        &record.embedding_1536,
+        &record.embedding_2048,
+        &record.embedding_2560,
+        &record.embedding_3072,
+        &record.embedding_4096,
+    )
+    .unwrap_or_default();
+
+    ChunkRow {
+        id: record.id.clone(),
+        project_id: record.project_id.clone(),
+        chunk_index: record.chunk_index,
+        text: codegraph_core::decompress_string(&record.text)
+            .unwrap_or_else(|_| record.text.clone()),
+        parent_node: record.parent_node.clone(),
+        embedding,
+        embedding_model: record.embedding_model.clone(),
+    }
+}
+
+/// Map a symbol-embedding record onto a `symbol_embeddings` row.
+pub(crate) fn symbol_record_to_row(record: &SymbolEmbeddingRecord) -> SymbolEmbeddingRow {
+    SymbolEmbeddingRow {
+        id: record.id.clone(),
+        project_id: record.project_id.clone(),
+        symbol: record.symbol.clone(),
+        normalized_symbol: record.normalized_symbol.clone(),
+        embedding: pick_embedding(
+            &record.embedding_384,
+            &record.embedding_768,
+            &record.embedding_1024,
+            &record.embedding_1536,
+            &record.embedding_2048,
+            &record.embedding_2560,
+            &record.embedding_3072,
+            &record.embedding_4096,
+        ),
+        embedding_model: Some(record.embedding_model.clone()),
+        node_id: record.node_id.clone(),
+        source_edge_id: record.source_edge_id.clone(),
+        metadata: record.metadata.clone(),
+    }
+}
+
+/// Map a file-metadata record onto a `file_metadata` row.
+///
+/// `parse_errors` becomes a JSON string because the table stores it as `text`;
+/// `last_indexed_at` is intentionally dropped (SQL `now()` stamps it).
+pub(crate) fn file_metadata_record_to_row(record: &FileMetadataRecord) -> FileMetadataRow {
+    FileMetadataRow {
+        project_id: record.project_id.clone(),
+        file_path: record.file_path.clone(),
+        content_hash: record.content_hash.clone(),
+        modified_at: Some(record.modified_at),
+        file_size: Some(record.file_size),
+        node_count: record.node_count as i32,
+        edge_count: record.edge_count as i32,
+        language: record.language.clone(),
+        parse_errors: record
+            .parse_errors
+            .as_ref()
+            .map(|errors| serde_json::to_string(errors).unwrap_or_else(|_| "[]".to_string())),
+    }
+}
+
+/// Map reconciliation statistics onto the backend-neutral outcome.
+pub(crate) fn reconcile_stats_to_outcome(stats: ReconcileStats) -> ReconcileOutcome {
+    ReconcileOutcome {
+        stale_nodes: stats.stale_nodes,
+        stale_edges: stats.stale_edges,
+        stale_chunks: stats.stale_chunks,
+        stale_symbols: stats.stale_symbols,
+        stale_files: stats.stale_files,
+    }
+}
+
+/// Postgres implementation of [`crate::storage::IndexStorage`].
+///
+/// Writes go straight through to the existing `PgStore` methods; there is no
+/// writer queue on this side yet, so batching/backpressure remains a caller
+/// concern until a Postgres writer lands.
+#[async_trait]
+impl crate::storage::IndexStorage for PgStore {
+    async fn upsert_nodes(&self, nodes: &[CodeNode]) -> anyhow::Result<u64> {
+        let rows: Vec<NodeRow> = nodes.iter().map(code_node_to_row).collect();
+        Ok(PgStore::upsert_nodes(self, &rows).await?)
+    }
+
+    async fn upsert_edges(&self, edges: &[CodeEdge]) -> anyhow::Result<u64> {
+        let rows: Vec<EdgeRow> = edges.iter().map(code_edge_to_row).collect();
+        Ok(PgStore::upsert_edges(self, &rows).await?)
+    }
+
+    async fn upsert_chunks(&self, chunks: &[ChunkEmbeddingRecord]) -> anyhow::Result<u64> {
+        let rows: Vec<ChunkRow> = chunks.iter().map(chunk_record_to_row).collect();
+        Ok(PgStore::upsert_chunks(self, &rows).await?)
+    }
+
+    async fn upsert_symbols(&self, symbols: &[SymbolEmbeddingRecord]) -> anyhow::Result<u64> {
+        let rows: Vec<SymbolEmbeddingRow> = symbols.iter().map(symbol_record_to_row).collect();
+        Ok(PgStore::upsert_symbol_embeddings(self, &rows).await?)
+    }
+
+    async fn upsert_file_metadata(&self, files: &[FileMetadataRecord]) -> anyhow::Result<u64> {
+        let rows: Vec<FileMetadataRow> = files.iter().map(file_metadata_record_to_row).collect();
+        Ok(PgStore::upsert_file_metadata(self, &rows).await?)
+    }
+
+    async fn reconcile(
+        &self,
+        project_id: &str,
+        fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
+        fresh_chunk_ids: &BTreeSet<String>,
+        fresh_edge_ids: &BTreeSet<String>,
+    ) -> anyhow::Result<ReconcileOutcome> {
+        let stats = PgStore::reconcile(
+            self,
+            project_id,
+            fresh_nodes_by_file,
+            fresh_chunk_ids,
+            fresh_edge_ids,
+        )
+        .await?;
+        Ok(reconcile_stats_to_outcome(stats))
+    }
+
+    async fn file_hashes(&self, project_id: &str) -> anyhow::Result<HashMap<String, String>> {
+        Ok(PgStore::file_hashes(self, project_id).await?)
+    }
+
+    async fn node_count(&self, project_id: &str) -> anyhow::Result<i64> {
+        Ok(PgStore::node_count(self, project_id).await?)
+    }
+
+    async fn edge_count(&self, project_id: &str) -> anyhow::Result<i64> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM edges WHERE project_id = $1",
+                &[&project_id],
+            )
+            .await
+            .map_err(db_err)?
+            .get(0);
+        Ok(count)
+    }
+
+    async fn chunk_count(&self, project_id: &str) -> anyhow::Result<i64> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM chunks WHERE project_id = $1",
+                &[&project_id],
+            )
+            .await
+            .map_err(db_err)?
+            .get(0);
+        Ok(count)
+    }
+
+    async fn knn_chunks(
+        &self,
+        project_id: &str,
+        query: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Ok(PgStore::knn_chunks(self, project_id, query, k).await?)
+    }
+
+    async fn reverse_deps(
+        &self,
+        project_id: &str,
+        from_node: &str,
+        depth: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(PgStore::reverse_deps(self, project_id, from_node, depth).await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2605,5 +2876,140 @@ mod tests {
         assert!(by_id("hyb_both").text_rank.is_some());
         assert!(by_id("hyb_vector").text_rank.is_none());
         assert!(by_id("hyb_text").vector_rank.is_none());
+    }
+}
+
+#[cfg(test)]
+mod storage_adapter_tests {
+    use super::*;
+    use codegraph_core::{EdgeType, Language, Location, Metadata, NodeId, NodeType};
+    use std::collections::HashMap;
+
+    fn location() -> Location {
+        Location {
+            file_path: "src/lib.rs".to_string(),
+            line: 10,
+            column: 4,
+            end_line: Some(20),
+            end_column: Some(1),
+        }
+    }
+
+    #[test]
+    fn code_node_maps_to_node_row() {
+        let mut node = CodeNode::new(
+            "do_thing",
+            Some(NodeType::Function),
+            Some(Language::Rust),
+            location(),
+        );
+        node.metadata = Metadata {
+            attributes: HashMap::from([
+                ("project_id".to_string(), "proj".to_string()),
+                ("embedding_model".to_string(), "test-model".to_string()),
+            ]),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        node.complexity = Some(3.5);
+
+        let row = code_node_to_row(&node);
+
+        assert_eq!(row.id, node.id.to_string());
+        assert_eq!(row.name, "do_thing");
+        assert_eq!(row.project_id, "proj");
+        assert_eq!(row.file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(row.start_line, Some(10));
+        assert_eq!(row.end_line, Some(20));
+        assert_eq!(row.node_type.as_deref(), Some("Function"));
+        assert_eq!(row.language.as_deref(), Some("Rust"));
+        assert_eq!(row.embedding_model.as_deref(), Some("test-model"));
+        assert_eq!(row.complexity, Some(3.5));
+    }
+
+    #[test]
+    fn code_edge_maps_to_edge_row() {
+        let edge = CodeEdge::new(NodeId::new_v4(), NodeId::new_v4(), EdgeType::Calls)
+            .with_project_id("proj");
+
+        let row = code_edge_to_row(&edge);
+
+        assert_eq!(row.id, edge.id.to_string());
+        assert_eq!(row.project_id, "proj");
+        assert_eq!(row.from_id, edge.from.to_string());
+        assert_eq!(row.to_id, edge.to.to_string());
+        assert_eq!(row.edge_type, "calls");
+    }
+
+    #[test]
+    fn chunk_record_picks_present_embedding() {
+        let record = ChunkEmbeddingRecord {
+            id: "chunk-1".to_string(),
+            parent_node: "node-1".to_string(),
+            chunk_index: 0,
+            text: "plain text".to_string(),
+            project_id: "proj".to_string(),
+            embedding_384: None,
+            embedding_768: Some(vec![0.5f32; 768]),
+            embedding_1024: None,
+            embedding_1536: None,
+            embedding_2048: None,
+            embedding_2560: None,
+            embedding_3072: None,
+            embedding_4096: None,
+            embedding_model: "test-model".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let row = chunk_record_to_row(&record);
+
+        assert_eq!(row.embedding.len(), 768);
+        assert_eq!(row.project_id, "proj");
+        assert_eq!(row.text, "plain text");
+    }
+
+    #[test]
+    fn file_metadata_parse_errors_serialised() {
+        let mut record = FileMetadataRecord {
+            file_path: "src/lib.rs".to_string(),
+            project_id: "proj".to_string(),
+            content_hash: "hash".to_string(),
+            modified_at: chrono::Utc::now(),
+            file_size: 42,
+            last_indexed_at: chrono::Utc::now(),
+            node_count: 3,
+            edge_count: 2,
+            language: Some("Rust".to_string()),
+            parse_errors: Some(vec!["e1".to_string()]),
+        };
+
+        let row = file_metadata_record_to_row(&record);
+        assert_eq!(row.parse_errors.as_deref(), Some("[\"e1\"]"));
+        assert_eq!(row.node_count, 3);
+        assert_eq!(row.edge_count, 2);
+
+        record.parse_errors = None;
+        let row = file_metadata_record_to_row(&record);
+        assert_eq!(row.parse_errors, None);
+    }
+
+    #[test]
+    fn reconcile_stats_maps_to_outcome() {
+        let stats = ReconcileStats {
+            stale_nodes: 1,
+            stale_edges: 2,
+            stale_chunks: 3,
+            stale_symbols: 4,
+            stale_files: 5,
+        };
+
+        let outcome = reconcile_stats_to_outcome(stats);
+
+        assert_eq!(outcome.stale_nodes, stats.stale_nodes);
+        assert_eq!(outcome.stale_edges, stats.stale_edges);
+        assert_eq!(outcome.stale_chunks, stats.stale_chunks);
+        assert_eq!(outcome.stale_symbols, stats.stale_symbols);
+        assert_eq!(outcome.stale_files, stats.stale_files);
     }
 }

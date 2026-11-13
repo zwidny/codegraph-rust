@@ -2335,25 +2335,14 @@ impl GraphStore for SurrealDbStorage {
     }
 }
 
-/// Lowercase hex without per-byte `String` allocation.
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = Vec::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize]);
-        out.push(HEX[(byte & 0x0f) as usize]);
-    }
-    // SAFETY: every pushed byte is ASCII hex.
-    String::from_utf8(out).expect("hex is ASCII")
-}
-
-fn symbol_embedding_record_id(project_id: &str, normalized_symbol: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(project_id.as_bytes());
-    hasher.update(b":");
-    hasher.update(normalized_symbol.as_bytes());
-    hex_lower(&hasher.finalize())
-}
+#[cfg(test)]
+pub(crate) use crate::storage::hex_lower;
+pub use crate::storage::{
+    ChunkEmbeddingRecord, FileMetadataRecord, NodeEmbeddingRecord, SURR_EMBEDDING_COLUMN_384,
+    SURR_EMBEDDING_COLUMN_768, SURR_EMBEDDING_COLUMN_1024, SURR_EMBEDDING_COLUMN_1536,
+    SURR_EMBEDDING_COLUMN_2048, SURR_EMBEDDING_COLUMN_2560, SURR_EMBEDDING_COLUMN_3072,
+    SURR_EMBEDDING_COLUMN_4096, SymbolEmbeddingRecord,
+};
 
 pub struct SymbolEmbeddingUpsert<'a> {
     pub symbol: &'a str,
@@ -2366,175 +2355,6 @@ pub struct SymbolEmbeddingUpsert<'a> {
     pub node_id: Option<&'a str>,
     pub source_edge_id: Option<&'a str>,
     pub metadata: Option<JsonValue>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SymbolEmbeddingRecord {
-    pub id: String,
-    pub symbol: String,
-    pub normalized_symbol: String,
-    pub project_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub organization_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_384: Option<Vec<f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_768: Option<Vec<f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_1024: Option<Vec<f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_1536: Option<Vec<f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_2048: Option<Vec<f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_2560: Option<Vec<f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_3072: Option<Vec<f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_4096: Option<Vec<f32>>,
-    pub embedding_model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_edge_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<JsonValue>,
-    pub last_computed_at: DateTime<Utc>,
-    pub access_count: i64,
-}
-
-impl SymbolEmbeddingRecord {
-    pub fn new(
-        project_id: &str,
-        organization_id: Option<&str>,
-        symbol: &str,
-        normalized_symbol: &str,
-        embedding: &[f32],
-        embedding_model: &str,
-        embedding_column: &str,
-        node_id: Option<&str>,
-        source_edge_id: Option<&str>,
-        metadata: Option<JsonValue>,
-    ) -> Self {
-        // Keep f32: the provider emits f32, SurrealDB stores F32, and serialising a
-        // widened f64 roughly doubles each element's JSON text (0.12345679 vs
-        // 0.12345679104328156), i.e. ~7 KB extra per 1024-d row.
-        let embedding_vec: Vec<f32> = embedding.to_vec();
-        let (
-            embedding_384,
-            embedding_768,
-            embedding_1024,
-            embedding_1536,
-            embedding_2048,
-            embedding_2560,
-            embedding_3072,
-            embedding_4096,
-        ) = match embedding_column {
-            SURR_EMBEDDING_COLUMN_384 => (
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_768 => (
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_1024 => (
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_1536 => (
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_2048 => (
-                None,
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_2560 => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_3072 => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_4096 => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-            ),
-            _ => (None, None, None, None, None, None, None, None),
-        };
-
-        SymbolEmbeddingRecord {
-            id: symbol_embedding_record_id(project_id, normalized_symbol),
-            symbol: symbol.to_string(),
-            normalized_symbol: normalized_symbol.to_string(),
-            project_id: project_id.to_string(),
-            organization_id: organization_id.map(|s| s.to_string()),
-            embedding_384,
-            embedding_768,
-            embedding_1024,
-            embedding_1536,
-            embedding_2048,
-            embedding_2560,
-            embedding_3072,
-            embedding_4096,
-            embedding_model: embedding_model.to_string(),
-            node_id: node_id.map(|s| s.to_string()),
-            source_edge_id: source_edge_id.map(|s| s.to_string()),
-            metadata,
-            last_computed_at: Utc::now(),
-            access_count: 0,
-        }
-    }
 }
 
 impl<'a> From<&SymbolEmbeddingUpsert<'a>> for SymbolEmbeddingRecord {
@@ -2569,31 +2389,6 @@ pub struct ProjectMetadataRecord {
     pub codegraph_version: String,
     pub organization_id: Option<String>,
     pub domain: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMetadataRecord {
-    pub file_path: String,
-    pub project_id: String,
-    pub content_hash: String,
-    pub modified_at: DateTime<Utc>,
-    pub file_size: i64,
-    pub last_indexed_at: DateTime<Utc>,
-    pub node_count: i64,
-    pub edge_count: i64,
-    pub language: Option<String>,
-    pub parse_errors: Option<Vec<String>>,
-}
-
-impl FileMetadataRecord {
-    /// Generate a unique record ID based on project_id and file_path
-    pub fn id(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.project_id.as_bytes());
-        hasher.update(b":");
-        hasher.update(self.file_path.as_bytes());
-        hex_lower(&hasher.finalize())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2640,15 +2435,6 @@ struct SurrealNodeRecord {
     chunk_count: Option<i64>,
 }
 
-pub const SURR_EMBEDDING_COLUMN_384: &str = "embedding_384";
-pub const SURR_EMBEDDING_COLUMN_768: &str = "embedding_768";
-pub const SURR_EMBEDDING_COLUMN_1024: &str = "embedding_1024";
-pub const SURR_EMBEDDING_COLUMN_1536: &str = "embedding_1536";
-pub const SURR_EMBEDDING_COLUMN_2048: &str = "embedding_2048";
-pub const SURR_EMBEDDING_COLUMN_2560: &str = "embedding_2560";
-pub const SURR_EMBEDDING_COLUMN_3072: &str = "embedding_3072";
-pub const SURR_EMBEDDING_COLUMN_4096: &str = "embedding_4096";
-
 fn normalized_embedding_column(column: &str) -> Option<&'static str> {
     match column {
         SURR_EMBEDDING_COLUMN_384 => Some(SURR_EMBEDDING_COLUMN_384),
@@ -2681,176 +2467,6 @@ pub fn surreal_embedding_column_for_dimension(dim: usize) -> &'static str {
                 dim
             );
             SURR_EMBEDDING_COLUMN_2048
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct NodeEmbeddingRecord {
-    pub id: String,
-    pub column: &'static str,
-    pub embedding: Vec<f32>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkEmbeddingRecord {
-    pub id: String,
-    pub parent_node: String,
-    pub chunk_index: i32,
-    pub text: String, // Back to String (Base64 encoded if compressed)
-    pub project_id: String,
-    pub embedding_384: Option<Vec<f32>>,
-    pub embedding_768: Option<Vec<f32>>,
-    pub embedding_1024: Option<Vec<f32>>,
-    pub embedding_1536: Option<Vec<f32>>,
-    pub embedding_2048: Option<Vec<f32>>,
-    pub embedding_2560: Option<Vec<f32>>,
-    pub embedding_3072: Option<Vec<f32>>,
-    pub embedding_4096: Option<Vec<f32>>,
-    pub embedding_model: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl ChunkEmbeddingRecord {
-    pub fn identity(parent_node: &str, chunk_index: usize) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(parent_node.as_bytes());
-        hasher.update(b":");
-        hasher.update(chunk_index.to_le_bytes());
-        hex_lower(&hasher.finalize())
-    }
-    pub fn new(
-        parent_node: &str,
-        chunk_index: usize,
-        text: String,
-        embedding: &[f32],
-        embedding_model: &str,
-        embedding_column: &str,
-        project_id: &str,
-    ) -> Self {
-        // Keep f32: the provider emits f32, SurrealDB stores F32, and serialising a
-        // widened f64 roughly doubles each element's JSON text (0.12345679 vs
-        // 0.12345679104328156), i.e. ~7 KB extra per 1024-d row.
-        let embedding_vec: Vec<f32> = embedding.to_vec();
-
-        // Use Base64 encoding for compression to satisfy String type
-        let text_val = codegraph_core::compress_to_string(&text);
-
-        let (
-            embedding_384,
-            embedding_768,
-            embedding_1024,
-            embedding_1536,
-            embedding_2048,
-            embedding_2560,
-            embedding_3072,
-            embedding_4096,
-        ) = match embedding_column {
-            // ... match arms ...
-            SURR_EMBEDDING_COLUMN_384 => (
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_768 => (
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_1024 => (
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_1536 => (
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_2048 => (
-                None,
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_2560 => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_3072 => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-                None,
-            ),
-            SURR_EMBEDDING_COLUMN_4096 => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(embedding_vec),
-            ),
-            _ => (None, None, None, None, None, None, None, None),
-        };
-
-        let id = Self::identity(parent_node, chunk_index);
-
-        Self {
-            id,
-            parent_node: parent_node.to_string(),
-            chunk_index: chunk_index as i32,
-            text: text_val,
-            project_id: project_id.to_string(),
-            embedding_384,
-            embedding_768,
-            embedding_1024,
-            embedding_1536,
-            embedding_2048,
-            embedding_2560,
-            embedding_3072,
-            embedding_4096,
-            embedding_model: embedding_model.to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
         }
     }
 }
@@ -3135,6 +2751,179 @@ fn parse_count(values: Vec<JsonValue>) -> Result<i64> {
             "Unexpected count shape: {}",
             other
         ))),
+    }
+}
+
+/// Count rows of one project-scoped table.
+async fn surreal_count(
+    db: Arc<Surreal<Any>>,
+    table: &str,
+    project_id: &str,
+) -> anyhow::Result<i64> {
+    let mut response = db
+        .query(format!(
+            "SELECT count() AS count FROM {table} WHERE project_id = $project_id GROUP ALL;"
+        ))
+        .bind(("project_id", project_id.to_string()))
+        .await
+        .map_err(|e| CodeGraphError::Database(format!("{table} count failed: {e}")))?;
+    let rows: Vec<JsonValue> = response
+        .take(0)
+        .map_err(|e| CodeGraphError::Database(format!("{table} count decode failed: {e}")))?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get("count"))
+        .and_then(|count| count.as_i64())
+        .unwrap_or(0))
+}
+
+/// Thin adapter over the existing SurrealDB write/read methods.
+///
+/// `upsert_nodes_batch` / `upsert_edges_batch` take `&mut self` only to update the
+/// shared `node_cache`; the clone below shares the same `Arc` fields, so the cache
+/// and connection are identical while the trait can stay `&self`.
+#[async_trait]
+impl crate::storage::IndexStorage for SurrealDbStorage {
+    async fn upsert_nodes(&self, nodes: &[CodeNode]) -> anyhow::Result<u64> {
+        let mut storage = self.clone();
+        storage.upsert_nodes_batch(nodes).await?;
+        Ok(nodes.len() as u64)
+    }
+
+    async fn upsert_edges(&self, edges: &[CodeEdge]) -> anyhow::Result<u64> {
+        let mut storage = self.clone();
+        storage.upsert_edges_batch(edges).await?;
+        Ok(edges.len() as u64)
+    }
+
+    async fn upsert_chunks(
+        &self,
+        chunks: &[crate::storage::ChunkEmbeddingRecord],
+    ) -> anyhow::Result<u64> {
+        self.upsert_chunk_embeddings_resilient(chunks).await?;
+        Ok(chunks.len() as u64)
+    }
+
+    async fn upsert_symbols(
+        &self,
+        symbols: &[crate::storage::SymbolEmbeddingRecord],
+    ) -> anyhow::Result<u64> {
+        self.upsert_symbol_embeddings_batch(symbols).await?;
+        Ok(symbols.len() as u64)
+    }
+
+    async fn upsert_file_metadata(
+        &self,
+        files: &[crate::storage::FileMetadataRecord],
+    ) -> anyhow::Result<u64> {
+        self.upsert_file_metadata_batch(files).await?;
+        Ok(files.len() as u64)
+    }
+
+    async fn reconcile(
+        &self,
+        project_id: &str,
+        fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
+        fresh_chunk_ids: &BTreeSet<String>,
+        fresh_edge_ids: &BTreeSet<String>,
+    ) -> anyhow::Result<crate::storage::ReconcileOutcome> {
+        // `reconcile_catalog_by_file` reports nothing back, so the outcome is zeroed
+        // rather than guessed; adding counts would change an existing signature.
+        self.reconcile_catalog_by_file(
+            project_id,
+            fresh_nodes_by_file,
+            fresh_chunk_ids,
+            fresh_edge_ids,
+            None,
+        )
+        .await?;
+        Ok(crate::storage::ReconcileOutcome::default())
+    }
+
+    async fn file_hashes(&self, project_id: &str) -> anyhow::Result<HashMap<String, String>> {
+        #[derive(Serialize, Deserialize, surrealdb::types::SurrealValue)]
+        struct FileHashRow {
+            file_path: String,
+            content_hash: String,
+        }
+
+        let mut response = self
+            .db
+            .query(
+                "SELECT file_path, content_hash FROM file_metadata WHERE project_id = $project_id;",
+            )
+            .bind(("project_id", project_id.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("file hash query failed: {e}")))?;
+        let rows: Vec<FileHashRow> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("file hash decode failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.file_path, row.content_hash))
+            .collect())
+    }
+
+    async fn node_count(&self, project_id: &str) -> anyhow::Result<i64> {
+        surreal_count(self.db(), "nodes", project_id).await
+    }
+
+    async fn edge_count(&self, project_id: &str) -> anyhow::Result<i64> {
+        surreal_count(self.db(), "edges", project_id).await
+    }
+
+    async fn chunk_count(&self, project_id: &str) -> anyhow::Result<i64> {
+        surreal_count(self.db(), "chunks", project_id).await
+    }
+
+    async fn knn_chunks(
+        &self,
+        project_id: &str,
+        query: &[f32],
+        k: usize,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        if k == 0 || query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        #[derive(Serialize, Deserialize, surrealdb::types::SurrealValue)]
+        struct KnnRow {
+            id: String,
+            distance: f64,
+        }
+
+        let mut response = self
+            .db
+            .query("RETURN fn::knn_chunks($project_id, $dimension, $query_embedding)")
+            .bind(("project_id", project_id.to_string()))
+            .bind(("dimension", query.len() as i64))
+            .bind(("query_embedding", query.to_vec()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("chunk KNN query failed: {e}")))?;
+        let rows: Vec<KnnRow> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("chunk KNN decode failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .take(k)
+            .map(|row| (row.id, row.distance as f32))
+            .collect())
+    }
+
+    async fn reverse_deps(
+        &self,
+        project_id: &str,
+        from_node: &str,
+        depth: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let graph = crate::graph_functions::GraphFunctions::new_with_project_id(
+            self.db(),
+            project_id.to_string(),
+        );
+        let deps = graph
+            .get_reverse_dependencies(from_node, "calls", depth as i32)
+            .await?;
+        Ok(deps.into_iter().map(|dependency| dependency.id).collect())
     }
 }
 
