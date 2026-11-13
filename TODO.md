@@ -358,10 +358,9 @@ micro-benchmark's row and connection counts. Do not quote 107x as an indexing sp
 | Item | Why it blocks |
 |---|---|
 | Postgres scoped reconciliation | Single-file and subdirectory indexes fail with an explicit error; full indexes work |
-| Postgres `semantic_search_with_context` | `semantic_code_search` on the Postgres backend fails with "not implemented" |
-| Postgres `detect_circular_dependencies` | Same |
-| `make build-dist` feature list | Not updated for the new default; `DIST_FEATURES` still needs `postgres` spelled out (or dropped, since it is now default) |
-| Surreal-only integration tests | `reconciliation_test`, `daemon_watch`, `graph_tools_smoke` are now `#![cfg(feature = "surrealdb")]`, so a default build skips them; they need an explicit `--features surrealdb` run in CI |
+| `full` feature excludes surrealdb | `cargo install --features full` produces a Postgres-only binary; add `surrealdb` explicitly if you need the legacy backend |
+| Surreal-only integration tests | `reconciliation_test`, `daemon_watch`, `graph_tools_smoke` are `#![cfg(feature = "surrealdb")]`; `ci.yml` covers them through its `--all-features` job |
+| Postgres search parity | `name`-only hits report `text_score` 0.0 (SurrealDB carries the name BM25 score); `node_id` is the bare id rather than `nodes:<id>`; `chunks.embedding` is `vector(1024)`, so other dimensions cannot search semantically |
 
 **Build shape (implemented in `fd76245`):**
 

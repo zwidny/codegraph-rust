@@ -1,6 +1,8 @@
 # Making `query` and `plan` backend-neutral (B2)
 
-Status: design only. Nothing here is implemented yet.
+Status: **implemented**. `query` and `plan` run over `IndexStorage`; Postgres is the default
+backend and `surrealdb` is an opt-in feature. The design notes below are kept because they
+explain why the eight methods look the way they do.
 
 ## Why this exists
 
