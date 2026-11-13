@@ -3050,6 +3050,29 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
         Ok(nodes)
     }
 
+    /// Delegates to [`SurrealDbStorage::load_symbols_excluding`], whose ids still
+    /// carry the `nodes:` record prefix. The trait contract says ids are decoded,
+    /// so the prefix is stripped here, exactly like [`Self::nodes_in_files`].
+    async fn symbols_excluding_files(
+        &self,
+        project_id: &str,
+        excluded_files: &[String],
+    ) -> anyhow::Result<Vec<crate::storage::SymbolInProject>> {
+        let rows = self
+            .load_symbols_excluding(project_id, excluded_files)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::SymbolInProject {
+                id: decode_node_id(&row.id).to_string(),
+                file_path: row.file_path,
+                name: row.name,
+                node_type: row.node_type,
+                qualified_name: row.qualified_name,
+            })
+            .collect())
+    }
+
     async fn retarget_edges(&self, project_id: &str, old: &str, new: &str) -> anyhow::Result<u64> {
         self.db
             .query(

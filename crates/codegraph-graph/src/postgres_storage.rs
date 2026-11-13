@@ -502,6 +502,19 @@ SELECT id, file_path, name, COALESCE(node_type, '') FROM nodes
 WHERE project_id = $1 AND file_path = ANY($2) ORDER BY id
 "#;
 
+/// Symbols outside the files a partial re-index scanned.
+///
+/// `file_path <> ALL($2)` is used instead of `NOT IN` because the two agree on
+/// NULL handling with SurrealDB's `NOT IN`: both exclude rows whose `file_path`
+/// IS NULL. An empty array also returns every row, since `<>` against ALL of an
+/// empty set is true.
+const SYMBOLS_EXCLUDING_FILES_SQL: &str = r#"
+SELECT id, file_path, name, node_type, metadata->>'qualified_name'
+FROM nodes
+WHERE project_id = $1 AND file_path <> ALL($2)
+ORDER BY id
+"#;
+
 /// Repoint inbound edges after a symbol's id moved. Only `to_id` is rewritten: this
 /// mirrors the SurrealQL redirect, which leaves `from_id` alone.
 const RETARGET_EDGES_SQL: &str = r#"
@@ -2107,6 +2120,33 @@ impl crate::storage::IndexStorage for PgStore {
                 file_path: row.get::<_, Option<String>>(1).unwrap_or_default(),
                 name: row.get(2),
                 node_type: row.get(3),
+            })
+            .collect())
+    }
+
+    /// Unlike SurrealDB, Postgres stores node ids as bare strings, so no
+    /// `nodes:` prefix or quoting has to be stripped here. A NULL `file_path`
+    /// is excluded by `<> ALL($2)` and decodes as an empty string, mirroring
+    /// [`Self::nodes_in_files`].
+    async fn symbols_excluding_files(
+        &self,
+        project_id: &str,
+        excluded_files: &[String],
+    ) -> anyhow::Result<Vec<crate::storage::SymbolInProject>> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(SYMBOLS_EXCLUDING_FILES_SQL, &[&project_id, &excluded_files])
+            .await
+            .map_err(db_err)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::SymbolInProject {
+                id: row.get(0),
+                file_path: row.get::<_, Option<String>>(1).unwrap_or_default(),
+                name: row.get(2),
+                node_type: row.get(3),
+                qualified_name: row.get(4),
             })
             .collect())
     }
@@ -3718,6 +3758,149 @@ mod tests {
         assert!(
             nodes.iter().all(|node| !node.node_type.is_empty()),
             "node_type must carry the stored kind"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn symbols_excluding_files_returns_the_complement() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("symbols_excluding");
+        store
+            .upsert_nodes(&[
+                node_in("sxf_a1", &project, "a.rs"),
+                node_in("sxf_a2", &project, "a.rs"),
+                node_in("sxf_b1", &project, "b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+
+        let symbols = store
+            .symbols_excluding_files(&project, &["a.rs".to_string()])
+            .await
+            .expect("symbols_excluding_files");
+
+        assert_eq!(symbols.len(), 1, "only b.rs survives the exclusion");
+        assert_eq!(symbols[0].file_path, "b.rs");
+        assert_eq!(symbols[0].id, "sxf_b1", "the bare id must round-trip");
+        assert_eq!(symbols[0].name, "name_sxf_b1");
+        assert_eq!(symbols[0].node_type.as_deref(), Some("function"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn symbols_excluding_files_with_empty_exclusion_returns_all() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("symbols_excluding_empty");
+        store
+            .upsert_nodes(&[
+                node_in("sxe_a1", &project, "a.rs"),
+                node_in("sxe_a2", &project, "a.rs"),
+                node_in("sxe_b1", &project, "b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+
+        let symbols = store
+            .symbols_excluding_files(&project, &[])
+            .await
+            .expect("symbols_excluding_files");
+
+        assert_eq!(
+            symbols.len(),
+            3,
+            "<> ALL(ARRAY[]::text[]) must match every row, not none"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn symbols_excluding_files_reads_qualified_name() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        use chrono::Utc;
+        use codegraph_core::{Language, Location, Metadata, NodeType};
+
+        let project = project_id("symbols_qualified_name");
+        let location = Location {
+            file_path: "src/lib.rs".to_string(),
+            line: 1,
+            column: 0,
+            end_line: Some(2),
+            end_column: Some(1),
+        };
+        let mut with_qualified = CodeNode::new(
+            "with_qualified",
+            Some(NodeType::Function),
+            Some(Language::Rust),
+            location.clone(),
+        );
+        with_qualified.metadata = Metadata {
+            attributes: HashMap::from([
+                ("project_id".to_string(), project.clone()),
+                (
+                    "qualified_name".to_string(),
+                    "module::with_qualified".to_string(),
+                ),
+            ]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let with_qualified_id = with_qualified.id.to_string();
+
+        let mut without_qualified = CodeNode::new(
+            "without_qualified",
+            Some(NodeType::Function),
+            Some(Language::Rust),
+            location,
+        );
+        without_qualified.metadata = Metadata {
+            attributes: HashMap::from([("project_id".to_string(), project.clone())]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let without_qualified_id = without_qualified.id.to_string();
+
+        IndexStorage::upsert_nodes(&store, &[with_qualified, without_qualified])
+            .await
+            .expect("upsert nodes");
+
+        let symbols = store
+            .symbols_excluding_files(&project, &[])
+            .await
+            .expect("symbols_excluding_files");
+
+        let qualified = symbols
+            .iter()
+            .find(|symbol| symbol.id == with_qualified_id)
+            .expect("node with qualified_name present");
+        assert_eq!(
+            qualified.qualified_name.as_deref(),
+            Some("module::with_qualified"),
+            "metadata->>'qualified_name' reads the flat attributes object"
+        );
+
+        let plain = symbols
+            .iter()
+            .find(|symbol| symbol.id == without_qualified_id)
+            .expect("node without qualified_name present");
+        assert_eq!(
+            plain.qualified_name, None,
+            "a missing key must decode as None"
         );
     }
 

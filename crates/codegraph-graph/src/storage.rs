@@ -275,6 +275,18 @@ pub struct NodeInFile {
     pub node_type: String,
 }
 
+/// A stored symbol outside the files a partial re-index scanned. Edge resolution
+/// needs their ids so edges emitted by the scanned files can still resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolInProject {
+    /// Decoded to the plain stored form; the backend strips its own id prefix.
+    pub id: String,
+    pub file_path: String,
+    pub name: String,
+    pub node_type: Option<String>,
+    pub qualified_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeEmbeddingRecord {
     pub id: String,
@@ -553,6 +565,15 @@ pub trait IndexStorage: Send + Sync {
     /// the plain stored form. Backends differ on whether the raw id carries a
     /// table prefix, so decoding is the backend's job.
     async fn nodes_in_files(&self, project_id: &str, files: &[String]) -> Result<Vec<NodeInFile>>;
+
+    /// Symbols whose `file_path` is not one of `excluded_files`, with ids already
+    /// decoded. Used by a partial re-index to resolve edges against the rest of
+    /// the project without loading the files it just scanned again.
+    async fn symbols_excluding_files(
+        &self,
+        project_id: &str,
+        excluded_files: &[String],
+    ) -> Result<Vec<SymbolInProject>>;
 
     /// Point every edge whose `to_id` is `old` at `new` instead. `from_id` is
     /// deliberately untouched: this mirrors the existing SurrealQL redirect.
