@@ -7854,6 +7854,7 @@ dependencies = [
  "rand 0.9.5",
  "regex",
  "regex-lite",
+ "reqwest",
  "rust_decimal",
  "semver",
  "serde",
