@@ -39,6 +39,8 @@ all-embeddings = [
     "embeddings-local"
 ]
 daemon = ["dep:codegraph-mcp-daemon"]
+# Write the graph to Postgres/pgvector instead of SurrealDB (CODEGRAPH_BACKEND)
+postgres = ["codegraph-mcp/postgres"]
 # Full features for cargo install --features full
 full = [
     "daemon",
