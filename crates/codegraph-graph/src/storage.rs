@@ -34,6 +34,52 @@ pub const SURR_EMBEDDING_COLUMN_2560: &str = "embedding_2560";
 pub const SURR_EMBEDDING_COLUMN_3072: &str = "embedding_3072";
 pub const SURR_EMBEDDING_COLUMN_4096: &str = "embedding_4096";
 
+/// Dimension → embedding column mapping shared by every backend adapter.
+///
+/// Despite the `SURR_`-prefixed column constants, the mapping itself is
+/// backend-neutral: it names the per-dimension vector field on the shared
+/// embedding records. Kept out of the SurrealDB module so Postgres-only builds
+/// can resolve a column without compiling the SurrealDB backend.
+#[derive(Clone, Copy, Debug)]
+pub enum EmbeddingColumn {
+    Embedding384,
+    Embedding768,
+    Embedding1024,
+    Embedding1536,
+    Embedding2048,
+    Embedding2560,
+    Embedding3072,
+    Embedding4096,
+}
+
+impl EmbeddingColumn {
+    pub fn column_name(&self) -> &'static str {
+        match self {
+            EmbeddingColumn::Embedding384 => SURR_EMBEDDING_COLUMN_384,
+            EmbeddingColumn::Embedding768 => SURR_EMBEDDING_COLUMN_768,
+            EmbeddingColumn::Embedding1024 => SURR_EMBEDDING_COLUMN_1024,
+            EmbeddingColumn::Embedding1536 => SURR_EMBEDDING_COLUMN_1536,
+            EmbeddingColumn::Embedding2048 => SURR_EMBEDDING_COLUMN_2048,
+            EmbeddingColumn::Embedding2560 => SURR_EMBEDDING_COLUMN_2560,
+            EmbeddingColumn::Embedding3072 => SURR_EMBEDDING_COLUMN_3072,
+            EmbeddingColumn::Embedding4096 => SURR_EMBEDDING_COLUMN_4096,
+        }
+    }
+
+    pub fn dimension(&self) -> usize {
+        match self {
+            EmbeddingColumn::Embedding384 => 384,
+            EmbeddingColumn::Embedding768 => 768,
+            EmbeddingColumn::Embedding1024 => 1024,
+            EmbeddingColumn::Embedding1536 => 1536,
+            EmbeddingColumn::Embedding2048 => 2048,
+            EmbeddingColumn::Embedding2560 => 2560,
+            EmbeddingColumn::Embedding3072 => 3072,
+            EmbeddingColumn::Embedding4096 => 4096,
+        }
+    }
+}
+
 /// Lowercase hex without per-byte `String` allocation.
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";

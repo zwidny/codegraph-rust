@@ -1346,6 +1346,7 @@ async fn build_graph_query(
         .unwrap_or(raw_project);
 
     match backend {
+        #[cfg(feature = "surrealdb")]
         codegraph_mcp::StorageBackend::Surreal => {
             use codegraph_graph::{GraphFunctions, SurrealDbStorage, SurrealGraph};
             let config = codegraph_graph::SurrealDbConfig::for_project(project_root);

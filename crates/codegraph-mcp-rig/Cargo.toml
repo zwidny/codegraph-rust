@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
+surrealdb = ["codegraph-graph/surrealdb"]
 rig-experimental = []
 # Provider features
 openai = []

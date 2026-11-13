@@ -1,6 +1,7 @@
 // ABOUTME: Exercises complete-project reconciliation without network services or inference.
 // ABOUTME: Checks cached callers, deletion, empty sources, docs invalidation and no-change runs.
 #![cfg(not(feature = "embeddings"))]
+#![cfg(feature = "surrealdb")]
 use anyhow::Result;
 use codegraph_core::config_manager::{CodeGraphConfig, IndexingTier};
 use codegraph_mcp::indexer::{IndexerConfig, ProjectIndexer};

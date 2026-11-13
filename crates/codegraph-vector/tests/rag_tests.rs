@@ -1,6 +1,8 @@
 // ABOUTME: End-to-end tests for the RAG system behavior and ranking
 // ABOUTME: Validates retrieval, response generation, and relevance scoring
 
+#![cfg(feature = "surrealdb")]
+
 #[cfg(test)]
 mod rag_integration_tests {
     use codegraph_core::{CodeNode, Language, NodeType};

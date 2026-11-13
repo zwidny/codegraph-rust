@@ -2476,6 +2476,7 @@ async fn handle_agent_status(json: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "surrealdb")]
 async fn handle_db_check(namespace: Option<String>, database: Option<String>) -> Result<()> {
     use codegraph_graph::{SurrealDbConfig, SurrealDbStorage};
 
@@ -2491,6 +2492,11 @@ async fn handle_db_check(namespace: Option<String>, database: Option<String>) ->
     let _storage = SurrealDbStorage::new(config).await?;
     println!("✓ SurrealDB connectivity verified ({})", target);
     Ok(())
+}
+
+#[cfg(not(feature = "surrealdb"))]
+async fn handle_db_check(_namespace: Option<String>, _database: Option<String>) -> Result<()> {
+    anyhow::bail!("`db check` requires a build with --features surrealdb")
 }
 
 fn prepare_debug_writer(base_path: &Path) -> Result<(BoxMakeWriter, PathBuf)> {

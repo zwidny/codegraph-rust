@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [features]
 embeddings = []
+surrealdb = ["codegraph-graph/surrealdb"]
 jina = []
 ollama = []
 

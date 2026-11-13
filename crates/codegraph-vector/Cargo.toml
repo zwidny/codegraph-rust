@@ -11,7 +11,7 @@ description = "Vector storage and similarity search using FAISS for CodeGraph"
 base64 = { workspace = true }
 codegraph-core = { workspace = true }
 codegraph-parser = { workspace = true }
-codegraph-graph = { path = "../codegraph-graph", features = ["surrealdb"] }
+codegraph-graph = { path = "../codegraph-graph" }
 ndarray = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -70,6 +70,7 @@ dotenvy = "0.15.7"
 [features]
 # Minimal defaults; opt-in providers from dependents
 default = []
+surrealdb = ["codegraph-graph/surrealdb"]
 persistent = ["dep:memmap2", "dep:flate2"]
 openai = ["dep:reqwest", "dep:tiktoken-rs"]
 local-embeddings = [
@@ -87,3 +88,4 @@ lmstudio = ["dep:reqwest"]
 [[example]]
 name = "rag_demo"
 path = "examples/rag_demo.rs"
+required-features = ["surrealdb"]

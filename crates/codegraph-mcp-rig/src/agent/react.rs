@@ -263,7 +263,7 @@ impl RigAgentTrait for XAIAgent {
     }
 }
 
-#[cfg(all(test, feature = "ollama"))]
+#[cfg(all(test, feature = "ollama", feature = "surrealdb"))]
 mod tests {
     use super::*;
     use axum::{Json, Router, routing::post};

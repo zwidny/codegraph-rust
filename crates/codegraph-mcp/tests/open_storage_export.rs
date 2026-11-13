@@ -1,6 +1,8 @@
 // ABOUTME: Compile-time check that codegraph-mcp exports the backend selector.
 // ABOUTME: Verifies `open_storage`, `StorageBackend` and `StorageMode` reach the crate root.
 
+#![cfg(feature = "surrealdb")]
+
 /// Constrains a future to the exact shape the read-only CLIs rely on:
 /// `anyhow::Result<Arc<dyn IndexStorage>>`.
 fn assert_storage_future<'a, F>(_f: F)

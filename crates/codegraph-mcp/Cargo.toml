@@ -60,7 +60,7 @@ glob-match = "0.2.1"
 # Internal dependencies
 codegraph-core = { workspace = true }
 codegraph-parser = { workspace = true }
-codegraph-graph = { workspace = true, features = ["surrealdb"] }
+codegraph-graph = { workspace = true }
 codegraph-vector = { workspace = true, optional = true, default-features = false }
 tokenizers = { workspace = true }  # Qwen2.5-Coder tokenizer for accurate token counting
 # codegraph-api not used directly here; avoid pulling heavy deps
@@ -76,10 +76,9 @@ anyhow = { workspace = true }
 serial_test = "4.0.1"
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 codegraph-vector = { workspace = true, features = ["ollama"] }
-surrealdb = { version = "4.0.1", features = ["kv-mem"] }
 
 [features]
-default = []
+default = ["postgres"]
 daemon = ["codegraph-parser/watcher-experimental"]
 embeddings = ["dep:codegraph-vector", "dep:codegraph-mcp-tools"]
 embeddings-local = ["embeddings", "codegraph-vector/local-embeddings"]
@@ -88,6 +87,7 @@ embeddings-ollama = ["embeddings", "codegraph-vector/ollama"]
 embeddings-jina = ["embeddings", "codegraph-vector/jina"]
 embeddings-lmstudio = ["embeddings", "codegraph-vector/lmstudio"]
 postgres = ["codegraph-graph/postgres"]
+surrealdb = ["codegraph-graph/surrealdb"]
 cloud = ["embeddings-jina", "codegraph-graph/surrealdb"]
 server-http = []
 ai-enhanced = ["embeddings"]

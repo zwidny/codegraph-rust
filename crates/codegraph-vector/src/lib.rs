@@ -3,6 +3,7 @@ pub mod embeddings;
 pub mod error;
 pub mod input_policy;
 pub mod providers;
+#[cfg(feature = "surrealdb")]
 pub mod search;
 mod submitted_cache;
 
@@ -31,6 +32,7 @@ pub mod jina_provider;
 #[cfg(feature = "lmstudio")]
 pub mod lmstudio_embedding_provider;
 
+#[cfg(feature = "surrealdb")]
 pub mod surreal_store;
 
 #[cfg(feature = "persistent")]
@@ -42,6 +44,7 @@ pub mod persistent;
 
 pub mod insights_generator;
 pub mod ml;
+#[cfg(feature = "surrealdb")]
 pub mod rag;
 pub mod reranker; // NEW: Fast reranking pipeline for insights generation // NEW: High-performance insights with reranking
 pub mod reranking; // NEW: Text-based reranking for RAG (Jina API, Ollama chat)
@@ -49,6 +52,7 @@ pub mod reranking; // NEW: Text-based reranking for RAG (Jina API, Ollama chat)
 pub use embedding::*;
 pub use embeddings::generator::AdvancedEmbeddingGenerator;
 pub use providers::*;
+#[cfg(feature = "surrealdb")]
 pub use search::*;
 
 pub use cache::*;
@@ -76,6 +80,7 @@ pub use jina_provider::{
 #[cfg(feature = "lmstudio")]
 pub use lmstudio_embedding_provider::*;
 
+#[cfg(feature = "surrealdb")]
 pub use surreal_store::*;
 
 #[cfg(feature = "persistent")]
@@ -87,6 +92,7 @@ pub use incremental::*;
 pub use persistent::*;
 
 pub use insights_generator::*;
+#[cfg(feature = "surrealdb")]
 pub use rag::*;
 pub use reranker::*; // Re-export reranker types // Re-export insights types
 pub use reranking::*; // Re-export text-based reranking types

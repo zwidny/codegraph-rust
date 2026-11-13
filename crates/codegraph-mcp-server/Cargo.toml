@@ -10,7 +10,7 @@ license = "Apache-2.0"
 path = "src/lib.rs"
 
 [features]
-default = ["daemon"]
+default = ["daemon", "postgres"]
 ai-enhanced = [
     "codegraph-mcp-rig",
     "codegraph-mcp/ai-enhanced",
@@ -41,6 +41,15 @@ all-embeddings = [
 daemon = ["dep:codegraph-mcp-daemon"]
 # Write the graph to Postgres/pgvector instead of SurrealDB (CODEGRAPH_BACKEND)
 postgres = ["codegraph-mcp/postgres"]
+# Compile the SurrealDB backend and its schema canaries (opt-in).
+surrealdb = [
+    "codegraph-mcp/surrealdb",
+    "codegraph-mcp-tools/surrealdb",
+    "codegraph-mcp-rig/surrealdb",
+    "codegraph-vector/surrealdb",
+    "codegraph-graph/surrealdb",
+    "dep:surrealdb",
+]
 # Full features for cargo install --features full
 full = [
     "daemon",
@@ -87,7 +96,7 @@ dirs = "7.0.0"
 dotenv = "0.15.0"
 nix = { version = "0.31.3", features = ["process", "signal"] }
 
-surrealdb = { version = "4.0.1", features = ["kv-mem", "kv-surrealkv"] }
+surrealdb = { version = "4.0.1", features = ["kv-mem", "kv-surrealkv"], optional = true }
 [dev-dependencies]
 tokenizers = { workspace = true }
 serial_test = "4.0.1"

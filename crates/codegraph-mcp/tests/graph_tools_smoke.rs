@@ -1,6 +1,8 @@
 // ABOUTME: Exercises in-process graph tools against a live SurrealDB.
 // ABOUTME: Skips automatically if required env vars are missing.
 
+#![cfg(feature = "surrealdb")]
+
 use codegraph_graph::{GraphFunctions, SurrealDbConfig, SurrealDbStorage};
 use codegraph_vector::ollama_embedding_provider::{OllamaEmbeddingConfig, OllamaEmbeddingProvider};
 use codegraph_vector::providers::EmbeddingProvider;

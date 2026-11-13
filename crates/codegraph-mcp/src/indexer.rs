@@ -23,15 +23,13 @@ use crate::analyzers::{AnalyzerSettings, find_tool_on_path, required_tools_for_l
 use crate::estimation::parse_files_with_unified_extraction as shared_unified_parse;
 use anyhow::{Context, Result, anyhow, bail};
 use codegraph_core::{CodeNode, EdgeRelationship, EdgeType, NodeId, NodeType};
-use codegraph_graph::ChunkEmbeddingRecord;
-use codegraph_graph::storage::IndexStorage;
-use codegraph_graph::{
-    FileMetadataRecord, NodeEmbeddingRecord, ProjectMetadataRecord, SURR_EMBEDDING_COLUMN_384,
-    SURR_EMBEDDING_COLUMN_768, SURR_EMBEDDING_COLUMN_1024, SURR_EMBEDDING_COLUMN_1536,
-    SURR_EMBEDDING_COLUMN_2048, SURR_EMBEDDING_COLUMN_2560, SURR_EMBEDDING_COLUMN_3072,
-    SURR_EMBEDDING_COLUMN_4096, SurrealDbConfig, SurrealDbStorage, SymbolEmbeddingRecord,
-    edge::CodeEdge,
+use codegraph_graph::edge::CodeEdge;
+use codegraph_graph::storage::{
+    ChunkEmbeddingRecord, EmbeddingColumn, FileMetadataRecord, IndexStorage, NodeEmbeddingRecord,
+    ProjectMetadataRecord, ReconcileScope, SymbolEmbeddingRecord,
 };
+#[cfg(feature = "surrealdb")]
+use codegraph_graph::{SurrealDbConfig, SurrealDbStorage};
 use codegraph_parser::TreeSitterParser;
 #[cfg(feature = "embeddings")]
 use codegraph_vector::prep::chunker::ChunkPlan;
@@ -92,46 +90,6 @@ pub fn set_watch_test_notifier(sender: tokio::sync::mpsc::UnboundedSender<PathBu
         .lock()
         .unwrap();
     *guard = Some(sender);
-}
-
-#[derive(Clone, Copy, Debug)]
-enum SurrealEmbeddingColumn {
-    Embedding384,
-    Embedding768,
-    Embedding1024,
-    Embedding1536,
-    Embedding2048,
-    Embedding2560,
-    Embedding3072,
-    Embedding4096,
-}
-
-impl SurrealEmbeddingColumn {
-    fn column_name(&self) -> &'static str {
-        match self {
-            SurrealEmbeddingColumn::Embedding384 => SURR_EMBEDDING_COLUMN_384,
-            SurrealEmbeddingColumn::Embedding768 => SURR_EMBEDDING_COLUMN_768,
-            SurrealEmbeddingColumn::Embedding1024 => SURR_EMBEDDING_COLUMN_1024,
-            SurrealEmbeddingColumn::Embedding1536 => SURR_EMBEDDING_COLUMN_1536,
-            SurrealEmbeddingColumn::Embedding2048 => SURR_EMBEDDING_COLUMN_2048,
-            SurrealEmbeddingColumn::Embedding2560 => SURR_EMBEDDING_COLUMN_2560,
-            SurrealEmbeddingColumn::Embedding3072 => SURR_EMBEDDING_COLUMN_3072,
-            SurrealEmbeddingColumn::Embedding4096 => SURR_EMBEDDING_COLUMN_4096,
-        }
-    }
-
-    fn dimension(&self) -> usize {
-        match self {
-            SurrealEmbeddingColumn::Embedding384 => 384,
-            SurrealEmbeddingColumn::Embedding768 => 768,
-            SurrealEmbeddingColumn::Embedding1024 => 1024,
-            SurrealEmbeddingColumn::Embedding1536 => 1536,
-            SurrealEmbeddingColumn::Embedding2048 => 2048,
-            SurrealEmbeddingColumn::Embedding2560 => 2560,
-            SurrealEmbeddingColumn::Embedding3072 => 3072,
-            SurrealEmbeddingColumn::Embedding4096 => 4096,
-        }
-    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -231,6 +189,8 @@ pub(crate) fn extraction_policy_for_tier(
 /// Storage backend for one indexing run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageBackend {
+    /// Compiled only when the crate carries the `surrealdb` feature.
+    #[cfg(feature = "surrealdb")]
     Surreal,
     Postgres,
 }
@@ -239,10 +199,29 @@ impl StorageBackend {
     /// `CODEGRAPH_BACKEND` selects the backend: empty / `surreal` / `surrealdb`
     /// mean SurrealDB, `postgres` / `pg` mean Postgres. Anything else is a
     /// configuration error rather than a silent fallback.
+    ///
+    /// A build that carries SurrealDB keeps it as the default so existing
+    /// deployments do not change backend on upgrade; a Postgres-only build
+    /// defaults to Postgres and rejects an explicit `surreal` request.
     pub fn from_env() -> Result<Self> {
         let raw = std::env::var("CODEGRAPH_BACKEND").unwrap_or_default();
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "surreal" | "surrealdb" => Ok(Self::Surreal),
+            "" => {
+                #[cfg(feature = "surrealdb")]
+                {
+                    Ok(Self::Surreal)
+                }
+                #[cfg(not(feature = "surrealdb"))]
+                {
+                    Ok(Self::Postgres)
+                }
+            }
+            #[cfg(feature = "surrealdb")]
+            "surreal" | "surrealdb" => Ok(Self::Surreal),
+            #[cfg(not(feature = "surrealdb"))]
+            "surreal" | "surrealdb" => Err(anyhow!(
+                "CODEGRAPH_BACKEND=surreal requires a build with --features surrealdb"
+            )),
             "postgres" | "pg" => Ok(Self::Postgres),
             other => Err(anyhow!(
                 "unknown CODEGRAPH_BACKEND `{other}`; expected `surreal` or `postgres`"
@@ -276,6 +255,7 @@ pub async fn open_storage(
     match backend {
         // `SurrealDbStorage::new` applies its own migration policy for both modes;
         // this does not change existing behaviour for the CLI.
+        #[cfg(feature = "surrealdb")]
         StorageBackend::Surreal => {
             let (_primary, pool) = ProjectIndexer::connect_surreal(project_root).await?;
             let handle = pool
@@ -313,6 +293,7 @@ pub struct ProjectIndexer {
     progress: MultiProgress,
     parser: TreeSitterParser,
     /// Present on the SurrealDB backend; `None` when `CODEGRAPH_BACKEND=postgres`.
+    #[cfg(feature = "surrealdb")]
     surreal: Option<Arc<TokioMutex<SurrealDbStorage>>>,
     /// Backend-neutral view of the same store `surreal` points at, so the
     /// indexing run no longer issues SurrealQL directly.
@@ -324,7 +305,7 @@ pub struct ProjectIndexer {
     domain: Option<String>,
     embedding_model: String,
     vector_dim: usize,
-    embedding_column: SurrealEmbeddingColumn,
+    embedding_column: EmbeddingColumn,
     project_root: PathBuf,
     reconcile_lock: TokioMutex<()>,
     lsp_pool: crate::analyzers::lsp::LspPool,
@@ -463,6 +444,7 @@ impl ProjectIndexer {
                 .with_extraction_policy(extraction_policy_for_tier(config.indexing_tier));
             let project_root = config.project_root.clone();
             let backend = StorageBackend::from_env()?;
+            #[cfg(feature = "surrealdb")]
             let (surreal, storage, storage_pool) = match backend {
                 StorageBackend::Surreal => {
                     let (surreal, surreal_pool) = Self::connect_surreal(&project_root).await?;
@@ -490,6 +472,23 @@ impl ProjectIndexer {
                     let storage: Arc<dyn IndexStorage> = Arc::new(store);
                     info!("🗄️ Storage backend: Postgres (pgvector)");
                     (None, Arc::clone(&storage), vec![storage])
+                }
+                #[cfg(not(feature = "postgres"))]
+                StorageBackend::Postgres => {
+                    return Err(anyhow!(
+                        "CODEGRAPH_BACKEND=postgres requires a build with --features postgres"
+                    ));
+                }
+            };
+            #[cfg(not(feature = "surrealdb"))]
+            let (storage, storage_pool) = match backend {
+                #[cfg(feature = "postgres")]
+                StorageBackend::Postgres => {
+                    let store = codegraph_graph::postgres_storage::PgStore::connect("")?;
+                    store.ensure_schema().await?;
+                    let storage: Arc<dyn IndexStorage> = Arc::new(store);
+                    info!("🗄️ Storage backend: Postgres (pgvector)");
+                    (Arc::clone(&storage), vec![storage])
                 }
                 #[cfg(not(feature = "postgres"))]
                 StorageBackend::Postgres => {
@@ -645,7 +644,7 @@ impl ProjectIndexer {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok());
             let vector_dim = env_vector_dim.unwrap_or(embedder_dimension);
-            let embedding_column = resolve_surreal_embedding_column(vector_dim).with_context(|| {
+            let embedding_column = resolve_embedding_column(vector_dim).with_context(|| {
             format!(
                 "Unsupported embedding dimension {}. Supported dimensions: 384, 768, 1024, 2048, 2560, 4096.",
                 vector_dim
@@ -667,23 +666,31 @@ impl ProjectIndexer {
                 );
             }
 
-            let vector_mode = codegraph_graph::vector_indexes::VectorIndexMode::from_env()?;
-            let vector_tables = Self::vector_tables(policies);
-            if vector_mode == codegraph_graph::vector_indexes::VectorIndexMode::Selected {
-                // SurrealDB vector indexes are created here; Postgres applies its
-                // own pgvector DDL in `PgStore::ensure_schema`.
-                if let Some(surreal) = surreal.as_ref() {
-                    codegraph_graph::vector_indexes::ensure_ready(
-                        &surreal.lock().await.db(),
-                        vector_dim,
-                        &vector_tables,
-                    )
-                    .await?;
-                } else {
-                    debug!(
-                        "vector index setup skipped: Postgres backend uses its own pgvector DDL"
-                    );
+            #[cfg(feature = "surrealdb")]
+            {
+                let vector_mode = codegraph_graph::vector_indexes::VectorIndexMode::from_env()?;
+                let vector_tables = Self::vector_tables(policies);
+                if vector_mode == codegraph_graph::vector_indexes::VectorIndexMode::Selected {
+                    // SurrealDB vector indexes are created here; Postgres applies its
+                    // own pgvector DDL in `PgStore::ensure_schema`.
+                    if let Some(surreal) = surreal.as_ref() {
+                        codegraph_graph::vector_indexes::ensure_ready(
+                            &surreal.lock().await.db(),
+                            vector_dim,
+                            &vector_tables,
+                        )
+                        .await?;
+                    } else {
+                        debug!(
+                            "vector index setup skipped: Postgres backend uses its own pgvector DDL"
+                        );
+                    }
                 }
+            }
+            #[cfg(not(feature = "surrealdb"))]
+            {
+                // A Postgres-only build applies its pgvector DDL in
+                // `PgStore::ensure_schema`; there is no SurrealDB index to prepare.
             }
             #[cfg(feature = "embeddings")]
             let embedder = if let Some(mut embedder) = embedder {
@@ -719,6 +726,7 @@ impl ProjectIndexer {
                 global_config: global_config.clone(),
                 progress: multi_progress,
                 parser,
+                #[cfg(feature = "surrealdb")]
                 surreal,
                 storage,
                 surreal_writer: Some(surreal_writer),
@@ -3327,6 +3335,7 @@ impl ProjectIndexer {
     ///
     /// Only the SurrealDB backend owns one: calling this with
     /// `CODEGRAPH_BACKEND=postgres` panics, because there is no SurrealDB handle.
+    #[cfg(feature = "surrealdb")]
     pub async fn surreal_storage(&self) -> Arc<TokioMutex<SurrealDbStorage>> {
         self.surreal
             .as_ref()
@@ -3350,7 +3359,7 @@ impl ProjectIndexer {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "surrealdb"))]
     pub async fn test_fetch_file_metadata(
         &self,
         file_path: &str,
@@ -3567,6 +3576,7 @@ impl ProjectIndexer {
         }
     }
 
+    #[cfg(feature = "surrealdb")]
     async fn connect_surreal(
         project_root: &Path,
     ) -> Result<(
@@ -3619,6 +3629,7 @@ impl ProjectIndexer {
         Ok((storage, pool))
     }
 
+    #[cfg(feature = "surrealdb")]
     fn log_surrealdb_status(&self, phase: &str) {
         let config = SurrealDbConfig::for_project(&self.project_root);
         let auth_state = if config.username.is_some() || config.password.is_some() {
@@ -3636,6 +3647,10 @@ impl ProjectIndexer {
         );
     }
 
+    #[cfg(not(feature = "surrealdb"))]
+    fn log_surrealdb_status(&self, _phase: &str) {}
+
+    #[cfg(feature = "surrealdb")]
     fn sanitize_surreal_url(raw: &str) -> String {
         if let Ok(mut url) = Url::parse(raw) {
             if !url.username().is_empty() {
@@ -3883,10 +3898,7 @@ impl ProjectIndexer {
     ///
     /// Indexing a subdirectory or a single file must not treat every other file in the
     /// project as deleted, which is what the unscoped reconciliation would do.
-    fn reconcile_scope(
-        project_root: &Path,
-        scanned: &Path,
-    ) -> Option<codegraph_graph::ReconcileScope> {
+    fn reconcile_scope(project_root: &Path, scanned: &Path) -> Option<ReconcileScope> {
         let project_root = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.to_path_buf());
@@ -3902,7 +3914,7 @@ impl ProjectIndexer {
         if scan_root == project_root {
             return None;
         }
-        Some(codegraph_graph::ReconcileScope {
+        Some(ReconcileScope {
             project_root,
             scan_root,
         })
@@ -4132,16 +4144,16 @@ fn chunk_embedding_db_batch_size(fallback: usize) -> usize {
         .unwrap_or(fallback.min(DEFAULT_CAP).min(MAX))
 }
 
-fn resolve_surreal_embedding_column(dim: usize) -> Result<SurrealEmbeddingColumn> {
+fn resolve_embedding_column(dim: usize) -> Result<EmbeddingColumn> {
     match dim {
-        384 => Ok(SurrealEmbeddingColumn::Embedding384),
-        768 => Ok(SurrealEmbeddingColumn::Embedding768),
-        1024 => Ok(SurrealEmbeddingColumn::Embedding1024),
-        1536 => Ok(SurrealEmbeddingColumn::Embedding1536),
-        2048 => Ok(SurrealEmbeddingColumn::Embedding2048),
-        2560 => Ok(SurrealEmbeddingColumn::Embedding2560),
-        3072 => Ok(SurrealEmbeddingColumn::Embedding3072),
-        4096 => Ok(SurrealEmbeddingColumn::Embedding4096),
+        384 => Ok(EmbeddingColumn::Embedding384),
+        768 => Ok(EmbeddingColumn::Embedding768),
+        1024 => Ok(EmbeddingColumn::Embedding1024),
+        1536 => Ok(EmbeddingColumn::Embedding1536),
+        2048 => Ok(EmbeddingColumn::Embedding2048),
+        2560 => Ok(EmbeddingColumn::Embedding2560),
+        3072 => Ok(EmbeddingColumn::Embedding3072),
+        4096 => Ok(EmbeddingColumn::Embedding4096),
         other => Err(anyhow!(
             "Unsupported embedding dimension {}. Supported: 384, 768, 1024, 1536, 2048, 2560, 3072, 4096",
             other
@@ -4172,26 +4184,23 @@ mod tests {
     }
 
     #[test]
-    fn surreal_embedding_column_supports_2560_dimension() {
-        let column =
-            resolve_surreal_embedding_column(2560).expect("2560-d embeddings should be supported");
-        assert_eq!(column.column_name(), SURR_EMBEDDING_COLUMN_2560);
+    fn embedding_column_supports_2560_dimension() {
+        let column = resolve_embedding_column(2560).expect("2560-d embeddings should be supported");
+        assert_eq!(column.column_name(), "embedding_2560");
         assert_eq!(column.dimension(), 2560);
     }
 
     #[test]
-    fn surreal_embedding_column_supports_1536_dimension() {
-        let column =
-            resolve_surreal_embedding_column(1536).expect("1536-d embeddings should be supported");
-        assert_eq!(column.column_name(), SURR_EMBEDDING_COLUMN_1536);
+    fn embedding_column_supports_1536_dimension() {
+        let column = resolve_embedding_column(1536).expect("1536-d embeddings should be supported");
+        assert_eq!(column.column_name(), "embedding_1536");
         assert_eq!(column.dimension(), 1536);
     }
 
     #[test]
-    fn surreal_embedding_column_supports_3072_dimension() {
-        let column =
-            resolve_surreal_embedding_column(3072).expect("3072-d embeddings should be supported");
-        assert_eq!(column.column_name(), SURR_EMBEDDING_COLUMN_3072);
+    fn embedding_column_supports_3072_dimension() {
+        let column = resolve_embedding_column(3072).expect("3072-d embeddings should be supported");
+        assert_eq!(column.column_name(), "embedding_3072");
         assert_eq!(column.dimension(), 3072);
     }
 
@@ -5090,6 +5099,7 @@ mod storage_backend_tests {
         }
     }
 
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn backend_from_env_defaults_to_surreal() {
         let _guard = BackendEnvGuard::new(None);
@@ -5099,6 +5109,17 @@ mod storage_backend_tests {
         );
     }
 
+    #[cfg(not(feature = "surrealdb"))]
+    #[test]
+    fn backend_from_env_defaults_to_postgres() {
+        let _guard = BackendEnvGuard::new(None);
+        assert_eq!(
+            StorageBackend::from_env().expect("unset CODEGRAPH_BACKEND must be valid"),
+            StorageBackend::Postgres
+        );
+    }
+
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn backend_from_env_accepts_surreal_aliases() {
         for value in ["surreal", "surrealdb", " Surreal "] {
@@ -5109,6 +5130,18 @@ mod storage_backend_tests {
                 "`{value}` must select the SurrealDB backend"
             );
         }
+    }
+
+    #[cfg(not(feature = "surrealdb"))]
+    #[test]
+    fn backend_from_env_rejects_surreal_without_the_feature() {
+        let _guard = BackendEnvGuard::new(Some("surreal"));
+        let error = StorageBackend::from_env().expect_err("surreal must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("requires a build with --features surrealdb"),
+            "unexpected error message: {message}"
+        );
     }
 
     #[test]

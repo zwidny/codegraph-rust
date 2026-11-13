@@ -1,6 +1,8 @@
 // ABOUTME: Direct graph queries without the LLM agent workflow — milliseconds, not minutes.
 // ABOUTME: Backs `codegraph query`; read-only, no schema writes, no providers contacted.
-use anyhow::{Context, Result, bail};
+#[cfg(feature = "surrealdb")]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use clap::Args;
 use codegraph_mcp::{StorageBackend, StorageMode, open_storage};
 use serde_json::{Value, json};
@@ -79,6 +81,7 @@ async fn run_async(args: QueryArgs) -> Result<()> {
     // can hold the project even when there is no local `.codegraph` directory.
     // Keep it so an unindexed project still fails loudly instead of silently
     // creating an empty embedded store and reporting "no match".
+    #[cfg(feature = "surrealdb")]
     if backend == StorageBackend::Surreal {
         let config = codegraph_graph::SurrealDbConfig::for_project(&project_root);
         if let Some(embedded_path) = config.connection.strip_prefix("surrealkv://") {

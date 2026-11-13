@@ -37,7 +37,7 @@ fn grounding_requires_successful_tool_observations_not_prose_or_budget_notes() {
     }))]));
 }
 
-#[cfg(feature = "ollama")]
+#[cfg(all(feature = "ollama", feature = "surrealdb"))]
 mod mock_model {
     use super::*;
     use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};

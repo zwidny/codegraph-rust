@@ -8,8 +8,11 @@
 use anyhow::{Result, anyhow};
 use codegraph_core::CodeNode;
 use codegraph_graph::{
-    ChunkEmbeddingRecord, FileMetadataRecord, NodeEmbeddingRecord, ProjectMetadataRecord,
-    SymbolEmbeddingRecord, edge::CodeEdge, storage::IndexStorage,
+    edge::CodeEdge,
+    storage::{
+        ChunkEmbeddingRecord, FileMetadataRecord, IndexStorage, NodeEmbeddingRecord,
+        ProjectMetadataRecord, SymbolEmbeddingRecord,
+    },
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::Serialize;
@@ -545,7 +548,7 @@ impl SurrealWriterHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "surrealdb"))]
 mod tests {
     use super::*;
     use codegraph_core::{Language, Location, NodeType};

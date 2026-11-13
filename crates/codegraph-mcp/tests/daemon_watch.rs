@@ -1,6 +1,7 @@
 // ABOUTME: Integration test verifying watch mode triggers incremental reindexing.
 // ABOUTME: Spawns watch loop, edits a file, and asserts file_metadata is updated.
 #![cfg(not(feature = "embeddings"))]
+#![cfg(feature = "surrealdb")]
 
 use std::sync::Arc;
 use std::time::Duration;
