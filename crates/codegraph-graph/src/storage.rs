@@ -336,6 +336,13 @@ pub struct SymbolInProject {
 /// One node matched by a name lookup, as `codegraph query` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SymbolMatch {
+    /// Bare node id (no `nodes:` prefix on SurrealDB, see `decode_node_id`).
+    ///
+    /// Not serialized: `codegraph query`'s JSON contract is the six display
+    /// fields, while `--file` needs the id to pin one definition before asking
+    /// for its callers/callees. Skipping keeps the printed shape unchanged.
+    #[serde(skip)]
+    pub id: String,
     pub name: String,
     pub node_type: Option<String>,
     pub language: Option<String>,
@@ -729,6 +736,30 @@ pub trait IndexStorage: Send + Sync {
         &self,
         project_id: &str,
         target: &str,
+        limit: i64,
+    ) -> Result<Vec<CallRelation>>;
+
+    /// Callers of one specific node (by id), not of every node sharing its name.
+    /// Used by `codegraph query --file`, which pins the definition first.
+    ///
+    /// `node_id` is the bare id (`SymbolMatch::id`), never a `nodes:`-prefixed
+    /// record id; a backend that stores record ids rebuilds them itself.
+    /// `limit` is clamped to `1..=1000`; `limit <= 0` means 1000.
+    async fn callers_of_id(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        limit: i64,
+    ) -> Result<Vec<CallRelation>>;
+
+    /// Callees of one specific node (by id): the mirror image of
+    /// [`IndexStorage::callers_of_id`].
+    ///
+    /// `node_id` has the same bare-id contract as `callers_of_id`.
+    async fn callees_of_id(
+        &self,
+        project_id: &str,
+        node_id: &str,
         limit: i64,
     ) -> Result<Vec<CallRelation>>;
 

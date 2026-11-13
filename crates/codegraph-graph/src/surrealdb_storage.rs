@@ -3157,7 +3157,8 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
             .db
             .query(
                 r#"
-                SELECT name, node_type, language, file_path, start_line, end_line
+                SELECT <string> id AS id, name, node_type, language, file_path,
+                       start_line, end_line
                 FROM nodes
                 WHERE project_id = $project
                   AND (name = $symbol OR string::starts_with(name, $symbol))
@@ -3179,6 +3180,7 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
         Ok(rows
             .into_iter()
             .map(|row| crate::storage::SymbolMatch {
+                id: decode_node_id(&json_string(&row, "id")).to_string(),
                 name: json_string(&row, "name"),
                 node_type: json_optional_string(&row, "node_type"),
                 language: json_optional_string(&row, "language"),
@@ -3263,6 +3265,87 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
         let rows: Vec<JsonValue> = response
             .take(0)
             .map_err(|e| CodeGraphError::Database(format!("callees lookup decode failed: {e}")))?;
+        Ok(rows.into_iter().map(call_relation_from_row).collect())
+    }
+
+    /// Callers of exactly one node id.
+    ///
+    /// `to` is a record, so the filter must rebuild it from the bare id with
+    /// `type::record('nodes', …)` — `to.name = …` (the name path) cannot pin one
+    /// definition among several with the same name.
+    async fn callers_of_id(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::CallRelation>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT
+                    from.name AS symbol,
+                    from.node_type AS node_type,
+                    from.file_path AS file,
+                    from.start_line AS line,
+                    metadata.resolution_method AS resolution
+                FROM edges
+                WHERE project_id = $project
+                  AND to = type::record('nodes', $node_id)
+                  AND edge_type = 'calls'
+                LIMIT $limit;
+                "#,
+            )
+            .bind(("project", project_id.to_string()))
+            .bind(("node_id", node_id.to_string()))
+            .bind(("limit", limit))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("callers by id failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("callers by id failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("callers by id decode failed: {e}")))?;
+        Ok(rows.into_iter().map(call_relation_from_row).collect())
+    }
+
+    /// Callees of exactly one node id: the mirror image of
+    /// [`Self::callers_of_id`].
+    async fn callees_of_id(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::CallRelation>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let mut response = self
+            .db
+            .query(
+                r#"
+                SELECT
+                    to.name AS symbol,
+                    to.node_type AS node_type,
+                    to.file_path AS file,
+                    to.start_line AS line,
+                    metadata.resolution_method AS resolution
+                FROM edges
+                WHERE project_id = $project
+                  AND from = type::record('nodes', $node_id)
+                  AND edge_type = 'calls'
+                LIMIT $limit;
+                "#,
+            )
+            .bind(("project", project_id.to_string()))
+            .bind(("node_id", node_id.to_string()))
+            .bind(("limit", limit))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("callees by id failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("callees by id failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("callees by id decode failed: {e}")))?;
         Ok(rows.into_iter().map(call_relation_from_row).collect())
     }
 

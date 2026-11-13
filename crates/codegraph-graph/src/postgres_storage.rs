@@ -543,7 +543,7 @@ UPDATE edges SET to_id = $3 WHERE project_id = $1 AND to_id = $2
 /// would treat `%` and `_` *inside* the symbol name as wildcards, so querying a
 /// symbol such as `a_b` would also match `axb`.
 const FIND_NODES_BY_NAME_SQL: &str = r#"
-SELECT name, node_type, language, file_path, start_line, end_line
+SELECT name, node_type, language, file_path, start_line, end_line, id
 FROM nodes
 WHERE project_id = $1 AND (name = $2 OR left(name, char_length($2)) = $2)
 ORDER BY name ASC
@@ -580,6 +580,39 @@ JOIN nodes callee ON callee.id = e.to_id
 WHERE e.project_id = $1
   AND e.edge_type = 'calls'
   AND target.project_id = $1 AND target.name = $2
+  AND callee.project_id = $1
+ORDER BY callee.name ASC
+LIMIT $3
+"#;
+
+/// Callers of one specific node id: [`CALLERS_OF_NAME_SQL`] with the *target*
+/// predicate on `e.to_id = $2` instead of a join on the target's name.
+///
+/// Only the caller is joined (and only it carries the `project_id` predicate),
+/// so a cross-project id collision cannot leak a row.
+const CALLERS_OF_ID_SQL: &str = r#"
+SELECT caller.name, caller.node_type, caller.file_path, caller.start_line,
+       e.metadata->>'resolution_method'
+FROM edges e
+JOIN nodes caller ON caller.id = e.from_id
+WHERE e.project_id = $1
+  AND e.edge_type = 'calls'
+  AND e.to_id = $2
+  AND caller.project_id = $1
+ORDER BY caller.name ASC
+LIMIT $3
+"#;
+
+/// Callees of one specific node id: [`CALLERS_OF_ID_SQL`] with the roles
+/// swapped (`e.from_id = $2`, projecting the `e.to_id` node).
+const CALLEES_OF_ID_SQL: &str = r#"
+SELECT callee.name, callee.node_type, callee.file_path, callee.start_line,
+       e.metadata->>'resolution_method'
+FROM edges e
+JOIN nodes callee ON callee.id = e.to_id
+WHERE e.project_id = $1
+  AND e.edge_type = 'calls'
+  AND e.from_id = $2
   AND callee.project_id = $1
 ORDER BY callee.name ASC
 LIMIT $3
@@ -2385,6 +2418,7 @@ impl crate::storage::IndexStorage for PgStore {
         Ok(rows
             .into_iter()
             .map(|row| crate::storage::SymbolMatch {
+                id: row.get(6),
                 name: row.get(0),
                 node_type: row.get(1),
                 language: row.get(2),
@@ -2423,6 +2457,39 @@ impl crate::storage::IndexStorage for PgStore {
         let client = self.pool.get().await.map_err(db_err)?;
         let rows = client
             .query(CALLEES_OF_NAME_SQL, &[&project_id, &target, &limit])
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(call_relation_from_row).collect())
+    }
+
+    /// Callers of exactly one node id, over `calls` edges.
+    async fn callers_of_id(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::CallRelation>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(CALLERS_OF_ID_SQL, &[&project_id, &node_id, &limit])
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(call_relation_from_row).collect())
+    }
+
+    /// Callees of exactly one node id: the mirror image of
+    /// [`Self::callers_of_id`].
+    async fn callees_of_id(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::storage::CallRelation>> {
+        let limit = crate::storage::clamp_lookup_limit(limit);
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(CALLEES_OF_ID_SQL, &[&project_id, &node_id, &limit])
             .await
             .map_err(db_err)?;
         Ok(rows.into_iter().map(call_relation_from_row).collect())
@@ -4842,6 +4909,94 @@ mod tests {
             .expect("callees_of_name");
         assert_eq!(callees.len(), 1, "one callee of caller");
         assert_eq!(callees[0].symbol, "target");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn callers_of_id_scopes_to_one_definition() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("query_callers_by_id");
+        // Two definitions both named `new`, in different files, each with its own
+        // caller. A name lookup cannot tell them apart; the id must.
+        let mut first_new = named_node("q_new_first", &project, "new");
+        first_new.file_path = Some("src/term/cell.rs".to_string());
+        let mut second_new = named_node("q_new_second", &project, "new");
+        second_new.file_path = Some("src/window/mod.rs".to_string());
+        store
+            .upsert_nodes(&[
+                first_new,
+                second_new,
+                named_node("q_caller_first", &project, "caller_first"),
+                named_node("q_caller_second", &project, "caller_second"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_edges(&[
+                edge_row("q_edge_first", &project, "q_caller_first", "q_new_first"),
+                edge_row("q_edge_second", &project, "q_caller_second", "q_new_second"),
+            ])
+            .await
+            .expect("upsert edges");
+
+        let callers = store
+            .callers_of_id(&project, "q_new_first", 100)
+            .await
+            .expect("callers_of_id");
+        let symbols: Vec<&str> = callers.iter().map(|row| row.symbol.as_str()).collect();
+        assert_eq!(
+            symbols,
+            vec!["caller_first"],
+            "only the caller of the pinned `new`, not of the same-named one"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn callees_of_id_mirrors_callers_of_id() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("query_callees_by_id");
+        let mut first_caller = named_node("q_pair_a", &project, "caller");
+        first_caller.file_path = Some("src/a.rs".to_string());
+        let mut second_caller = named_node("q_pair_b", &project, "caller");
+        second_caller.file_path = Some("src/b.rs".to_string());
+        store
+            .upsert_nodes(&[
+                first_caller,
+                second_caller,
+                named_node("q_pair_target_a", &project, "target_a"),
+                named_node("q_pair_target_b", &project, "target_b"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_edges(&[
+                edge_row("q_pair_edge_a", &project, "q_pair_a", "q_pair_target_a"),
+                edge_row("q_pair_edge_b", &project, "q_pair_b", "q_pair_target_b"),
+            ])
+            .await
+            .expect("upsert edges");
+
+        let callees = store
+            .callees_of_id(&project, "q_pair_a", 100)
+            .await
+            .expect("callees_of_id");
+        let symbols: Vec<&str> = callees.iter().map(|row| row.symbol.as_str()).collect();
+        assert_eq!(
+            symbols,
+            vec!["target_a"],
+            "only what the pinned caller calls, not the same-named caller's target"
+        );
     }
 
     #[tokio::test]
