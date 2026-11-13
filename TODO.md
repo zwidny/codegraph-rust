@@ -313,7 +313,7 @@ Nothing is wired up yet.
 | Stale SCIP error message | **Fixed in `291192f`**: the import now warns `SCIP index … is older than N of M captured sources` (mtime comparison, non-fatal) and position failures carry `<path>:<line>:<col> (end …, encoding N) … the index is probably stale`. The mtime heuristic can misfire on `git checkout`/`touch` — it only warns, so that is cosmetic |
 | Occurrence-aware edge ids | ~31% of this repo's 96,733 edges share `(from,to,type)` with another edge (max 71 occurrences of one `references`). Deliberate (`edge.rs` keeps distinct call sites distinct), but degree/coupling metrics must `DISTINCT` or they over-count |
 
-### 6. Postgres + pgvector backend — **in progress**
+### 6. Postgres + pgvector backend — **end-to-end working, queries pending**
 
 Evaluation is settled (107x write, 56x KNN, 156x full-text; see
 [docs/BACKEND_EVALUATION.md](docs/BACKEND_EVALUATION.md)). The migration proceeds in
@@ -331,15 +331,33 @@ suites stay green):
 | `347cdf1` | `file_metadata` (composite key, incremental change detection) |
 | `5ad994d` | `IndexStorage` trait + both backend impls |
 | `f8436c6` | Writer queue drives `Arc<dyn IndexStorage>`; `project_metadata` table |
+| `e2b0d0a` | The indexer's remaining reads on the trait (fingerprint, counts, nodes_in_files, …) |
+| `11dac6e` | `ReconcileScope` on the trait; Postgres refuses scoped reconciliation explicitly |
+| `01b73d0` | `symbols_excluding_files` for partial re-index |
+| `2dbb125` | All 17 indexer call sites moved to the trait (‑167 net lines) |
+| `3f509ac` | `CODEGRAPH_BACKEND=postgres` + subprocess test isolation fix |
+| `7ca45e6` | Fixes a pre-existing panic: enrichment sliced past the end of a source file |
+| `ee6afd1` | `codegraph-mcp-server` forwards the feature so the binary can be built |
+
+**End-to-end measured** (details and conditions in
+[docs/BACKEND_EVALUATION.md](docs/BACKEND_EVALUATION.md#end-to-end-verification-measured-not-projected)):
+
+| Project | Rows | Postgres | SurrealDB | Speedup |
+|---|---|---|---|---|
+| alacritty | 14,949 | 2,248 ms | 3,655 ms | 1.6x |
+| this repo | 39,301 | 7,323 ms | 28,651 ms | 3.9x |
+
+The write phases alone are 4.8x–9.0x; the 107x figure is the storage ceiling, reached only at the
+micro-benchmark's row and connection counts. Do not quote 107x as an indexing speedup.
 
 **Still open:**
 
 | Item | Why it blocks |
 |---|---|
-| 7 more `IndexStorage` methods | The indexer still issues raw SurrealQL for the project fingerprint, `DELETE project_metadata`, reconcile, vector-index readiness, file metadata reads, and edge retargeting |
-| `CODEGRAPH_BACKEND=postgres` | Nothing constructs a `PgStore` in production yet |
-| `GraphQueries` parity | hub / coupling / call chain / subgraph are SurrealQL-only |
-| End-to-end run | The 107x write figure has only been measured on a synthetic harness, not through a real `codegraph index` |
+| Postgres scoped reconciliation | Single-file and subdirectory indexes fail with an explicit error; full indexes work |
+| `GraphQueries` parity | hub / coupling / call chain / subgraph are SurrealQL-only, so switching the backend changes how the graph is written, not how it is read |
+| MCP query tools on Postgres | `official_server.rs` and `graph_functions` still assume SurrealDB |
+| `postgres` feature defaults | Not in `make build-dist`; you must pass `DIST_FEATURES=...,postgres` (or `make install-dist` with it) |
 
 **Semantics that deliberately differ, do not "fix" silently:**
 

@@ -253,3 +253,52 @@ now:         494 s   (480 s of it is storage writes)
 after switch: ~20-30 s  (writes ~5 s)
 queries:      39 ms -> 0.7 ms (KNN), 420 ms -> 1.7 ms (reverse deps)
 ```
+
+## End-to-end verification (measured, not projected)
+
+The table above is pure storage micro-benchmarks. Once `CODEGRAPH_BACKEND=postgres` was wired
+up, the whole indexing run was measured on two real projects. Same binary, same flags, same
+machine, `CODEGRAPH_EMBEDDING_POLICY=off` and `CODEGRAPH_SEMANTIC_RESOLUTION=off` on both sides
+(so no provider traffic and no chunk vectors), SurrealDB on embedded `surrealkv://` — its
+production configuration here — and Postgres 16 + pgvector in a container.
+
+| Project | Rows written | Postgres `index_ms` | SurrealDB `index_ms` | Speedup |
+|---|---|---|---|---|
+| alacritty (86 files) | 14,949 | **2,248** | 3,655 | **1.6x** |
+| this repo (263 files) | 39,301 | **7,323** | 28,651 | **3.9x** |
+
+Phase breakdown, same two runs:
+
+| `phase_ms` key | alacritty PG | alacritty Surreal | repo PG | repo Surreal |
+|---|---|---|---|---|
+| `analyzers` | 755 | 264 | 1,648 | 2,171 |
+| `enqueue_nodes` | 547 | 1,993 | **3,057** | **14,740** |
+| `resolution_edge_preparation_and_writes` | 267 | 1,080 | **934** | **8,398** |
+| `durable_reconcile_and_indexes` | 31 | 80 | 130 | 201 |
+
+**Read this before quoting "107x".** 107x is the storage write ceiling, not the end-to-end
+speedup. What an indexing run gains depends on how much of it is storage:
+
+- On 86 files the write path is a minority of the run (analyzers and parsing dominate), so the
+  end-to-end gain is 1.6x even though edge writes are 4x faster.
+- On 263 files writes have grown into the largest single phase, and the end-to-end gain is 3.9x.
+- Per-phase, the write paths themselves are 4.8x (`enqueue_nodes`) to 9.0x (edge preparation and
+  writes). They approach 107x only at the row counts and connection counts in the micro-benchmark.
+
+Both runs wrote exactly the same content: 39,301 rows acked on Postgres and 39,312 on SurrealDB
+(the 11-row difference is edge-id occurrence handling in reconciliation), `graph_complete = true`,
+and identical node/edge counts (14,735 / 24,303). Row counts read back from Postgres matched the
+indexer's own accounting, so the pipeline is not silently dropping writes.
+
+### Trap: a copy without `.git` is treated as a partial index
+
+`codegraph index .` resolves the owning project as "the nearest `.git` or `.codegraph` ancestor".
+A working copy stripped of both (as an isolated benchmark copy is) resolves elsewhere, so
+`scan_root != project_root`, the run is treated as a partial re-index, and Postgres rejects it:
+
+```
+Configuration error: scoped reconciliation is not implemented for the Postgres backend yet
+```
+
+Passing `--project-root <dir>` explicitly fixes it. This is pre-existing CLI behaviour, not a
+backend issue, but it makes an otherwise valid benchmark look broken.
