@@ -3426,7 +3426,7 @@ impl ProjectIndexer {
                 records.push(NodeEmbeddingRecord {
                     id: node.id.to_string(),
                     column: self.embedding_column.column_name(),
-                    embedding: embedding.iter().map(|&v| v as f64).collect(),
+                    embedding: embedding.to_vec(),
                     updated_at: chrono::Utc::now(),
                 });
             }

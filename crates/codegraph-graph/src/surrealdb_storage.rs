@@ -1274,7 +1274,10 @@ impl SurrealDbStorage {
             embedding_2560,
             embedding_4096,
         ) = if let Some(values) = &node.embedding {
-            let embedding_vec: Vec<f64> = values.iter().map(|&f| f as f64).collect();
+            // Keep f32: the provider emits f32, SurrealDB stores F32, and serialising a
+            // widened f64 roughly doubles each element's JSON text (0.12345679 vs
+            // 0.12345679104328156), i.e. ~7 KB extra per 1024-d row.
+            let embedding_vec: Vec<f32> = values.to_vec();
             match values.len() {
                 384 => (Some(embedding_vec), None, None, None, None, None),
                 768 => (None, Some(embedding_vec), None, None, None, None),
@@ -2226,7 +2229,7 @@ RETURN NONE;
         let record = NodeEmbeddingRecord {
             id: node_id.to_string(),
             column: embedding_column,
-            embedding: embedding.iter().map(|&f| f as f64).collect(),
+            embedding: embedding.to_vec(),
             updated_at: Utc::now(),
         };
         self.update_node_embeddings_batch(std::slice::from_ref(&record))
@@ -2332,16 +2335,24 @@ impl GraphStore for SurrealDbStorage {
     }
 }
 
+/// Lowercase hex without per-byte `String` allocation.
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 0x0f) as usize]);
+    }
+    // SAFETY: every pushed byte is ASCII hex.
+    String::from_utf8(out).expect("hex is ASCII")
+}
+
 fn symbol_embedding_record_id(project_id: &str, normalized_symbol: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(project_id.as_bytes());
     hasher.update(b":");
     hasher.update(normalized_symbol.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+    hex_lower(&hasher.finalize())
 }
 
 pub struct SymbolEmbeddingUpsert<'a> {
@@ -2366,21 +2377,21 @@ pub struct SymbolEmbeddingRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_384: Option<Vec<f64>>,
+    pub embedding_384: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_768: Option<Vec<f64>>,
+    pub embedding_768: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_1024: Option<Vec<f64>>,
+    pub embedding_1024: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_1536: Option<Vec<f64>>,
+    pub embedding_1536: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_2048: Option<Vec<f64>>,
+    pub embedding_2048: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_2560: Option<Vec<f64>>,
+    pub embedding_2560: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_3072: Option<Vec<f64>>,
+    pub embedding_3072: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_4096: Option<Vec<f64>>,
+    pub embedding_4096: Option<Vec<f32>>,
     pub embedding_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
@@ -2405,7 +2416,10 @@ impl SymbolEmbeddingRecord {
         source_edge_id: Option<&str>,
         metadata: Option<JsonValue>,
     ) -> Self {
-        let embedding_vec: Vec<f64> = embedding.iter().map(|&f| f as f64).collect();
+        // Keep f32: the provider emits f32, SurrealDB stores F32, and serialising a
+        // widened f64 roughly doubles each element's JSON text (0.12345679 vs
+        // 0.12345679104328156), i.e. ~7 KB extra per 1024-d row.
+        let embedding_vec: Vec<f32> = embedding.to_vec();
         let (
             embedding_384,
             embedding_768,
@@ -2578,11 +2592,7 @@ impl FileMetadataRecord {
         hasher.update(self.project_id.as_bytes());
         hasher.update(b":");
         hasher.update(self.file_path.as_bytes());
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+        hex_lower(&hasher.finalize())
     }
 }
 
@@ -2601,17 +2611,17 @@ struct SurrealNodeRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     end_line: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding_384: Option<Vec<f64>>,
+    embedding_384: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding_768: Option<Vec<f64>>,
+    embedding_768: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding_1024: Option<Vec<f64>>,
+    embedding_1024: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding_2048: Option<Vec<f64>>,
+    embedding_2048: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding_2560: Option<Vec<f64>>,
+    embedding_2560: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding_4096: Option<Vec<f64>>,
+    embedding_4096: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2679,7 +2689,7 @@ pub fn surreal_embedding_column_for_dimension(dim: usize) -> &'static str {
 pub struct NodeEmbeddingRecord {
     pub id: String,
     pub column: &'static str,
-    pub embedding: Vec<f64>,
+    pub embedding: Vec<f32>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -2690,14 +2700,14 @@ pub struct ChunkEmbeddingRecord {
     pub chunk_index: i32,
     pub text: String, // Back to String (Base64 encoded if compressed)
     pub project_id: String,
-    pub embedding_384: Option<Vec<f64>>,
-    pub embedding_768: Option<Vec<f64>>,
-    pub embedding_1024: Option<Vec<f64>>,
-    pub embedding_1536: Option<Vec<f64>>,
-    pub embedding_2048: Option<Vec<f64>>,
-    pub embedding_2560: Option<Vec<f64>>,
-    pub embedding_3072: Option<Vec<f64>>,
-    pub embedding_4096: Option<Vec<f64>>,
+    pub embedding_384: Option<Vec<f32>>,
+    pub embedding_768: Option<Vec<f32>>,
+    pub embedding_1024: Option<Vec<f32>>,
+    pub embedding_1536: Option<Vec<f32>>,
+    pub embedding_2048: Option<Vec<f32>>,
+    pub embedding_2560: Option<Vec<f32>>,
+    pub embedding_3072: Option<Vec<f32>>,
+    pub embedding_4096: Option<Vec<f32>>,
     pub embedding_model: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -2709,11 +2719,7 @@ impl ChunkEmbeddingRecord {
         hasher.update(parent_node.as_bytes());
         hasher.update(b":");
         hasher.update(chunk_index.to_le_bytes());
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        hex_lower(&hasher.finalize())
     }
     pub fn new(
         parent_node: &str,
@@ -2724,7 +2730,10 @@ impl ChunkEmbeddingRecord {
         embedding_column: &str,
         project_id: &str,
     ) -> Self {
-        let embedding_vec: Vec<f64> = embedding.iter().map(|&f| f as f64).collect();
+        // Keep f32: the provider emits f32, SurrealDB stores F32, and serialising a
+        // widened f64 roughly doubles each element's JSON text (0.12345679 vs
+        // 0.12345679104328156), i.e. ~7 KB extra per 1024-d row.
+        let embedding_vec: Vec<f32> = embedding.to_vec();
 
         // Use Base64 encoding for compression to satisfy String type
         let text_val = codegraph_core::compress_to_string(&text);
@@ -3368,6 +3377,53 @@ mod tests {
             "surrealkv:///tmp/x/.codegraph/db"
         );
         assert!(is_embedded_connection("surrealkv:///tmp/x/.codegraph/db"));
+    }
+
+    #[test]
+    fn hex_lower_matches_format_encoding() {
+        assert_eq!(hex_lower(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    #[test]
+    fn hex_lower_matches_sha256_of_known_input() {
+        assert_eq!(
+            hex_lower(&Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn symbol_embedding_record_keeps_f32_precision() {
+        let embedding = [0.1f32, 0.25, -1.5];
+        let record = SymbolEmbeddingRecord::new(
+            "f32-project",
+            None,
+            "symbol",
+            "symbol",
+            &embedding,
+            "fixture",
+            SURR_EMBEDDING_COLUMN_1024,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(record.embedding_1024, Some(vec![0.1f32, 0.25, -1.5]));
+
+        let stored = serde_json::to_string(&record.embedding_1024).unwrap();
+        assert!(stored.contains("0.1,"), "{stored}");
+        assert!(!stored.contains("0.100000001"), "{stored}");
+
+        // Widening the same provider output to f64 would inflate the JSON payload.
+        let as_f32 = serde_json::to_string(&vec![0.1f32, 0.25, -1.5]).unwrap();
+        let widened = serde_json::to_string(
+            &vec![0.1f32, 0.25, -1.5]
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<f64>>(),
+        )
+        .unwrap();
+        assert!(as_f32.len() < widened.len(), "{as_f32} vs {widened}");
     }
 }
 
