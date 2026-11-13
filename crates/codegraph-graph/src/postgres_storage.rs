@@ -587,9 +587,10 @@ const NODE_IDENTITIES_SQL: &str = r#"
 SELECT id, name, COALESCE(file_path, '') FROM nodes WHERE project_id = $1 ORDER BY id
 "#;
 
-/// Edge endpoints for `plan verify`. Both ids are bare strings on this backend.
+/// Edge endpoints and kind for `plan verify` / `plan show`. Both ids are bare
+/// strings on this backend and `edge_type` is `NOT NULL`.
 const EDGE_ENDPOINTS_SQL: &str = r#"
-SELECT from_id, to_id FROM edges WHERE project_id = $1 ORDER BY id
+SELECT from_id, to_id, edge_type FROM edges WHERE project_id = $1 ORDER BY id
 "#;
 
 /// Node metadata for `plan show`. Postgres stores it as `jsonb`, so it decodes
@@ -2383,8 +2384,12 @@ impl crate::storage::IndexStorage for PgStore {
             .collect())
     }
 
-    /// Edge endpoints for `plan verify`; Postgres ids are already bare strings.
-    async fn edge_endpoints(&self, project_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+    /// Edge endpoints and kind for `plan verify` / `plan show`; Postgres ids are
+    /// already bare strings.
+    async fn edge_endpoints(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::storage::EdgeEndpoint>> {
         let client = self.pool.get().await.map_err(db_err)?;
         let rows = client
             .query(EDGE_ENDPOINTS_SQL, &[&project_id])
@@ -2392,7 +2397,11 @@ impl crate::storage::IndexStorage for PgStore {
             .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
+            .map(|row| crate::storage::EdgeEndpoint {
+                from: row.get(0),
+                to: row.get(1),
+                edge_type: row.get(2),
+            })
             .collect())
     }
 
@@ -4505,8 +4514,13 @@ mod tests {
             .expect("edge_endpoints");
         assert_eq!(
             endpoints,
-            vec![("pv_a".to_string(), "pv_b".to_string())],
-            "one endpoint pair, ids not prefixed"
+            vec![crate::storage::EdgeEndpoint {
+                from: "pv_a".to_string(),
+                to: "pv_b".to_string(),
+                // `edge_row` writes `DEFAULT_EDGE_TYPE`, which is `calls`.
+                edge_type: "calls".to_string(),
+            }],
+            "one edge with its kind; ids not prefixed and edge_type read, not defaulted"
         );
     }
 

@@ -7,12 +7,17 @@
 // (reachability, cycles, layering, degree) check that reasoning for consistency.
 use anyhow::{Context, Result, bail};
 use codegraph_core::{CodeNode, EdgeType, Location, NodeId, NodeType};
-use codegraph_graph::{CodeEdge, SurrealDbConfig, SurrealDbStorage};
+use codegraph_graph::CodeEdge;
+use codegraph_graph::storage::{
+    EdgeEndpoint, IndexStorage, NodeIdentityRow, ProjectMetadataRecord,
+};
+use codegraph_mcp::{StorageBackend, StorageMode, open_storage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum PlanAction {
@@ -225,12 +230,16 @@ fn default_plan_id(file: &str) -> String {
         .unwrap_or_else(|| "plan".to_string())
 }
 
-async fn connect_storage_at(project_root: &Path) -> Result<SurrealDbStorage> {
-    let config = SurrealDbConfig::for_project(project_root);
-    let connection = config.connection.clone();
-    SurrealDbStorage::new(config)
-        .await
-        .map_err(|error| anyhow::anyhow!("connect to SurrealDB at {connection}: {error}"))
+/// Open one storage handle for a `plan` subcommand.
+///
+/// The backend comes from `CODEGRAPH_BACKEND` (the same selector `codegraph index`
+/// uses); `mode` keeps read-only commands from issuing schema DDL.
+async fn connect_storage_at(
+    project_root: &Path,
+    mode: StorageMode,
+) -> Result<Arc<dyn IndexStorage>> {
+    let backend = StorageBackend::from_env()?;
+    open_storage(backend, project_root, mode).await
 }
 
 /// Resolve the project a `plan` command operates on.
@@ -261,64 +270,57 @@ fn resolve_project_root(project: Option<PathBuf>) -> Result<PathBuf> {
     Ok(if start.is_dir() { start } else { start_dir })
 }
 
-async fn count_plan_nodes(storage: &SurrealDbStorage, project: &str) -> Result<usize> {
-    let mut response = storage
-        .db()
-        .query("SELECT count() AS count FROM nodes WHERE project_id = $project GROUP ALL")
-        .bind(("project", project.to_string()))
+async fn count_plan_nodes(storage: &Arc<dyn IndexStorage>, project: &str) -> Result<usize> {
+    Ok(storage
+        .node_count(project)
         .await
-        .context("count plan nodes")?
-        .check()
-        .context("count plan nodes")?;
-    let rows: Vec<Value> = response.take(0).unwrap_or_default();
-    Ok(rows
-        .first()
-        .and_then(|row| row.get("count"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize)
+        .context("count plan nodes")? as usize)
 }
 
 async fn write_plan_constraints(
-    storage: &SurrealDbStorage,
+    storage: &Arc<dyn IndexStorage>,
     project: &str,
     constraints: &[Constraint],
 ) -> Result<()> {
     let constraints = serde_json::to_value(constraints)?;
+    // The constraints live in `project_metadata.metadata.plan_constraints`, the same
+    // place `plan show` reads them from. The remaining fields are the record's type
+    // contract; a draft plan has no file/node/edge statistics of its own.
+    let record = ProjectMetadataRecord {
+        metadata: json!({ "plan_constraints": constraints }),
+        project_id: project.to_string(),
+        name: project.to_string(),
+        root_path: project.to_string(),
+        primary_language: None,
+        file_count: 0,
+        node_count: 0,
+        edge_count: 0,
+        avg_coverage_score: 0.0,
+        last_analyzed: chrono::Utc::now(),
+        codegraph_version: env!("CARGO_PKG_VERSION").to_string(),
+        organization_id: None,
+        domain: None,
+    };
     storage
-        .db()
-        .query(
-            "UPSERT project_metadata SET project_id = $project, name = $project, \
-             root_path = $project, metadata = { plan_constraints: $constraints } \
-             WHERE project_id = $project;",
-        )
-        .bind(("project", project.to_string()))
-        .bind(("constraints", constraints))
+        .upsert_project_metadata(record)
         .await
-        .context("write plan constraints")?
-        .check()
         .context("write plan constraints")?;
     Ok(())
 }
 
 async fn read_plan_constraints(
-    storage: &SurrealDbStorage,
+    storage: &Arc<dyn IndexStorage>,
     project: &str,
 ) -> Result<Vec<Constraint>> {
-    let mut response = storage
-        .db()
-        .query(
-            "SELECT metadata.plan_constraints AS constraints FROM project_metadata \
-             WHERE project_id = $project LIMIT 1;",
-        )
-        .bind(("project", project.to_string()))
+    let Some(metadata) = storage
+        .project_metadata_value(project)
         .await
         .context("read plan constraints")?
-        .check()
-        .context("read plan constraints")?;
-    let rows: Vec<Value> = response.take(0).unwrap_or_default();
-    let Some(value) = rows
-        .first()
-        .and_then(|row| row.get("constraints"))
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(value) = metadata
+        .get("plan_constraints")
         .filter(|value| !value.is_null())
         .cloned()
     else {
@@ -338,14 +340,14 @@ async fn store(
     let project = draft_project_id(&plan_id);
 
     let root = resolve_project_root(project_path)?;
-    let mut storage = connect_storage_at(&root).await?;
+    let storage = connect_storage_at(&root, StorageMode::ReadWrite).await?;
     let existing = count_plan_nodes(&storage, &project).await?;
     if existing > 0 {
         if !force {
             bail!("plan '{plan_id}' already stored ({existing} nodes); pass --force to replace it");
         }
         storage
-            .clean_project_data(&project)
+            .delete_project(&project)
             .await
             .map_err(|error| anyhow::anyhow!("clear existing plan '{plan_id}': {error}"))?;
     }
@@ -387,7 +389,7 @@ async fn store(
         nodes.push(node);
     }
     storage
-        .upsert_nodes_batch(&nodes)
+        .upsert_nodes(&nodes)
         .await
         .map_err(|error| anyhow::anyhow!("write plan nodes: {error}"))?;
 
@@ -403,7 +405,7 @@ async fn store(
         edges.push(CodeEdge::new(from, to, edge_type).with_project_id(project.clone()));
     }
     storage
-        .upsert_edges_batch(&edges)
+        .upsert_edges(&edges)
         .await
         .map_err(|error| anyhow::anyhow!("write plan edges: {error}"))?;
     write_plan_constraints(&storage, &project, &doc.constraints).await?;
@@ -426,7 +428,7 @@ async fn store(
 async fn show(plan_id: &str, format: PlanFormat, project_path: Option<PathBuf>) -> Result<()> {
     let project = draft_project_id(plan_id);
     let root = resolve_project_root(project_path)?;
-    let storage = connect_storage_at(&root).await?;
+    let storage = connect_storage_at(&root, StorageMode::ReadOnly).await?;
     if count_plan_nodes(&storage, &project).await? == 0 {
         bail!(
             "plan '{plan_id}' is not stored; run `codegraph plan store <file> --plan-id {plan_id}` first"
@@ -435,80 +437,41 @@ async fn show(plan_id: &str, format: PlanFormat, project_path: Option<PathBuf>) 
 
     let constraints = read_plan_constraints(&storage, &project).await?;
 
-    let mut node_response = storage
-        .db()
-        .query("SELECT <string>id AS rid, name, metadata FROM nodes WHERE project_id = $project")
-        .bind(("project", project.clone()))
+    // `nodes_with_metadata` already decodes the backend representation: SurrealDB
+    // stores a compressed JSON string, Postgres a `jsonb` value.
+    let node_rows = storage
+        .nodes_with_metadata(&project)
         .await
-        .context("read plan nodes")?
-        .check()
         .context("read plan nodes")?;
-    let node_rows: Vec<Value> = node_response.take(0).unwrap_or_default();
 
     let mut name_by_record = HashMap::new();
     let mut nodes = Vec::with_capacity(node_rows.len());
     for row in node_rows {
-        let record = row.get("rid").and_then(Value::as_str).unwrap_or_default();
-        let name = row
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let metadata = row
-            .get("metadata")
-            .and_then(Value::as_str)
-            .and_then(|encoded| codegraph_core::decompress_json(encoded).ok());
-        let layer = metadata
+        let layer = row
+            .metadata
             .as_ref()
             .and_then(|metadata| metadata.get("layer"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let kind = metadata
+        let kind = row
+            .metadata
             .as_ref()
             .and_then(|metadata| metadata.get("draft_kind"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        name_by_record.insert(record.to_string(), name.clone());
+        name_by_record.insert(row.id, row.name.clone());
         nodes.push(PlanNode {
-            id: name,
+            id: row.name,
             layer,
             kind,
         });
     }
 
-    let mut edge_response = storage
-        .db()
-        .query(
-            "SELECT <string>from AS from_id, <string>to AS to_id, edge_type FROM edges WHERE project_id = $project",
-        )
-        .bind(("project", project))
+    let edge_rows = storage
+        .edge_endpoints(&project)
         .await
-        .context("read plan edges")?
-        .check()
         .context("read plan edges")?;
-    let edge_rows: Vec<Value> = edge_response.take(0).unwrap_or_default();
-
-    let mut edges = Vec::new();
-    for row in edge_rows {
-        let from_id = row
-            .get("from_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let to_id = row.get("to_id").and_then(Value::as_str).unwrap_or_default();
-        let (Some(from), Some(to)) = (name_by_record.get(from_id), name_by_record.get(to_id))
-        else {
-            continue;
-        };
-        edges.push(PlanEdge {
-            from: from.clone(),
-            to: to.clone(),
-            kind: row
-                .get("edge_type")
-                .and_then(Value::as_str)
-                .unwrap_or("references")
-                .to_string(),
-        });
-    }
+    let edges = plan_edges_from_rows(&edge_rows, &name_by_record);
 
     // Constraints are persisted next to the draft graph in `project_metadata`.
     let doc = PlanDoc {
@@ -546,13 +509,13 @@ async fn show(plan_id: &str, format: PlanFormat, project_path: Option<PathBuf>) 
 async fn drop_plan(plan_id: &str, project_path: Option<PathBuf>) -> Result<()> {
     let project = draft_project_id(plan_id);
     let root = resolve_project_root(project_path)?;
-    let storage = connect_storage_at(&root).await?;
+    let storage = connect_storage_at(&root, StorageMode::ReadWrite).await?;
     let nodes = count_plan_nodes(&storage, &project).await?;
     if nodes == 0 {
         bail!("plan '{plan_id}' is not stored");
     }
     storage
-        .clean_project_data(&project)
+        .delete_project(&project)
         .await
         .map_err(|error| anyhow::anyhow!("delete plan '{plan_id}': {error}"))?;
     println!(
@@ -589,71 +552,80 @@ struct CodeComparison {
     unplanned_code_edges: Vec<(String, String)>,
 }
 
-async fn load_code_index(storage: &SurrealDbStorage, project: &str) -> Result<CodeIndex> {
-    let mut node_response = storage
-        .db()
-        .query("SELECT <string> id AS id, name, file_path FROM nodes WHERE project_id = $project;")
-        .bind(("project", project.to_string()))
-        .await
-        .context("read code nodes")?
-        .check()
-        .context("read code nodes")?;
-    let node_rows: Vec<Value> = node_response.take(0).unwrap_or_default();
-
-    let mut id_to_name: HashMap<String, String> = HashMap::new();
-    let mut index = CodeIndex::default();
-    for row in node_rows {
-        let Some(id) = row.get("id").and_then(Value::as_str) else {
+/// Map stored edge rows onto the plan's `from`/`to`/`kind` triple.
+///
+/// The `kind` is the stored `edge_type`, so `plan show` round-trips exactly what
+/// `plan store` wrote (including an explicit `"type"` from the plan file). An edge
+/// whose endpoint is not a stored plan node is skipped, matching the SurrealQL this
+/// replaced.
+fn plan_edges_from_rows(
+    edges: &[EdgeEndpoint],
+    name_by_record: &HashMap<String, String>,
+) -> Vec<PlanEdge> {
+    let mut plan_edges = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let (Some(from), Some(to)) = (name_by_record.get(&edge.from), name_by_record.get(&edge.to))
+        else {
             continue;
         };
-        let name = row
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if name.is_empty() {
+        plan_edges.push(PlanEdge {
+            from: from.clone(),
+            to: to.clone(),
+            kind: edge.edge_type.clone(),
+        });
+    }
+    plan_edges
+}
+
+/// Project `(id, name, file_path)` rows plus `(from_id, to_id)` endpoints into the
+/// comparison view `plan verify` uses.
+///
+/// Kept pure so the mapping is testable without a live store. Its contract mirrors
+/// the SurrealQL this replaced:
+///
+/// - a node with an empty name is skipped and does not count towards `nodes`;
+/// - same-name nodes append their file, so one name can list several files;
+/// - an edge whose endpoint is not a known node id is skipped, but every edge is
+///   still counted in `edge_count`.
+fn index_from_rows(nodes: &[NodeIdentityRow], edges: &[EdgeEndpoint]) -> CodeIndex {
+    let mut id_to_name: HashMap<String, String> = HashMap::new();
+    let mut index = CodeIndex::default();
+    for row in nodes {
+        if row.name.is_empty() {
             continue;
         }
-        let file = row
-            .get("file_path")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        id_to_name.insert(id.to_string(), name.clone());
-        index.names.entry(name).or_default().push(file);
+        id_to_name.insert(row.id.clone(), row.name.clone());
+        index
+            .names
+            .entry(row.name.clone())
+            .or_default()
+            .push(row.file_path.clone());
         index.nodes += 1;
     }
 
-    let mut edge_response = storage
-        .db()
-        .query(
-            "SELECT <string> from AS from_id, <string> to AS to_id FROM edges \
-             WHERE project_id = $project;",
-        )
-        .bind(("project", project.to_string()))
-        .await
-        .context("read code edges")?
-        .check()
-        .context("read code edges")?;
-    let edge_rows: Vec<Value> = edge_response.take(0).unwrap_or_default();
-
     let mut pairs = Vec::new();
-    for row in edge_rows {
+    for edge in edges {
         index.edge_count += 1;
-        let from = row
-            .get("from_id")
-            .and_then(Value::as_str)
-            .and_then(|id| id_to_name.get(id));
-        let to = row
-            .get("to_id")
-            .and_then(Value::as_str)
-            .and_then(|id| id_to_name.get(id));
+        let from = id_to_name.get(&edge.from);
+        let to = id_to_name.get(&edge.to);
         if let (Some(from), Some(to)) = (from, to) {
             pairs.push((from.clone(), to.clone()));
         }
     }
     index.edges.extend(pairs);
-    Ok(index)
+    index
+}
+
+async fn load_code_index(storage: &Arc<dyn IndexStorage>, project: &str) -> Result<CodeIndex> {
+    let nodes = storage
+        .node_identities(project)
+        .await
+        .context("read code nodes")?;
+    let edges = storage
+        .edge_endpoints(project)
+        .await
+        .context("read code edges")?;
+    Ok(index_from_rows(&nodes, &edges))
 }
 
 fn compare_with_code(doc: &PlanDoc, code: &CodeIndex) -> CodeComparison {
@@ -755,7 +727,7 @@ async fn verify(file: &str, project: Option<PathBuf>, format: PlanFormat) -> Res
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| root.display().to_string());
 
-    let storage = connect_storage_at(&root).await?;
+    let storage = connect_storage_at(&root, StorageMode::ReadOnly).await?;
     let code = load_code_index(&storage, &project_id).await?;
     let comparison = compare_with_code(&doc, &code);
 
@@ -1348,6 +1320,116 @@ mod tests {
         assert!(
             comparison.unplanned_code_edges.is_empty(),
             "a planned edge is not an unplanned one"
+        );
+    }
+
+    fn identity(id: &str, name: &str, file: &str) -> NodeIdentityRow {
+        NodeIdentityRow {
+            id: id.to_string(),
+            name: name.to_string(),
+            file_path: file.to_string(),
+            metadata: None,
+        }
+    }
+
+    fn endpoint(from: &str, to: &str, edge_type: &str) -> EdgeEndpoint {
+        EdgeEndpoint {
+            from: from.to_string(),
+            to: to.to_string(),
+            edge_type: edge_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn load_code_index_shape_matches_the_surreal_contract() {
+        let nodes = vec![
+            identity("n1", "shared", "src/a.rs"),
+            identity("n2", "shared", "src/b.rs"),
+            identity("n3", "", "src/empty.rs"),
+            identity("n4", "only", "src/c.rs"),
+        ];
+        let edges = vec![
+            endpoint("n1", "n2", "calls"),
+            endpoint("n1", "ghost", "calls"),
+            endpoint("n4", "n1", "calls"),
+        ];
+
+        let index = index_from_rows(&nodes, &edges);
+
+        assert_eq!(
+            index.nodes, 3,
+            "a node without a name is skipped and does not count"
+        );
+        assert_eq!(
+            index.names.get("shared"),
+            Some(&vec!["src/a.rs".to_string(), "src/b.rs".to_string()]),
+            "one name in two files keeps both paths"
+        );
+        assert_eq!(
+            index.names.get(""),
+            None,
+            "an empty name never enters the index"
+        );
+        assert_eq!(
+            index.edge_count, 3,
+            "every edge counts, including one with an unknown endpoint"
+        );
+        assert_eq!(
+            index.edges.len(),
+            2,
+            "an edge whose endpoint is unknown is dropped"
+        );
+        assert!(
+            index
+                .edges
+                .contains(&("shared".to_string(), "shared".to_string()))
+        );
+        assert!(
+            index
+                .edges
+                .contains(&("only".to_string(), "shared".to_string()))
+        );
+    }
+
+    #[test]
+    fn plan_show_round_trips_edge_kind() {
+        let rows = vec![
+            identity("n1", "entry", "plan.yaml"),
+            identity("n2", "store", "plan.yaml"),
+            identity("n3", "orphan", "plan.yaml"),
+        ];
+        let mut name_by_record = HashMap::new();
+        for row in &rows {
+            name_by_record.insert(row.id.clone(), row.name.clone());
+        }
+
+        let endpoints = vec![
+            endpoint("n1", "n2", "depends"),
+            endpoint("n1", "missing", "depends"),
+            endpoint("n3", "n1", "calls"),
+        ];
+        let edges = plan_edges_from_rows(&endpoints, &name_by_record);
+        assert_eq!(
+            edges.len(),
+            2,
+            "an edge with an unknown endpoint never reaches the plan"
+        );
+
+        let doc = PlanDoc {
+            nodes: vec![node("entry"), node("store"), node("orphan")],
+            edges,
+            constraints: Vec::new(),
+        };
+        let json = serde_json::to_value(&doc).expect("serialize plan");
+        assert_eq!(json["edges"][0]["from"], "entry");
+        assert_eq!(json["edges"][0]["to"], "store");
+        assert_eq!(
+            json["edges"][0]["type"], "depends",
+            "the stored kind survives `plan show`, including the default `depends`"
+        );
+        assert_eq!(
+            json["edges"][1]["type"], "calls",
+            "an explicit kind is preserved verbatim"
         );
     }
 }

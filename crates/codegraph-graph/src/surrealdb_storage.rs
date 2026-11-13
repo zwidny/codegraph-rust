@@ -6,7 +6,7 @@ use crate::graph_types::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use codegraph_core::{CodeGraphError, CodeNode, GraphStore, NodeId, Result};
+use codegraph_core::{CodeGraphError, CodeNode, EdgeType, GraphStore, NodeId, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -3298,12 +3298,15 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
             .collect())
     }
 
-    /// Every edge's endpoints, decoded from their `nodes:` record form.
-    async fn edge_endpoints(&self, project_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+    /// Every edge's endpoints and kind, decoded from their `nodes:` record form.
+    async fn edge_endpoints(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::storage::EdgeEndpoint>> {
         let mut response = self
             .db
             .query(
-                "SELECT <string> from AS from_id, <string> to AS to_id FROM edges \
+                "SELECT <string> from AS from_id, <string> to AS to_id, edge_type FROM edges \
                  WHERE project_id = $project;",
             )
             .bind(("project", project_id.to_string()))
@@ -3319,11 +3322,13 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
         // against `node_identities` ids, which are decoded, so strip the prefix.
         Ok(rows
             .into_iter()
-            .map(|row| {
-                (
-                    decode_node_id(&json_string(&row, "from_id")).to_string(),
-                    decode_node_id(&json_string(&row, "to_id")).to_string(),
-                )
+            .map(|row| crate::storage::EdgeEndpoint {
+                from: decode_node_id(&json_string(&row, "from_id")).to_string(),
+                to: decode_node_id(&json_string(&row, "to_id")).to_string(),
+                // `edge_type` is part of the schema; this fallback only covers a
+                // legacy row written before the column existed, not the normal path.
+                edge_type: json_optional_string(&row, "edge_type")
+                    .unwrap_or_else(|| EdgeType::References.to_string()),
             })
             .collect())
     }

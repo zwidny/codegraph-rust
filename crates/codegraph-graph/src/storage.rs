@@ -288,7 +288,7 @@ pub struct SymbolInProject {
 }
 
 /// One node matched by a name lookup, as `codegraph query` reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SymbolMatch {
     pub name: String,
     pub node_type: Option<String>,
@@ -299,7 +299,7 @@ pub struct SymbolMatch {
 }
 
 /// One caller or callee edge, projected for `codegraph query --callers/--callees`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CallRelation {
     pub symbol: String,
     pub node_type: Option<String>,
@@ -310,7 +310,7 @@ pub struct CallRelation {
 }
 
 /// Node identity used by `codegraph plan verify` and `plan show`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeIdentityRow {
     pub id: String,
     pub name: String,
@@ -318,6 +318,14 @@ pub struct NodeIdentityRow {
     /// Already decoded: SurrealDB stores a compressed JSON string, Postgres a
     /// `jsonb` value. `None` when the node has no metadata.
     pub metadata: Option<serde_json::Value>,
+}
+
+/// One edge's endpoints plus its relationship kind, for `plan show`/`verify`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeEndpoint {
+    pub from: String,
+    pub to: String,
+    pub edge_type: String,
 }
 
 /// Ceiling every name/edge lookup applies to its caller-supplied `limit`.
@@ -676,8 +684,9 @@ pub trait IndexStorage: Send + Sync {
     /// Every node's id, name and file path, for `plan verify`.
     async fn node_identities(&self, project_id: &str) -> Result<Vec<NodeIdentityRow>>;
 
-    /// Every edge's endpoints, for `plan verify`.
-    async fn edge_endpoints(&self, project_id: &str) -> Result<Vec<(String, String)>>;
+    /// Every edge's endpoints and kind, for `plan verify` (which only needs the
+    /// pair) and `plan show` (which round-trips the kind).
+    async fn edge_endpoints(&self, project_id: &str) -> Result<Vec<EdgeEndpoint>>;
 
     /// Every node's id, name and decoded metadata, for `plan show`.
     async fn nodes_with_metadata(&self, project_id: &str) -> Result<Vec<NodeIdentityRow>>;
