@@ -110,6 +110,23 @@ pub struct EdgeRow {
     pub edge_type: String,
 }
 
+/// One row of the `file_metadata` table.
+///
+/// `last_indexed_at` is deliberately absent: it is stamped by SQL `now()` on every
+/// upsert, so a caller cannot rewind or forge the indexing timestamp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileMetadataRow {
+    pub project_id: String,
+    pub file_path: String,
+    pub content_hash: String,
+    pub modified_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub file_size: Option<i64>,
+    pub node_count: i32,
+    pub edge_count: i32,
+    pub language: Option<String>,
+    pub parse_errors: Option<String>,
+}
+
 /// One fused node hit produced by [`PgStore::hybrid_nodes`].
 ///
 /// `rrf` is the Reciprocal Rank Fusion score, `vector_rank`/`text_rank` are the
@@ -131,10 +148,12 @@ pub struct ReconcileStats {
     pub stale_edges: u64,
     pub stale_chunks: u64,
     pub stale_symbols: u64,
+    /// Metadata rows removed because their file disappeared from the project.
+    pub stale_files: u64,
 }
 
-/// DDL for the chunk, edge, node and symbol-embedding tables. Every statement is
-/// idempotent.
+/// DDL for the chunk, edge, node, symbol-embedding and file-metadata tables. Every
+/// statement is idempotent.
 pub const SCHEMA_DDL: &str = r#"
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -208,6 +227,21 @@ CREATE INDEX IF NOT EXISTS sym_project ON symbol_embeddings(project_id);
 CREATE INDEX IF NOT EXISTS sym_project_norm ON symbol_embeddings(project_id, normalized_symbol);
 CREATE INDEX IF NOT EXISTS sym_node ON symbol_embeddings(node_id);
 CREATE INDEX IF NOT EXISTS sym_hnsw ON symbol_embeddings USING hnsw (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);
+
+CREATE TABLE IF NOT EXISTS file_metadata (
+  project_id      text NOT NULL,
+  file_path       text NOT NULL,
+  content_hash    text NOT NULL,
+  modified_at     timestamptz,
+  file_size       bigint,
+  last_indexed_at timestamptz DEFAULT now(),
+  node_count      integer DEFAULT 0,
+  edge_count      integer DEFAULT 0,
+  language        text,
+  parse_errors    text,
+  PRIMARY KEY (project_id, file_path)
+);
+CREATE INDEX IF NOT EXISTS file_metadata_project ON file_metadata(project_id);
 "#;
 
 /// Staging table for `COPY`. The embedding is carried as text so we never have to
@@ -372,6 +406,36 @@ DELETE FROM chunks
 
 const DELETE_STALE_NODES_SQL: &str = r#"
 DELETE FROM nodes WHERE project_id = $1 AND id = ANY($2)
+"#;
+
+/// `modified_at` travels as RFC 3339 text and is cast server-side, so the Postgres
+/// backend does not need `tokio-postgres`'s chrono feature for one column.
+const UPSERT_FILE_METADATA_SQL: &str = r#"
+INSERT INTO file_metadata (project_id, file_path, content_hash, modified_at,
+  file_size, node_count, edge_count, language, parse_errors, last_indexed_at)
+SELECT t.project_id, t.file_path, t.content_hash, t.modified_at_text::timestamptz,
+  t.file_size, t.node_count, t.edge_count, t.language, t.parse_errors, now()
+FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[],
+  $6::integer[], $7::integer[], $8::text[], $9::text[]) AS t(project_id, file_path,
+  content_hash, modified_at_text, file_size, node_count, edge_count, language,
+  parse_errors)
+ON CONFLICT (project_id, file_path) DO UPDATE SET
+  content_hash = EXCLUDED.content_hash,
+  modified_at = EXCLUDED.modified_at,
+  file_size = EXCLUDED.file_size,
+  node_count = EXCLUDED.node_count,
+  edge_count = EXCLUDED.edge_count,
+  language = EXCLUDED.language,
+  parse_errors = EXCLUDED.parse_errors,
+  last_indexed_at = now()
+"#;
+
+const FILE_HASHES_SQL: &str = r#"
+SELECT file_path, content_hash FROM file_metadata WHERE project_id = $1
+"#;
+
+const DELETE_FILES_SQL: &str = r#"
+DELETE FROM file_metadata WHERE project_id = $1 AND file_path = ANY($2)
 "#;
 
 const KNN_SQL: &str = r#"
@@ -658,6 +722,24 @@ fn compute_stale_nodes(
     }
 
     stale
+}
+
+/// Files present in the store but absent from this run's scan.
+///
+/// `file_metadata` is keyed by `(project_id, file_path)`, so a vanished file has no
+/// fresh node list to diff against; the key set difference is the whole answer. The
+/// output is sorted so callers (and tests) see a deterministic list.
+fn compute_vanished_files(
+    existing_by_file: &BTreeMap<String, Vec<String>>,
+    fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut vanished: Vec<String> = existing_by_file
+        .keys()
+        .filter(|file| !fresh_nodes_by_file.contains_key(*file))
+        .cloned()
+        .collect();
+    vanished.sort();
+    vanished
 }
 
 /// Edge ids that are stale because a scanned endpoint no longer re-emits them.
@@ -1181,6 +1263,91 @@ impl PgStore {
         Ok(merged)
     }
 
+    /// Insert or update file metadata, keyed by `(project_id, file_path)`.
+    ///
+    /// `last_indexed_at` is stamped with SQL `now()` on insert and update; the row
+    /// struct intentionally carries no client-side value for it. Inputs larger than
+    /// [`UPSERT_BATCH_SIZE`] are split into independent statements. A single
+    /// parameterised statement is enough because the row is small (no embedding) and
+    /// a full re-index of a 10k-file project is still only ~20 statements.
+    pub async fn upsert_file_metadata(&self, rows: &[FileMetadataRow]) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let client = self.pool.get().await.map_err(db_err)?;
+        let mut merged = 0u64;
+        for batch in rows.chunks(UPSERT_BATCH_SIZE) {
+            let project_ids: Vec<&str> = batch.iter().map(|row| row.project_id.as_str()).collect();
+            let file_paths: Vec<&str> = batch.iter().map(|row| row.file_path.as_str()).collect();
+            let content_hashes: Vec<&str> =
+                batch.iter().map(|row| row.content_hash.as_str()).collect();
+            let modified_at: Vec<Option<String>> = batch
+                .iter()
+                .map(|row| row.modified_at.map(|ts| ts.to_rfc3339()))
+                .collect();
+            let file_sizes: Vec<Option<i64>> = batch.iter().map(|row| row.file_size).collect();
+            let node_counts: Vec<i32> = batch.iter().map(|row| row.node_count).collect();
+            let edge_counts: Vec<i32> = batch.iter().map(|row| row.edge_count).collect();
+            let languages: Vec<Option<&str>> =
+                batch.iter().map(|row| row.language.as_deref()).collect();
+            let parse_errors: Vec<Option<&str>> = batch
+                .iter()
+                .map(|row| row.parse_errors.as_deref())
+                .collect();
+
+            merged += client
+                .execute(
+                    UPSERT_FILE_METADATA_SQL,
+                    &[
+                        &project_ids,
+                        &file_paths,
+                        &content_hashes,
+                        &modified_at,
+                        &file_sizes,
+                        &node_counts,
+                        &edge_counts,
+                        &languages,
+                        &parse_errors,
+                    ],
+                )
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(merged)
+    }
+
+    /// Map `file_path -> content_hash` for one project, for the incremental "did this
+    /// file change" check.
+    pub async fn file_hashes(&self, project_id: &str) -> Result<HashMap<String, String>> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(FILE_HASHES_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect())
+    }
+
+    /// Delete metadata rows for paths that no longer exist in the project.
+    ///
+    /// `paths` is not treated as authoritative when empty: an empty slice deletes
+    /// nothing and returns `Ok(0)`.
+    pub async fn delete_files(&self, project_id: &str, paths: &[String]) -> Result<u64> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+
+        let client = self.pool.get().await.map_err(db_err)?;
+        let deleted = client
+            .execute(DELETE_FILES_SQL, &[&project_id, &paths])
+            .await
+            .map_err(db_err)?;
+        Ok(deleted)
+    }
+
     /// Remove catalog rows that this run did not re-emit, for the whole project.
     ///
     /// Mirrors `SurrealDbStorage::reconcile_catalog_by_file` without its per-file
@@ -1194,7 +1361,8 @@ impl PgStore {
     ///   a scanned file;
     /// * chunks: owned by stale nodes, plus chunks of surviving nodes whose ids are
     ///   absent from `fresh_chunk_ids`;
-    /// * symbol embeddings: owned by stale nodes.
+    /// * symbol embeddings: owned by stale nodes;
+    /// * file metadata: rows whose file disappeared from the project entirely.
     ///
     /// Both `fresh_edge_ids` and `fresh_chunk_ids` are treated as authoritative only
     /// when non-empty: an empty set carries no information, so the corresponding diff
@@ -1253,7 +1421,14 @@ impl PgStore {
         let fresh_node_ids: Vec<String> = fresh_nodes_by_file.values().flatten().cloned().collect();
         let has_unreemitted_chunk_pass = !fresh_chunk_ids.is_empty() && !fresh_node_ids.is_empty();
 
-        if stale_nodes.is_empty() && stale_edges.is_empty() && !has_unreemitted_chunk_pass {
+        // Step 5: files whose metadata must go because they no longer exist.
+        let vanished_files = compute_vanished_files(&existing_by_file, fresh_nodes_by_file);
+
+        if stale_nodes.is_empty()
+            && stale_edges.is_empty()
+            && !has_unreemitted_chunk_pass
+            && vanished_files.is_empty()
+        {
             return Ok(ReconcileStats::default());
         }
 
@@ -1289,6 +1464,12 @@ impl PgStore {
             .execute(DELETE_STALE_NODES_SQL, &[&project_id, &stale_nodes])
             .await
             .map_err(db_err)?;
+        if !vanished_files.is_empty() {
+            stats.stale_files = transaction
+                .execute(DELETE_FILES_SQL, &[&project_id, &vanished_files])
+                .await
+                .map_err(db_err)?;
+        }
 
         transaction.commit().await.map_err(db_err)?;
         Ok(stats)
@@ -1336,12 +1517,12 @@ mod tests {
             }
         }
         assert_eq!(
-            table_count, 4,
-            "expected chunks + edges + nodes + symbol_embeddings tables"
+            table_count, 5,
+            "expected chunks + edges + nodes + symbol_embeddings + file_metadata tables"
         );
         assert_eq!(
-            index_count, 16,
-            "expected 16 chunks/edges/nodes/symbol indexes"
+            index_count, 17,
+            "expected 17 chunks/edges/nodes/symbol/file_metadata indexes"
         );
     }
 
@@ -1411,6 +1592,26 @@ mod tests {
             stale,
             vec!["a2".to_string(), "b1".to_string()],
             "a shrunk file keeps only its re-emitted ids; a vanished file loses all of them"
+        );
+    }
+
+    #[test]
+    fn vanished_files_is_difference_of_keys() {
+        let existing = fresh_map(&[("a.rs", &["a1"]), ("b.rs", &["b1"]), ("c.rs", &["c1"])]);
+        let fresh = fresh_map(&[("a.rs", &["a1"]), ("c.rs", &["c1"])]);
+
+        assert_eq!(
+            compute_vanished_files(&existing, &fresh),
+            vec!["b.rs".to_string()],
+            "only files missing from the fresh scan are vanished"
+        );
+    }
+
+    #[test]
+    fn file_metadata_ddl_uses_composite_key() {
+        assert!(
+            SCHEMA_DDL.contains("PRIMARY KEY (project_id, file_path)"),
+            "file_metadata must be keyed per project: paths repeat across projects"
         );
     }
 
@@ -2121,6 +2322,132 @@ mod tests {
             .map(|row| row.get(0))
             .collect();
         assert_eq!(symbol_ids, vec!["recon_sym_kept".to_string()]);
+    }
+
+    // ---- File metadata ----
+
+    fn file_meta(project: &str, path: &str, hash: &str) -> FileMetadataRow {
+        FileMetadataRow {
+            project_id: project.to_string(),
+            file_path: path.to_string(),
+            content_hash: hash.to_string(),
+            modified_at: None,
+            file_size: Some(42),
+            node_count: 1,
+            edge_count: 0,
+            language: Some("rust".to_string()),
+            parse_errors: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn file_metadata_upsert_and_hashes() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("file_meta");
+        store
+            .upsert_file_metadata(&[
+                file_meta(&project, "src/a.rs", "hash_a1"),
+                file_meta(&project, "src/b.rs", "hash_b1"),
+            ])
+            .await
+            .expect("first upsert");
+
+        let hashes = store.file_hashes(&project).await.expect("file_hashes");
+        assert_eq!(hashes.len(), 2, "both metadata rows are visible");
+        assert_eq!(hashes.get("src/a.rs").map(String::as_str), Some("hash_a1"));
+        assert_eq!(hashes.get("src/b.rs").map(String::as_str), Some("hash_b1"));
+
+        store
+            .upsert_file_metadata(&[file_meta(&project, "src/a.rs", "hash_a2")])
+            .await
+            .expect("second upsert");
+
+        let hashes = store.file_hashes(&project).await.expect("file_hashes");
+        assert_eq!(hashes.len(), 2, "re-upsert must not duplicate rows");
+        assert_eq!(hashes.get("src/a.rs").map(String::as_str), Some("hash_a2"));
+
+        let client = store.pool.get().await.expect("pool get");
+        let count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM file_metadata WHERE project_id = $1",
+                &[&project],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn delete_files_removes_only_given_paths() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("file_delete");
+        store
+            .upsert_file_metadata(&[
+                file_meta(&project, "src/a.rs", "hash_a"),
+                file_meta(&project, "src/b.rs", "hash_b"),
+                file_meta(&project, "src/c.rs", "hash_c"),
+            ])
+            .await
+            .expect("upsert");
+
+        let deleted = store
+            .delete_files(&project, &["src/b.rs".to_string()])
+            .await
+            .expect("delete_files");
+        assert_eq!(deleted, 1);
+
+        let hashes = store.file_hashes(&project).await.expect("file_hashes");
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains_key("src/a.rs"));
+        assert!(hashes.contains_key("src/c.rs"));
+        assert!(!hashes.contains_key("src/b.rs"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn reconcile_removes_metadata_for_vanished_files() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("recon_files");
+        store
+            .upsert_nodes(&[
+                node_in("recon_file_a", &project, "src/a.rs"),
+                node_in("recon_file_b", &project, "src/b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_file_metadata(&[
+                file_meta(&project, "src/a.rs", "hash_a"),
+                file_meta(&project, "src/b.rs", "hash_b"),
+            ])
+            .await
+            .expect("upsert metadata");
+
+        let fresh = fresh_map(&[("src/a.rs", &["recon_file_a"])]);
+        let stats = store
+            .reconcile(&project, &fresh, &BTreeSet::new(), &BTreeSet::new())
+            .await
+            .expect("reconcile");
+
+        assert_eq!(stats.stale_files, 1, "b.rs disappeared from the scan");
+        let hashes = store.file_hashes(&project).await.expect("file_hashes");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes.get("src/a.rs").map(String::as_str), Some("hash_a"));
     }
 
     // ---- Node retrieval: integration tests ----
