@@ -107,6 +107,10 @@ struct TraceMetrics {
     inflight: AtomicUsize,
     inflight_max: AtomicUsize,
     exec_total_us: AtomicU64,
+    /// Time spent inside `encoded_size` while building batches (client CPU).
+    serialize_us: AtomicU64,
+    /// Number of rows passed through `encoded_size`.
+    serialize_rows: AtomicU64,
     started_at: std::sync::Mutex<Option<Instant>>,
 }
 
@@ -177,6 +181,17 @@ impl TraceMetrics {
                 percentile_us(&mut samples, 0.95),
             ));
         }
+        let ser_us = self.serialize_us.load(Ordering::Relaxed);
+        let ser_rows = self.serialize_rows.load(Ordering::Relaxed);
+        let per_row = if ser_rows == 0 { 0 } else { ser_us / ser_rows };
+        out.push_str(&format!(
+            "\n  encode_size total_us={ser_us} rows={ser_rows} per_row_us={per_row} share={:.1}%",
+            if wall_us == 0 {
+                0.0
+            } else {
+                ser_us as f64 * 100.0 / wall_us as f64
+            }
+        ));
         out
     }
 }
@@ -425,7 +440,15 @@ impl SurrealWriterHandle {
         let mut bytes = 2usize;
         for row in rows {
             // Count encoded bytes without allocating another serialized batch.
+            let serialize_started = Instant::now();
             let size = encoded_size(&row)? + 1;
+            if let Some(trace) = &self.trace {
+                trace.serialize_us.fetch_add(
+                    serialize_started.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
+                trace.serialize_rows.fetch_add(1, Ordering::Relaxed);
+            }
             if size + 2 > self.limits.bytes {
                 return Err(anyhow!(
                     "One graph record needs {} bytes; increase CODEGRAPH_DB_BATCH_BYTES (current {})",
