@@ -3,10 +3,11 @@
 
 //! Offline proof-of-concept storage layer for Postgres + pgvector.
 //!
-//! This module intentionally implements only the three operations the migration
-//! evaluation measured (chunk upsert via `COPY`, KNN search and recursive reverse
-//! dependency walks) plus the DDL they need. It is not wired into the indexing
-//! pipeline; see `docs/BACKEND_EVALUATION.md` for the measurements motivating it.
+//! This module implements the operations the migration evaluation measured (chunk
+//! upsert via `COPY`, KNN search and recursive reverse dependency walks), the node
+//! and symbol-embedding tables they ingest into, and the DDL all of them need. It is
+//! not wired into the indexing pipeline; see `docs/BACKEND_EVALUATION.md` for the
+//! measurements motivating it.
 
 use codegraph_core::{CodeGraphError, Result};
 use deadpool_postgres::Pool;
@@ -25,7 +26,41 @@ pub struct ChunkRow {
     pub embedding_model: String,
 }
 
-/// DDL for the chunk and edge tables. Every statement is idempotent.
+/// One row of the `symbol_embeddings` table.
+#[derive(Debug, Clone)]
+pub struct SymbolEmbeddingRow {
+    pub id: String,
+    pub project_id: String,
+    pub symbol: String,
+    pub normalized_symbol: String,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
+    pub node_id: Option<String>,
+    pub source_edge_id: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// One row of the `nodes` table.
+#[derive(Debug, Clone)]
+pub struct NodeRow {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub node_type: Option<String>,
+    pub language: Option<String>,
+    pub file_path: Option<String>,
+    pub start_line: Option<i32>,
+    pub end_line: Option<i32>,
+    pub content: Option<String>,
+    pub complexity: Option<f64>,
+    pub chunk_count: Option<i32>,
+    pub embedding_model: Option<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// DDL for the chunk, edge, node and symbol-embedding tables. Every statement is
+/// idempotent.
 pub const SCHEMA_DDL: &str = r#"
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -52,6 +87,50 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS edges_from ON edges(project_id, edge_type, from_id);
 CREATE INDEX IF NOT EXISTS edges_to   ON edges(project_id, edge_type, to_id);
+
+CREATE TABLE IF NOT EXISTS nodes (
+  id              text PRIMARY KEY,
+  project_id      text,
+  name            text NOT NULL,
+  node_type       text,
+  language        text,
+  file_path       text,
+  start_line      integer,
+  end_line        integer,
+  content         text,
+  complexity      double precision,
+  chunk_count     integer,
+  embedding_model text,
+  embedding_1024  vector(1024),
+  metadata        jsonb,
+  created_at      timestamptz DEFAULT now(),
+  updated_at      timestamptz DEFAULT now(),
+  content_tsv     tsvector GENERATED ALWAYS AS (
+    to_tsvector('english', coalesce(name,'') || ' ' || coalesce(content,''))) STORED
+);
+CREATE INDEX IF NOT EXISTS nodes_project ON nodes(project_id);
+CREATE INDEX IF NOT EXISTS nodes_project_file ON nodes(project_id, file_path);
+CREATE INDEX IF NOT EXISTS nodes_project_name ON nodes(project_id, name);
+CREATE INDEX IF NOT EXISTS nodes_hnsw ON nodes USING hnsw (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);
+CREATE INDEX IF NOT EXISTS nodes_tsv ON nodes USING gin(content_tsv);
+
+CREATE TABLE IF NOT EXISTS symbol_embeddings (
+  id                text PRIMARY KEY,
+  project_id        text,
+  symbol            text NOT NULL,
+  normalized_symbol text NOT NULL,
+  embedding_1024    vector(1024),
+  embedding_model   text,
+  node_id           text,
+  source_edge_id    text,
+  metadata          jsonb,
+  access_count      integer DEFAULT 0,
+  created_at        timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS sym_project ON symbol_embeddings(project_id);
+CREATE INDEX IF NOT EXISTS sym_project_norm ON symbol_embeddings(project_id, normalized_symbol);
+CREATE INDEX IF NOT EXISTS sym_node ON symbol_embeddings(node_id);
+CREATE INDEX IF NOT EXISTS sym_hnsw ON symbol_embeddings USING hnsw (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);
 "#;
 
 /// Staging table for `COPY`. The embedding is carried as text so we never have to
@@ -81,6 +160,92 @@ ON CONFLICT (id) DO UPDATE SET
   embedding_model = EXCLUDED.embedding_model
 "#;
 
+/// Staging table for node upserts. Like the chunk staging table, the embedding and
+/// metadata are carried as text and cast during the merge.
+const NODES_STAGING_DDL: &str = r#"
+CREATE TEMP TABLE nodes_staging (
+  id text, project_id text, name text, node_type text, language text,
+  file_path text, start_line integer, end_line integer, content text,
+  complexity double precision, chunk_count integer, embedding_model text,
+  embedding text, metadata text
+) ON COMMIT DROP;
+"#;
+
+const COPY_NODES_INTO_STAGING: &str = r#"
+COPY nodes_staging (id, project_id, name, node_type, language, file_path,
+  start_line, end_line, content, complexity, chunk_count, embedding_model,
+  embedding, metadata)
+FROM STDIN BINARY
+"#;
+
+const MERGE_NODES_STAGING: &str = r#"
+INSERT INTO nodes (id, project_id, name, node_type, language, file_path,
+  start_line, end_line, content, complexity, chunk_count, embedding_model,
+  embedding_1024, metadata)
+SELECT id, project_id, name, node_type, language, file_path,
+  start_line, end_line, content, complexity, chunk_count, embedding_model,
+  embedding::vector, metadata::jsonb
+FROM nodes_staging
+ON CONFLICT (id) DO UPDATE SET
+  project_id = EXCLUDED.project_id,
+  name = EXCLUDED.name,
+  node_type = EXCLUDED.node_type,
+  language = EXCLUDED.language,
+  file_path = EXCLUDED.file_path,
+  start_line = EXCLUDED.start_line,
+  end_line = EXCLUDED.end_line,
+  content = EXCLUDED.content,
+  complexity = EXCLUDED.complexity,
+  chunk_count = EXCLUDED.chunk_count,
+  embedding_model = EXCLUDED.embedding_model,
+  embedding_1024 = EXCLUDED.embedding_1024,
+  metadata = EXCLUDED.metadata,
+  updated_at = now()
+"#;
+
+const SYMBOL_EMBEDDINGS_STAGING_DDL: &str = r#"
+CREATE TEMP TABLE symbol_embeddings_staging (
+  id text, project_id text, symbol text, normalized_symbol text,
+  embedding text, embedding_model text, node_id text, source_edge_id text,
+  metadata text
+) ON COMMIT DROP;
+"#;
+
+const COPY_SYMBOL_EMBEDDINGS_INTO_STAGING: &str = r#"
+COPY symbol_embeddings_staging (id, project_id, symbol, normalized_symbol,
+  embedding, embedding_model, node_id, source_edge_id, metadata)
+FROM STDIN BINARY
+"#;
+
+const MERGE_SYMBOL_EMBEDDINGS_STAGING: &str = r#"
+INSERT INTO symbol_embeddings (id, project_id, symbol, normalized_symbol,
+  embedding_1024, embedding_model, node_id, source_edge_id, metadata)
+SELECT id, project_id, symbol, normalized_symbol, embedding::vector,
+  embedding_model, node_id, source_edge_id, metadata::jsonb
+FROM symbol_embeddings_staging
+ON CONFLICT (id) DO UPDATE SET
+  project_id = EXCLUDED.project_id,
+  symbol = EXCLUDED.symbol,
+  normalized_symbol = EXCLUDED.normalized_symbol,
+  embedding_1024 = EXCLUDED.embedding_1024,
+  embedding_model = EXCLUDED.embedding_model,
+  node_id = EXCLUDED.node_id,
+  source_edge_id = EXCLUDED.source_edge_id,
+  metadata = EXCLUDED.metadata
+"#;
+
+const NODES_BY_IDS_SQL: &str = r#"
+SELECT id, project_id, name, node_type, language, file_path,
+       start_line, end_line, content, complexity, chunk_count, embedding_model,
+       embedding_1024::text, metadata::text
+FROM nodes
+WHERE project_id = $1 AND id = ANY($2)
+"#;
+
+const NODE_COUNT_SQL: &str = r#"
+SELECT count(*) FROM nodes WHERE project_id = $1
+"#;
+
 const KNN_SQL: &str = r#"
 SELECT id, (embedding <=> $1::text::vector) AS distance
 FROM chunks
@@ -106,6 +271,10 @@ pub const DEFAULT_EDGE_TYPE: &str = "calls";
 
 /// Maximum traversal depth accepted by [`PgStore::reverse_deps`].
 pub const MAX_REVERSE_DEPTH: u32 = 10;
+
+/// Rows per staging transaction. Larger inputs are split so a single transaction
+/// (and its temporary table) stays bounded.
+const UPSERT_BATCH_SIZE: usize = 5000;
 
 fn db_err<E: std::fmt::Display>(error: E) -> CodeGraphError {
     CodeGraphError::Database(error.to_string())
@@ -155,6 +324,44 @@ fn vector_component(value: f32) -> String {
     rendered
 }
 
+/// Render an optional embedding for a staging column. `None` stays `NULL`, so the
+/// target column keeps a null vector instead of a zero-length one.
+pub(crate) fn embedding_text(values: Option<&[f32]>) -> Option<String> {
+    values.map(vector_text)
+}
+
+/// Serialise optional metadata for a `text` staging column; the merge casts it to
+/// `jsonb`. `None` stays `NULL`.
+pub(crate) fn metadata_text(value: Option<&serde_json::Value>) -> Result<Option<String>> {
+    value
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// Parse pgvector's text output format (`[0.1,0.25,-1.5]`) back into floats.
+///
+/// `tokio-postgres` has no decoder for the `vector` type, so round-tripping goes
+/// through the textual form pgvector produces.
+pub(crate) fn parse_vector_text(text: &str) -> Result<Vec<f32>> {
+    let inner = text
+        .trim()
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .ok_or_else(|| db_err(format!("invalid pgvector literal: {text}")))?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|component| {
+            component.trim().parse::<f32>().map_err(|error| {
+                db_err(format!("invalid pgvector component {component:?}: {error}"))
+            })
+        })
+        .collect()
+}
+
 /// Postgres-backed store used by the offline POC only.
 pub struct PgStore {
     pool: Pool,
@@ -202,7 +409,8 @@ impl PgStore {
         Ok(Self { pool })
     }
 
-    /// Apply the chunk/edge DDL. Safe to run repeatedly.
+    /// Apply the full storage DDL (chunks, edges, nodes, symbol embeddings). Safe to
+    /// run repeatedly.
     pub async fn ensure_schema(&self) -> Result<()> {
         let client = self.pool.get().await.map_err(db_err)?;
         client.batch_execute(SCHEMA_DDL).await.map_err(db_err)?;
@@ -261,6 +469,197 @@ impl PgStore {
             .map_err(db_err)?;
         transaction.commit().await.map_err(db_err)?;
         Ok(merged)
+    }
+
+    /// Insert or update nodes. Inputs larger than [`UPSERT_BATCH_SIZE`] are split
+    /// into independent transactions, each with its own staging table.
+    pub async fn upsert_nodes(&self, rows: &[NodeRow]) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut merged = 0u64;
+        for batch in rows.chunks(UPSERT_BATCH_SIZE) {
+            merged += self.upsert_node_batch(batch).await?;
+        }
+        Ok(merged)
+    }
+
+    async fn upsert_node_batch(&self, rows: &[NodeRow]) -> Result<u64> {
+        let mut client = self.pool.get().await.map_err(db_err)?;
+        let transaction = client.transaction().await.map_err(db_err)?;
+        transaction
+            .batch_execute(NODES_STAGING_DDL)
+            .await
+            .map_err(db_err)?;
+
+        let sink = transaction
+            .copy_in(COPY_NODES_INTO_STAGING)
+            .await
+            .map_err(db_err)?;
+        let types = [
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::INT4,
+            Type::INT4,
+            Type::TEXT,
+            Type::FLOAT8,
+            Type::INT4,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+        ];
+        let mut writer = std::pin::pin!(BinaryCopyInWriter::new(sink, &types));
+        for row in rows {
+            let embedding = embedding_text(row.embedding.as_deref());
+            let metadata = metadata_text(row.metadata.as_ref())?;
+            writer
+                .as_mut()
+                .write(&[
+                    &row.id,
+                    &row.project_id,
+                    &row.name,
+                    &row.node_type,
+                    &row.language,
+                    &row.file_path,
+                    &row.start_line,
+                    &row.end_line,
+                    &row.content,
+                    &row.complexity,
+                    &row.chunk_count,
+                    &row.embedding_model,
+                    &embedding,
+                    &metadata,
+                ])
+                .await
+                .map_err(db_err)?;
+        }
+        writer.finish().await.map_err(db_err)?;
+
+        let merged = transaction
+            .execute(MERGE_NODES_STAGING, &[])
+            .await
+            .map_err(db_err)?;
+        transaction.commit().await.map_err(db_err)?;
+        Ok(merged)
+    }
+
+    /// Insert or update symbol embeddings. `access_count` is left untouched by an
+    /// update so usage statistics survive re-indexing. Inputs larger than
+    /// [`UPSERT_BATCH_SIZE`] are split into independent transactions.
+    pub async fn upsert_symbol_embeddings(&self, rows: &[SymbolEmbeddingRow]) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut merged = 0u64;
+        for batch in rows.chunks(UPSERT_BATCH_SIZE) {
+            merged += self.upsert_symbol_embedding_batch(batch).await?;
+        }
+        Ok(merged)
+    }
+
+    async fn upsert_symbol_embedding_batch(&self, rows: &[SymbolEmbeddingRow]) -> Result<u64> {
+        let mut client = self.pool.get().await.map_err(db_err)?;
+        let transaction = client.transaction().await.map_err(db_err)?;
+        transaction
+            .batch_execute(SYMBOL_EMBEDDINGS_STAGING_DDL)
+            .await
+            .map_err(db_err)?;
+
+        let sink = transaction
+            .copy_in(COPY_SYMBOL_EMBEDDINGS_INTO_STAGING)
+            .await
+            .map_err(db_err)?;
+        let types = [Type::TEXT; 9];
+        let mut writer = std::pin::pin!(BinaryCopyInWriter::new(sink, &types));
+        for row in rows {
+            let embedding = embedding_text(row.embedding.as_deref());
+            let metadata = metadata_text(row.metadata.as_ref())?;
+            writer
+                .as_mut()
+                .write(&[
+                    &row.id,
+                    &row.project_id,
+                    &row.symbol,
+                    &row.normalized_symbol,
+                    &embedding,
+                    &row.embedding_model,
+                    &row.node_id,
+                    &row.source_edge_id,
+                    &metadata,
+                ])
+                .await
+                .map_err(db_err)?;
+        }
+        writer.finish().await.map_err(db_err)?;
+
+        let merged = transaction
+            .execute(MERGE_SYMBOL_EMBEDDINGS_STAGING, &[])
+            .await
+            .map_err(db_err)?;
+        transaction.commit().await.map_err(db_err)?;
+        Ok(merged)
+    }
+
+    /// Fetch nodes by id, restricted to `project_id`. Order is not guaranteed.
+    pub async fn nodes_by_ids(&self, project_id: &str, ids: &[String]) -> Result<Vec<NodeRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(NODES_BY_IDS_SQL, &[&project_id, &ids])
+            .await
+            .map_err(db_err)?;
+
+        let mut nodes = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let embedding: Option<String> = row.get(12);
+            let embedding = match embedding.as_deref() {
+                Some(text) => Some(parse_vector_text(text)?),
+                None => None,
+            };
+            let metadata: Option<String> = row.get(13);
+            let metadata = match metadata.as_deref() {
+                Some(text) => Some(serde_json::from_str::<serde_json::Value>(text)?),
+                None => None,
+            };
+
+            nodes.push(NodeRow {
+                id: row.get(0),
+                project_id: row.get(1),
+                name: row.get(2),
+                node_type: row.get(3),
+                language: row.get(4),
+                file_path: row.get(5),
+                start_line: row.get(6),
+                end_line: row.get(7),
+                content: row.get(8),
+                complexity: row.get(9),
+                chunk_count: row.get(10),
+                embedding_model: row.get(11),
+                embedding,
+                metadata,
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Number of nodes stored for `project_id`.
+    pub async fn node_count(&self, project_id: &str) -> Result<i64> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let count: i64 = client
+            .query_one(NODE_COUNT_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?
+            .get(0);
+        Ok(count)
     }
 
     /// Nearest neighbours for `query`, restricted to one project. Returns
@@ -366,8 +765,54 @@ mod tests {
                 );
             }
         }
-        assert_eq!(table_count, 2, "expected chunks + edges tables");
-        assert_eq!(index_count, 6, "expected 6 chunks/edges indexes");
+        assert_eq!(
+            table_count, 4,
+            "expected chunks + edges + nodes + symbol_embeddings tables"
+        );
+        assert_eq!(
+            index_count, 15,
+            "expected 15 chunks/edges/nodes/symbol indexes"
+        );
+    }
+
+    #[test]
+    fn nodes_ddl_covers_all_indexes() {
+        for index in [
+            "nodes_project_file",
+            "nodes_hnsw",
+            "nodes_tsv",
+            "sym_project_norm",
+            "sym_hnsw",
+        ] {
+            assert!(
+                SCHEMA_DDL.contains(&format!("CREATE INDEX IF NOT EXISTS {index} ")),
+                "SCHEMA_DDL is missing index {index}"
+            );
+        }
+        assert!(SCHEMA_DDL.contains("embedding_1024  vector(1024)"));
+        assert!(SCHEMA_DDL.contains("GENERATED ALWAYS AS"));
+    }
+
+    #[test]
+    fn node_row_metadata_roundtrip() {
+        let original = serde_json::json!({"a": 1, "nested": {"b": [true, null, "x"]}});
+        let text = metadata_text(Some(&original))
+            .expect("serialise metadata")
+            .expect("metadata is Some");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("parse metadata");
+        assert_eq!(parsed, original);
+        assert!(metadata_text(None).expect("none").is_none());
+    }
+
+    #[test]
+    fn vector_text_reused_for_nodes() {
+        let embedding = vec![0.5f32];
+        assert_eq!(
+            embedding_text(Some(embedding.as_slice())),
+            Some("[0.5]".to_string())
+        );
+        assert_eq!(embedding_text(None), None);
+        assert_eq!(parse_vector_text("[0.5]").expect("parse"), vec![0.5f32]);
     }
 
     // ---- Integration tests (require CODEGRAPH_PG_URL, run with --ignored) ----
@@ -500,5 +945,184 @@ mod tests {
             .expect("select")
             .get(0);
         assert_eq!(text, "updated text");
+    }
+
+    fn node(id: &str, project_id: &str) -> NodeRow {
+        NodeRow {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            name: format!("name_{id}"),
+            node_type: Some("function".to_string()),
+            language: Some("rust".to_string()),
+            file_path: Some("src/lib.rs".to_string()),
+            start_line: Some(10),
+            end_line: Some(20),
+            content: Some(format!("content for {id}")),
+            complexity: Some(1.5),
+            chunk_count: Some(0),
+            embedding_model: None,
+            embedding: None,
+            metadata: None,
+        }
+    }
+
+    fn symbol_embedding(
+        id: &str,
+        project_id: &str,
+        normalized_symbol: &str,
+        embedding: Vec<f32>,
+    ) -> SymbolEmbeddingRow {
+        SymbolEmbeddingRow {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            symbol: format!("symbol_{id}"),
+            normalized_symbol: normalized_symbol.to_string(),
+            embedding: Some(embedding),
+            embedding_model: Some("test-model".to_string()),
+            node_id: Some("node".to_string()),
+            source_edge_id: None,
+            metadata: Some(serde_json::json!({"source": "test"})),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn nodes_roundtrip_and_count() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("nodes");
+        let mut rich = node("node_rich", &project);
+        rich.embedding = Some(unit_vector(0));
+        rich.embedding_model = Some("test-model".to_string());
+        rich.metadata = Some(serde_json::json!({"kind": "test", "score": 2}));
+
+        let rows = vec![
+            node("node_plain", &project),
+            rich.clone(),
+            node("node_third", &project),
+        ];
+        let merged = store.upsert_nodes(&rows).await.expect("upsert_nodes");
+        assert_eq!(merged, 3);
+        assert_eq!(store.node_count(&project).await.expect("node_count"), 3);
+
+        let ids = vec!["node_rich".to_string(), "node_plain".to_string()];
+        let fetched = store
+            .nodes_by_ids(&project, &ids)
+            .await
+            .expect("nodes_by_ids");
+        assert_eq!(fetched.len(), 2, "expected exactly the requested nodes");
+
+        let found = fetched
+            .iter()
+            .find(|row| row.id == "node_rich")
+            .expect("rich node present");
+        assert_eq!(found.project_id, project);
+        assert_eq!(found.name, rich.name);
+        assert_eq!(found.node_type, rich.node_type);
+        assert_eq!(found.language, rich.language);
+        assert_eq!(found.file_path, rich.file_path);
+        assert_eq!(found.start_line, rich.start_line);
+        assert_eq!(found.end_line, rich.end_line);
+        assert_eq!(found.content, rich.content);
+        assert_eq!(found.complexity, rich.complexity);
+        assert_eq!(found.chunk_count, rich.chunk_count);
+        assert_eq!(found.embedding_model, rich.embedding_model);
+        assert_eq!(found.embedding, rich.embedding);
+        assert_eq!(found.metadata, rich.metadata);
+
+        let foreign = store
+            .nodes_by_ids("some_other_project", &ids)
+            .await
+            .expect("nodes_by_ids for other project");
+        assert!(foreign.is_empty(), "nodes_by_ids must filter by project_id");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn nodes_upsert_is_idempotent() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("node_upsert");
+        let first = node("node_upsert_a", &project);
+        store
+            .upsert_nodes(std::slice::from_ref(&first))
+            .await
+            .expect("first upsert");
+
+        let mut second = first.clone();
+        second.content = Some("updated content".to_string());
+        second.embedding = Some(unit_vector(1));
+        store
+            .upsert_nodes(std::slice::from_ref(&second))
+            .await
+            .expect("second upsert");
+
+        assert_eq!(
+            store.node_count(&project).await.expect("node_count"),
+            1,
+            "upsert must not duplicate rows"
+        );
+
+        let fetched = store
+            .nodes_by_ids(&project, &["node_upsert_a".to_string()])
+            .await
+            .expect("nodes_by_ids");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].content.as_deref(), Some("updated content"));
+        assert_eq!(fetched[0].embedding, second.embedding);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn symbol_embeddings_upsert_and_lookup() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("symbols");
+        let rows = vec![
+            symbol_embedding("sym_a", &project, "call", unit_vector(4)),
+            symbol_embedding("sym_b", &project, "search", unit_vector(5)),
+        ];
+        let merged = store
+            .upsert_symbol_embeddings(&rows)
+            .await
+            .expect("first upsert");
+        assert_eq!(merged, 2);
+
+        let repeat = symbol_embedding("sym_a", &project, "call", unit_vector(6));
+        store
+            .upsert_symbol_embeddings(std::slice::from_ref(&repeat))
+            .await
+            .expect("second upsert");
+
+        let client = store.pool.get().await.expect("pool get");
+        let count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM symbol_embeddings WHERE project_id = $1",
+                &[&project],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(count, 2, "re-upsert must not duplicate rows");
+
+        let normalized: Option<String> = client
+            .query_one(
+                "SELECT normalized_symbol FROM symbol_embeddings
+                  WHERE project_id = $1 AND normalized_symbol = $2 AND id = $3",
+                &[&project, &"call", &"sym_a"],
+            )
+            .await
+            .expect("lookup by normalized_symbol")
+            .get(0);
+        assert_eq!(normalized.as_deref(), Some("call"));
     }
 }
