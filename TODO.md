@@ -341,6 +341,9 @@ suites stay green):
 | `9d50a12` | `PgGraph` implements `GraphQuery` (8 of 12 methods; 2 fail loudly) |
 | `de463b2` | `official_server` picks the graph backend at runtime |
 | `fd76245` | Default build is Postgres-only; `surrealdb-core` is no longer compiled |
+| `8ccce03` | Postgres semantic search (three-way RRF) |
+| `45bc533` | Postgres circular dependency detection |
+| `a9fa36d` | Postgres scoped reconciliation, so `index <subdir>` works |
 
 **End-to-end measured** (details and conditions in
 [docs/BACKEND_EVALUATION.md](docs/BACKEND_EVALUATION.md#end-to-end-verification-measured-not-projected)):
@@ -357,7 +360,6 @@ micro-benchmark's row and connection counts. Do not quote 107x as an indexing sp
 
 | Item | Why it blocks |
 |---|---|
-| Postgres scoped reconciliation | Single-file and subdirectory indexes fail with an explicit error; full indexes work |
 | `full` feature excludes surrealdb | `cargo install --features full` produces a Postgres-only binary; add `surrealdb` explicitly if you need the legacy backend |
 | Surreal-only integration tests | `reconciliation_test`, `daemon_watch`, `graph_tools_smoke` are `#![cfg(feature = "surrealdb")]`; `ci.yml` covers them through its `--all-features` job |
 | Postgres search parity | `name`-only hits report `text_score` 0.0 (SurrealDB carries the name BM25 score); `node_id` is the bare id rather than `nodes:<id>`; `chunks.embedding` is `vector(1024)`, so other dimensions cannot search semantically |
