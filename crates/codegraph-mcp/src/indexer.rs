@@ -2657,18 +2657,37 @@ impl ProjectIndexer {
     ) -> Result<HashMap<String, Vec<f32>>> {
         texts.sort();
         texts.dedup();
+        // 分段计时开关：未设置 CODEGRAPH_TRACE_SYMBOL_EMBED 时只多几个原子变量与一次 env 查询，
+        // 不产生日志、不改变任何行为。
+        let trace = std::env::var_os("CODEGRAPH_TRACE_SYMBOL_EMBED").is_some();
+        let embed_ns = std::sync::atomic::AtomicU64::new(0);
+        let record_ns = std::sync::atomic::AtomicU64::new(0);
+        let persist_ns = std::sync::atomic::AtomicU64::new(0);
+        let batch_count = std::sync::atomic::AtomicU64::new(0);
+        let wall_started = std::time::Instant::now();
         let (batch_size, concurrency) = self.symbol_embedding_batch_settings();
         let mut results = HashMap::new();
         let texts = &texts;
+        // `async move` 块会移动捕获值，这里显式按引用捕获计时器，保持下方 `load` 仍用原变量。
+        let embed_ns_ref = &embed_ns;
+        let batch_count_ref = &batch_count;
         let mut batches = stream::iter((0..texts.len()).step_by(batch_size).map(
             |start| async move {
                 let batch = &texts[start..(start + batch_size).min(texts.len())];
+                let embed_started = std::time::Instant::now();
                 let vectors = self
                     .embedder
                     .as_ref()
                     .expect("sync provider initialized")
                     .embed_texts_batched(batch)
                     .await?;
+                if trace {
+                    embed_ns_ref.fetch_add(
+                        embed_started.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    batch_count_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 if vectors.len() != batch.len()
                     || vectors.iter().any(|vector| {
                         vector.len() != self.vector_dim
@@ -2685,6 +2704,7 @@ impl ProjectIndexer {
         .buffer_unordered(concurrency);
         while let Some(result) = batches.next().await {
             let (batch, vectors) = result?;
+            let record_started = std::time::Instant::now();
             let mut records = Vec::with_capacity(batch.len());
             for (text, vector) in batch.iter().zip(vectors) {
                 records.push(self.build_symbol_embedding_record(
@@ -2695,7 +2715,32 @@ impl ProjectIndexer {
                 ));
                 results.insert(text.clone(), vector);
             }
+            if trace {
+                record_ns.fetch_add(
+                    record_started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            let persist_started = std::time::Instant::now();
             self.persist_symbol_embedding_records(records).await?;
+            if trace {
+                persist_ns.fetch_add(
+                    persist_started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+        if trace {
+            let ms = |ns: u64| ns as f64 / 1_000_000.0;
+            info!(
+                "SYMBOL_EMBED_TRACE texts={} batches={} embed={:.0}ms record={:.0}ms persist={:.0}ms wall={:.0}ms",
+                texts.len(),
+                batch_count.load(std::sync::atomic::Ordering::Relaxed),
+                ms(embed_ns.load(std::sync::atomic::Ordering::Relaxed)),
+                ms(record_ns.load(std::sync::atomic::Ordering::Relaxed)),
+                ms(persist_ns.load(std::sync::atomic::Ordering::Relaxed)),
+                wall_started.elapsed().as_millis(),
+            );
         }
         Ok(results)
     }
