@@ -302,3 +302,52 @@ Configuration error: scoped reconciliation is not implemented for the Postgres b
 
 Passing `--project-root <dir>` explicitly fixes it. This is pre-existing CLI behaviour, not a
 backend issue, but it makes an otherwise valid benchmark look broken.
+
+## Removing the hard SurrealDB dependency (planned)
+
+`codegraph-graph` already keeps `surrealdb` optional, and every `use surrealdb::` in it sits
+behind `#[cfg(feature = "surrealdb")]`. What forces `surrealdb-core` into every build is two
+upstream Cargo declarations:
+
+```
+crates/codegraph-mcp/Cargo.toml:63    codegraph-graph = { workspace = true, features = ["surrealdb"] }
+crates/codegraph-vector/Cargo.toml:14 codegraph-graph = { path = "../codegraph-graph", features = ["surrealdb"] }
+```
+
+That is why `cargo test -p codegraph-mcp-server --lib` spent >8 minutes compiling
+`surrealdb-core 4.0.1` (256 codegen units, full debuginfo, ~2 GB per rlib; 18 variants and
+47 fingerprints already cached, 36 GB of rlibs, 39 GB of incremental data).
+
+Target feature matrix:
+
+| Build | Compiles surrealdb-core | Notes |
+|---|---|---|
+| `--no-default-features --features postgres` | **no** | the intended default |
+| `--features surrealdb` | yes | explicit opt-in for the legacy backend |
+
+Planned changes (design validated with `plan_check`: acyclic, layered, and
+`IndexStorage` has no path to `SurrealDbStorage`):
+
+1. Drop `features = ["surrealdb"]` from the two declarations above; add
+   `surrealdb = ["codegraph-graph/surrealdb"]` to each crate and forward it from
+   `codegraph-mcp-tools`, `-mcp-rig` and `-mcp-server`.
+2. Move `SurrealEmbeddingColumn` (8 dimension variants) out of `indexer.rs` into
+   `storage.rs` as `EmbeddingColumn`: it is a dimension→column map, not a SurrealDB type.
+3. `#[cfg(feature = "surrealdb")]` on the remaining concrete references:
+   `connect_surreal`, the `surreal` field, `surreal_storage()`, the writer's two test
+   fixtures, `codegraph-vector/src/surreal_store.rs`, the `rig` test modules, and
+   `official_server`/`query_cli`/`plan_cli`/`handle_db_check`.
+
+### What disappears from a default build
+
+These commands talk to SurrealDB directly; under a Postgres-only build they are compiled out
+and must be requested with `--features surrealdb`:
+
+| Command | Why it is Surreal-only today |
+|---|---|
+| `codegraph query` | raw SurrealQL symbol lookup (`query_cli.rs`) |
+| `codegraph plan` (async half) | stores/queries plans via `SurrealDbStorage` (`plan_cli.rs`); `run_offline` is unaffected |
+| `codegraph db check` | `SurrealDbConfig`/`SurrealDbStorage` health probe |
+| MCP graph tools | until `PgGraph` implements `GraphQuery` |
+
+`codegraph index` and the `IndexStorage` write path are already backend-neutral.
