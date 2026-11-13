@@ -32,7 +32,9 @@ pub use estimation::{
     build_symbol_index,
 };
 pub use heartbeat::*;
-pub use indexer::{IndexStats, IndexerConfig, ProjectIndexer};
+pub use indexer::{
+    IndexStats, IndexerConfig, ProjectIndexer, StorageBackend, StorageMode, open_storage,
+};
 pub use transport::*;
 
 // Server modules have moved to codegraph-mcp-server; no re-exports to avoid dependency cycles.

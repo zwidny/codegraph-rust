@@ -230,7 +230,7 @@ pub(crate) fn extraction_policy_for_tier(
 
 /// Storage backend for one indexing run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StorageBackend {
+pub enum StorageBackend {
     Surreal,
     Postgres,
 }
@@ -239,7 +239,7 @@ impl StorageBackend {
     /// `CODEGRAPH_BACKEND` selects the backend: empty / `surreal` / `surrealdb`
     /// mean SurrealDB, `postgres` / `pg` mean Postgres. Anything else is a
     /// configuration error rather than a silent fallback.
-    pub(crate) fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self> {
         let raw = std::env::var("CODEGRAPH_BACKEND").unwrap_or_default();
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "surreal" | "surrealdb" => Ok(Self::Surreal),
@@ -248,6 +248,62 @@ impl StorageBackend {
                 "unknown CODEGRAPH_BACKEND `{other}`; expected `surreal` or `postgres`"
             )),
         }
+    }
+}
+
+/// Whether a caller may create schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageMode {
+    /// `codegraph query`: never issue DDL. A missing schema is an error that
+    /// tells the user to index first, not something to repair silently.
+    ReadOnly,
+    /// `codegraph plan store` / `plan drop`: apply the schema before writing.
+    ReadWrite,
+}
+
+/// Open one storage handle for callers that only read the graph (the `query` and
+/// `plan` CLIs). Unlike the indexer this does not build a writer pool: those
+/// callers issue no bulk writes.
+///
+/// SurrealDB opens a fresh connection from the project's configuration; Postgres
+/// reads `CODEGRAPH_PG_URL` and applies the schema so a first run works against an
+/// empty database.
+pub async fn open_storage(
+    backend: StorageBackend,
+    project_root: &std::path::Path,
+    mode: StorageMode,
+) -> Result<Arc<dyn IndexStorage>> {
+    match backend {
+        // `SurrealDbStorage::new` applies its own migration policy for both modes;
+        // this does not change existing behaviour for the CLI.
+        StorageBackend::Surreal => {
+            let (_primary, pool) = ProjectIndexer::connect_surreal(project_root).await?;
+            let handle = pool
+                .first()
+                .ok_or_else(|| anyhow!("surreal storage pool is empty"))?;
+            let storage = handle.lock().await.clone();
+            Ok(Arc::new(storage))
+        }
+        #[cfg(feature = "postgres")]
+        StorageBackend::Postgres => {
+            let store = codegraph_graph::postgres_storage::PgStore::connect("")?;
+            match mode {
+                StorageMode::ReadWrite => store.ensure_schema().await?,
+                StorageMode::ReadOnly => {
+                    if !store.schema_present().await? {
+                        return Err(anyhow!(
+                            "project not indexed: the Postgres schema is missing at CODEGRAPH_PG_URL; \
+                             run `codegraph index` first (or set CODEGRAPH_BACKEND=surreal)"
+                        ));
+                    }
+                }
+            }
+            Ok(Arc::new(store))
+        }
+        #[cfg(not(feature = "postgres"))]
+        StorageBackend::Postgres => Err(anyhow!(
+            "CODEGRAPH_BACKEND=postgres requires a build with --features postgres"
+        )),
     }
 }
 
@@ -5074,6 +5130,27 @@ mod storage_backend_tests {
         let message = error.to_string();
         assert!(
             message.contains("unknown CODEGRAPH_BACKEND"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    /// Without the `postgres` feature the backend exists as a variant but must
+    /// fail loudly instead of silently falling back to SurrealDB.
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn open_storage_rejects_postgres_without_the_feature() {
+        let result = open_storage(
+            StorageBackend::Postgres,
+            Path::new("."),
+            StorageMode::ReadOnly,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("Postgres must not open without --features postgres");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("requires a build with --features postgres"),
             "unexpected error message: {message}"
         );
     }

@@ -1068,6 +1068,18 @@ impl PgStore {
         Ok(())
     }
 
+    /// Whether the schema this module needs has been applied. Read-only callers
+    /// use this to fail with an actionable message instead of a bare SQL error.
+    pub async fn schema_present(&self) -> Result<bool> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let present: bool = client
+            .query_one("SELECT to_regclass('public.nodes') IS NOT NULL", &[])
+            .await
+            .map_err(db_err)?
+            .get(0);
+        Ok(present)
+    }
+
     /// Insert or update chunks in one transaction: `COPY` into a temporary table,
     /// then merge with `ON CONFLICT (id) DO UPDATE`.
     pub async fn upsert_chunks(&self, rows: &[ChunkRow]) -> Result<u64> {
@@ -2802,6 +2814,19 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("poc_{tag}_{}_{nanos}_{n}", std::process::id())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn schema_present_is_true_after_ensure_schema() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+        assert!(
+            store.schema_present().await.expect("schema_present"),
+            "the schema must report as present right after ensure_schema"
+        );
     }
 
     #[tokio::test]
