@@ -1,7 +1,7 @@
 // ABOUTME: Deterministic, context-aware symbol catalog used before semantic inference.
 // ABOUTME: Preserves ambiguous aliases and indexes lexical candidates by character trigrams.
 
-use codegraph_core::{CodeNode, EdgeRelationship, NodeId};
+use codegraph_core::{CodeNode, EdgeRelationship, NodeId, NodeType};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -118,6 +118,20 @@ pub(crate) fn aliases_for(
         names.insert(short.to_string());
     }
     names
+}
+
+/// Macro invocations are graph nodes so "who calls this macro" is answerable, but
+/// they are not callable targets. Leaving them in the catalog let a call resolve to
+/// a same-named macro: on EasyTier 15 `calls` edges pointed at `tokio::join`,
+/// `std::task::ready`, `write` or `concat` instead of the real functions.
+fn is_macro_invocation(node: &CodeNode) -> bool {
+    matches!(&node.node_type, Some(NodeType::Other(kind)) if kind == "macro_invocation")
+}
+
+/// `ExternalSymbol::kind` carries `format!("{:?}", NodeType)`, i.e.
+/// `Other("macro_invocation")` for macros.
+fn is_macro_kind(kind: Option<&str>) -> bool {
+    kind.is_some_and(|kind| kind.contains("macro_invocation"))
 }
 
 fn trigrams(name: &str) -> BTreeSet<String> {
@@ -247,6 +261,9 @@ impl SymbolCatalog {
             fuzzy_limit: configured_fuzzy_limit(),
         };
         for node in nodes {
+            if is_macro_invocation(node) {
+                continue;
+            }
             catalog.insert_symbol(
                 node.id,
                 &node.location.file_path,
@@ -261,6 +278,9 @@ impl SymbolCatalog {
             }
         }
         for symbol in external {
+            if is_macro_kind(symbol.kind.as_deref()) {
+                continue;
+            }
             let seen = catalog.symbols.contains_key(&symbol.id);
             catalog.insert_symbol(
                 symbol.id,
@@ -632,6 +652,67 @@ mod tests {
             metadata: Default::default(),
             span: None,
         }
+    }
+
+    #[test]
+    fn macro_nodes_are_not_resolution_candidates() {
+        let function = node("a.rs", "join");
+        let mut macro_node = node("b.rs", "join");
+        macro_node.node_type = Some(NodeType::Other("macro_invocation".to_string()));
+        macro_node.set_deterministic_id("test");
+        assert_ne!(function.id, macro_node.id, "distinct nodes");
+        assert!(is_macro_invocation(&macro_node));
+        assert!(!is_macro_invocation(&function));
+
+        let caller = node("c.rs", "caller");
+        let catalog = SymbolCatalog::new(&[caller.clone(), function.clone(), macro_node.clone()]);
+
+        // The macro's `join` alias must not create a second candidate: were it
+        // present, `exact` would see two ids and `choose` would refuse (neither
+        // is in `c.rs`), so a `Some(function)` result proves it was skipped.
+        assert!(!catalog.ambiguous("join"));
+        assert_eq!(catalog.unique_aliases().get("join"), Some(&function.id));
+        assert_eq!(
+            catalog.exact(&edge(caller.id, "join"), &[]),
+            Some(function.id)
+        );
+        assert!(
+            !catalog
+                .unique_aliases()
+                .values()
+                .any(|id| *id == macro_node.id),
+            "the macro node must not enter the catalog at all"
+        );
+    }
+
+    #[test]
+    fn macro_external_symbols_are_not_resolution_candidates() {
+        let function = ExternalSymbol {
+            id: NodeId::new_v4(),
+            file: "a.rs".to_string(),
+            name: "join".to_string(),
+            kind: Some("Function".to_string()),
+            qualified: None,
+        };
+        let macro_symbol = ExternalSymbol {
+            id: NodeId::new_v4(),
+            file: "b.rs".to_string(),
+            name: "join".to_string(),
+            kind: Some("Other(\"macro_invocation\")".to_string()),
+            qualified: None,
+        };
+        assert!(is_macro_kind(macro_symbol.kind.as_deref()));
+        assert!(!is_macro_kind(function.kind.as_deref()));
+        assert!(
+            !is_macro_kind(Some("Other(\"impl\")")),
+            "only macro_invocation is skipped"
+        );
+
+        let catalog =
+            SymbolCatalog::new_with_external(&[], &[function.clone(), macro_symbol.clone()]);
+
+        assert!(!catalog.ambiguous("join"));
+        assert_eq!(catalog.unique_aliases().get("join"), Some(&function.id));
     }
 
     #[test]
