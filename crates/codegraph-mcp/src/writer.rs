@@ -9,9 +9,13 @@ use codegraph_graph::{
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::Serialize;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Instant,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -33,6 +37,8 @@ struct Envelope {
     job: Job,
     _memory: Option<OwnedSemaphorePermit>,
     bytes: u64,
+    /// Set when the item is about to be queued; used to measure queue wait.
+    enqueued_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -84,7 +90,112 @@ struct WriteMetrics {
     rows: AtomicU64,
     bytes: AtomicU64,
 }
+
+/// Full (unsampled) write-timing audit, enabled by `CODEGRAPH_TRACE_WRITER=1`.
+///
+/// Off by default: when no trace is installed, no samples are recorded and no
+/// logs are emitted, so the production path is unchanged.
+#[derive(Default)]
+struct TraceMetrics {
+    /// Sum of time blocked waiting for queue capacity or the byte permit.
+    backpressure_us: AtomicU64,
+    /// Individual backpressure samples, for percentiles.
+    backpressure_samples: std::sync::Mutex<Vec<u64>>,
+    queue_wait_us: std::sync::Mutex<Vec<u64>>,
+    exec_us: std::sync::Mutex<Vec<u64>>,
+    by_kind: std::sync::Mutex<BTreeMap<&'static str, KindStats>>,
+    inflight: AtomicUsize,
+    inflight_max: AtomicUsize,
+    exec_total_us: AtomicU64,
+    started_at: std::sync::Mutex<Option<Instant>>,
+}
+
+#[derive(Default, Clone)]
+struct KindStats {
+    jobs: u64,
+    rows: u64,
+    exec_us: Vec<u64>,
+}
+
+/// Nearest-rank percentile over an unordered sample. Returns 0 for an empty slice.
+fn percentile_us(samples: &mut [u64], p: f64) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    let n = samples.len();
+    let rank = ((p * n as f64).ceil() as usize).max(1).min(n);
+    samples[rank - 1]
+}
+
+impl TraceMetrics {
+    fn snapshot(&self, jobs: u64, rows: u64) -> String {
+        let wall_ms = self
+            .started_at
+            .lock()
+            .unwrap()
+            .map_or(0, |started| started.elapsed().as_millis() as u64);
+        let wall_us = wall_ms.saturating_mul(1000).max(1);
+        // Total backpressure is retained for callers/forensics; percentiles use samples.
+        let _backpressure_total = self.backpressure_us.load(Ordering::Relaxed);
+        let exec_total = self.exec_total_us.load(Ordering::Relaxed);
+        let inflight_max = self.inflight_max.load(Ordering::Relaxed);
+        let inflight_avg = exec_total as f64 / wall_us as f64;
+
+        let mut backpressure = self.backpressure_samples.lock().unwrap().clone();
+        let mut queue_wait = self.queue_wait_us.lock().unwrap().clone();
+        let mut exec = self.exec_us.lock().unwrap().clone();
+        let backpressure_max = backpressure.iter().copied().max().unwrap_or(0);
+        let queue_wait_max = queue_wait.iter().copied().max().unwrap_or(0);
+        let exec_max = exec.iter().copied().max().unwrap_or(0);
+
+        let mut out = format!(
+            "WRITER_TRACE jobs={jobs} rows={rows} wall_ms={wall_ms}\n  \
+             backpressure_us p50={} p95={} max={}\n  \
+             queue_wait_us   p50={} p95={} max={}\n  \
+             exec_us         p50={} p95={} p99={} max={}\n  \
+             inflight avg={inflight_avg:.2} max={inflight_max}\n  by_kind",
+            percentile_us(&mut backpressure, 0.50),
+            percentile_us(&mut backpressure, 0.95),
+            backpressure_max,
+            percentile_us(&mut queue_wait, 0.50),
+            percentile_us(&mut queue_wait, 0.95),
+            queue_wait_max,
+            percentile_us(&mut exec, 0.50),
+            percentile_us(&mut exec, 0.95),
+            percentile_us(&mut exec, 0.99),
+            exec_max,
+        );
+        let by_kind = self.by_kind.lock().unwrap();
+        for (kind, stats) in by_kind.iter() {
+            let mut samples = stats.exec_us.clone();
+            out.push_str(&format!(
+                " {kind}: jobs={} rows={} exec_p50={} exec_p95={}",
+                stats.jobs,
+                stats.rows,
+                percentile_us(&mut samples, 0.50),
+                percentile_us(&mut samples, 0.95),
+            ));
+        }
+        out
+    }
+}
+
 impl Job {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Nodes(_) => "nodes",
+            Self::Edges(_) => "edges",
+            Self::NodeEmbeddings(_) => "node_embeddings",
+            Self::SymbolEmbeddings(_) => "symbol_embeddings",
+            Self::ChunkEmbeddings(_) => "chunks",
+            Self::FileMetadata(_) => "file_metadata",
+            Self::DeleteFiles { .. } => "delete_files",
+            Self::ProjectMetadata(_) => "project_metadata",
+            Self::Flush(_) => "flush",
+            Self::Shutdown(_) => "shutdown",
+        }
+    }
     fn rows(&self) -> usize {
         match self {
             Self::Nodes(rows) => rows.len(),
@@ -151,6 +262,7 @@ pub(crate) struct SurrealWriterHandle {
     limits: Limits,
     join: JoinHandle<()>,
     metrics: Arc<WriteMetrics>,
+    trace: Option<Arc<TraceMetrics>>,
 }
 
 impl SurrealWriterHandle {
@@ -161,11 +273,25 @@ impl SurrealWriterHandle {
         let (tx, mut rx) = mpsc::channel::<Envelope>(8);
         let metrics = Arc::new(WriteMetrics::default());
         let worker_metrics = metrics.clone();
+        let trace =
+            std::env::var_os("CODEGRAPH_TRACE_WRITER").map(|_| Arc::new(TraceMetrics::default()));
+        let worker_trace = trace.clone();
         let join = tokio::spawn(async move {
+            let trace = worker_trace;
             let mut running = FuturesUnordered::<JoinHandle<Result<()>>>::new();
             let mut error = None;
             let mut next = 0;
             while let Some(envelope) = rx.recv().await {
+                let dequeued = Instant::now();
+                if let Some(trace) = &trace {
+                    let wait = dequeued.duration_since(envelope.enqueued_at).as_micros() as u64;
+                    trace.queue_wait_us.lock().unwrap().push(wait);
+                    if let Ok(mut started) = trace.started_at.lock()
+                        && started.is_none()
+                    {
+                        *started = Some(dequeued);
+                    }
+                }
                 let barrier = matches!(
                     envelope.job,
                     Job::DeleteFiles { .. }
@@ -180,6 +306,11 @@ impl SurrealWriterHandle {
                     }
                     match envelope.job {
                         Job::Flush(response) => {
+                            if let Some(trace) = &trace {
+                                let jobs = worker_metrics.jobs.load(Ordering::Relaxed);
+                                let rows = worker_metrics.rows.load(Ordering::Relaxed);
+                                tracing::info!("{}", trace.snapshot(jobs, rows));
+                            }
                             let _ = response.send(error.take().map_or(Ok(()), |e| Err(anyhow!(e))));
                         }
                         Job::Shutdown(response) => {
@@ -204,13 +335,35 @@ impl SurrealWriterHandle {
                     let storage = pool[next % pool.len()].clone();
                     next += 1;
                     let metrics = worker_metrics.clone();
+                    let kind = envelope.job.kind();
+                    let rows = envelope.job.rows() as u64;
+                    if let Some(trace) = &trace {
+                        let current = trace.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+                        trace.inflight_max.fetch_max(current, Ordering::Relaxed);
+                    }
+                    let task_trace = trace.clone();
                     running.push(tokio::spawn(async move {
                         let Envelope {
                             job,
                             _memory,
                             bytes,
+                            ..
                         } = envelope;
+                        let started = Instant::now();
                         let result = execute(job, storage, &metrics, bytes).await;
+                        let elapsed = started.elapsed();
+                        if let Some(trace) = task_trace {
+                            let us = elapsed.as_micros() as u64;
+                            trace.exec_us.lock().unwrap().push(us);
+                            trace.exec_total_us.fetch_add(us, Ordering::Relaxed);
+                            let mut by_kind = trace.by_kind.lock().unwrap();
+                            let stats = by_kind.entry(kind).or_default();
+                            stats.jobs += 1;
+                            stats.rows += rows;
+                            stats.exec_us.push(us);
+                            drop(by_kind);
+                            trace.inflight.fetch_sub(1, Ordering::Relaxed);
+                        }
                         drop(_memory);
                         result
                     }));
@@ -227,6 +380,7 @@ impl SurrealWriterHandle {
             limits,
             join,
             metrics,
+            trace,
         }
     }
 
@@ -242,19 +396,28 @@ impl SurrealWriterHandle {
         if bytes > self.limits.queue_bytes {
             return Err(anyhow!("Write exceeds queue byte budget: {bytes}"));
         }
+        let send_started = Instant::now();
         let permit = self
             .memory
             .clone()
             .acquire_many_owned(bytes.max(1) as u32)
             .await?;
-        self.tx
+        let result = self
+            .tx
             .send(Envelope {
                 job,
                 _memory: Some(permit),
                 bytes: bytes as u64,
+                enqueued_at: Instant::now(),
             })
             .await
-            .map_err(|_| anyhow!("Graph writer unavailable"))
+            .map_err(|_| anyhow!("Graph writer unavailable"));
+        if let Some(trace) = &self.trace {
+            let elapsed = send_started.elapsed().as_micros() as u64;
+            trace.backpressure_us.fetch_add(elapsed, Ordering::Relaxed);
+            trace.backpressure_samples.lock().unwrap().push(elapsed);
+        }
+        result
     }
 
     async fn batch<T: Serialize>(&self, rows: Vec<T>, wrap: impl Fn(Vec<T>) -> Job) -> Result<()> {
@@ -457,5 +620,41 @@ mod tests {
         );
         writer.flush().await.unwrap();
         writer.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn percentile_empty_is_zero() {
+        let mut samples: Vec<u64> = Vec::new();
+        assert_eq!(percentile_us(&mut samples, 0.50), 0);
+        assert_eq!(percentile_us(&mut samples, 0.95), 0);
+    }
+
+    #[test]
+    fn percentile_single_sample() {
+        let mut samples = [42u64];
+        assert_eq!(percentile_us(&mut samples, 0.50), 42);
+        assert_eq!(percentile_us(&mut samples, 0.95), 42);
+        assert_eq!(percentile_us(&mut samples, 0.99), 42);
+    }
+
+    #[test]
+    fn percentile_p50_and_p95_on_known_sample() {
+        let mut samples = [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(percentile_us(&mut samples, 0.50), 5);
+        assert_eq!(percentile_us(&mut samples, 0.95), 10);
+    }
+
+    #[test]
+    fn percentile_is_order_independent() {
+        let mut ordered = [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let mut shuffled = [10u64, 3, 7, 1, 9, 2, 8, 4, 6, 5];
+        assert_eq!(
+            percentile_us(&mut ordered, 0.50),
+            percentile_us(&mut shuffled, 0.50)
+        );
+        assert_eq!(
+            percentile_us(&mut ordered, 0.95),
+            percentile_us(&mut shuffled, 0.95)
+        );
     }
 }
