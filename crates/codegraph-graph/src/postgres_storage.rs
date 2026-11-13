@@ -56,6 +56,11 @@
 //! for `ON CONFLICT (id)`. An older `edges` table must therefore be **rebuilt** (drop
 //! and recreate it, then re-index) before reconciliation is used; this module never
 //! attempts `ADD PRIMARY KEY`.
+//!
+//! `metadata` is added the same way: `ALTER TABLE edges ADD COLUMN IF NOT EXISTS
+//! metadata jsonb`. The upgrade only adds the column; rows written before it keep
+//! `NULL`, so `resolution_method` and the other edge attributes read back empty until
+//! the project is re-indexed.
 
 use crate::edge::CodeEdge;
 use crate::storage::{
@@ -124,6 +129,9 @@ pub struct EdgeRow {
     pub from_id: String,
     pub to_id: String,
     pub edge_type: String,
+    /// Free-form edge attributes (`resolution_method`, confidence, …). Stored as
+    /// `jsonb`; `None` when the edge carries no metadata.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// One row of the `file_metadata` table.
@@ -193,9 +201,11 @@ CREATE TABLE IF NOT EXISTS edges (
   project_id text NOT NULL,
   from_id    text NOT NULL,
   to_id      text NOT NULL,
-  edge_type  text NOT NULL
+  edge_type  text NOT NULL,
+  metadata   jsonb
 );
 ALTER TABLE edges ADD COLUMN IF NOT EXISTS id text;
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS metadata jsonb;
 CREATE INDEX IF NOT EXISTS edges_from ON edges(project_id, edge_type, from_id);
 CREATE INDEX IF NOT EXISTS edges_to   ON edges(project_id, edge_type, to_id);
 CREATE INDEX IF NOT EXISTS edges_project ON edges(project_id);
@@ -404,13 +414,16 @@ SELECT id, from_id, to_id FROM edges WHERE project_id = $1
 "#;
 
 const UPSERT_EDGES_SQL: &str = r#"
-INSERT INTO edges (id, project_id, from_id, to_id, edge_type)
-SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
+INSERT INTO edges (id, project_id, from_id, to_id, edge_type, metadata)
+SELECT t.id, t.project_id, t.from_id, t.to_id, t.edge_type, t.metadata::jsonb
+FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+     AS t(id, project_id, from_id, to_id, edge_type, metadata)
 ON CONFLICT (id) DO UPDATE SET
   project_id = EXCLUDED.project_id,
   from_id = EXCLUDED.from_id,
   to_id = EXCLUDED.to_id,
-  edge_type = EXCLUDED.edge_type
+  edge_type = EXCLUDED.edge_type,
+  metadata = EXCLUDED.metadata
 "#;
 
 const DELETE_STALE_EDGES_SQL: &str = r#"
@@ -1381,11 +1394,17 @@ impl PgStore {
             let from_ids: Vec<String> = batch.iter().map(|row| row.from_id.clone()).collect();
             let to_ids: Vec<String> = batch.iter().map(|row| row.to_id.clone()).collect();
             let edge_types: Vec<String> = batch.iter().map(|row| row.edge_type.clone()).collect();
+            // `None` binds as SQL NULL, which `NULL::jsonb` keeps as NULL. An empty
+            // string would instead reach `::jsonb` and fail to parse.
+            let metadata: Vec<Option<String>> = batch
+                .iter()
+                .map(|row| row.metadata.as_ref().map(|value| value.to_string()))
+                .collect();
 
             merged += client
                 .execute(
                     UPSERT_EDGES_SQL,
-                    &[&ids, &projects, &from_ids, &to_ids, &edge_types],
+                    &[&ids, &projects, &from_ids, &to_ids, &edge_types, &metadata],
                 )
                 .await
                 .map_err(db_err)?;
@@ -1786,6 +1805,11 @@ pub(crate) fn code_edge_to_row(edge: &CodeEdge) -> EdgeRow {
         from_id: edge.from.to_string(),
         to_id: edge.to.to_string(),
         edge_type: edge.edge_type.to_string(),
+        metadata: if edge.metadata.is_empty() {
+            None
+        } else {
+            serde_json::to_value(&edge.metadata).ok()
+        },
     }
 }
 
@@ -2648,6 +2672,86 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn edges_persist_metadata() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("edge_meta");
+        let mut with_meta = edge_row(&format!("{project}_meta"), &project, "meta_from", "meta_to");
+        with_meta.metadata = Some(serde_json::json!({"resolution_method": "exact"}));
+        let bare = edge_row(&format!("{project}_bare"), &project, "meta_from", "meta_to");
+
+        store
+            .upsert_edges(&[with_meta, bare])
+            .await
+            .expect("upsert edges");
+
+        let client = store.pool.get().await.expect("pool get");
+        let method: Option<String> = client
+            .query_one(
+                "SELECT metadata->>'resolution_method' FROM edges WHERE id = $1",
+                &[&format!("{project}_meta")],
+            )
+            .await
+            .expect("read metadata resolution_method")
+            .get(0);
+        assert_eq!(method.as_deref(), Some("exact"));
+
+        let is_null: bool = client
+            .query_one(
+                "SELECT metadata IS NULL FROM edges WHERE id = $1",
+                &[&format!("{project}_bare")],
+            )
+            .await
+            .expect("read bare metadata")
+            .get(0);
+        assert!(is_null, "an edge without metadata must store SQL NULL");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn upsert_edges_keeps_metadata_on_conflict() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("edge_meta_conflict");
+        let edge_id = format!("{project}_conflict");
+        let mut first = edge_row(&edge_id, &project, "conflict_from", "conflict_to");
+        first.metadata = Some(serde_json::json!({"a": "1"}));
+        store
+            .upsert_edges(std::slice::from_ref(&first))
+            .await
+            .expect("first upsert");
+
+        let mut second = first.clone();
+        second.metadata = Some(serde_json::json!({"a": "2"}));
+        store
+            .upsert_edges(std::slice::from_ref(&second))
+            .await
+            .expect("second upsert");
+
+        let client = store.pool.get().await.expect("pool get");
+        let value: Option<String> = client
+            .query_one(
+                "SELECT metadata->>'a' FROM edges WHERE id = $1",
+                &[&edge_id],
+            )
+            .await
+            .expect("read metadata after conflict")
+            .get(0);
+        assert_eq!(
+            value.as_deref(),
+            Some("2"),
+            "ON CONFLICT must overwrite metadata, not keep the stale value"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
     async fn upsert_chunks_is_idempotent() {
         let Some(store) = store_or_skip() else {
             return;
@@ -2880,6 +2984,7 @@ mod tests {
             from_id: from_id.to_string(),
             to_id: to_id.to_string(),
             edge_type: DEFAULT_EDGE_TYPE.to_string(),
+            metadata: None,
         }
     }
 
@@ -4013,6 +4118,20 @@ mod storage_adapter_tests {
         assert_eq!(row.from_id, edge.from.to_string());
         assert_eq!(row.to_id, edge.to.to_string());
         assert_eq!(row.edge_type, "calls");
+        assert!(
+            row.metadata.is_none(),
+            "an edge without attributes must not invent a metadata object"
+        );
+
+        let with_meta = edge.with_metadata("resolution_method".to_string(), "exact".to_string());
+        let row = code_edge_to_row(&with_meta);
+        assert_eq!(
+            row.metadata
+                .as_ref()
+                .and_then(|value| value.get("resolution_method")),
+            Some(&serde_json::Value::String("exact".to_string())),
+            "edge attributes are flattened into a JSON object"
+        );
     }
 
     #[test]
