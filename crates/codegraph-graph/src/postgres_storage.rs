@@ -39,6 +39,13 @@
 //! the top-k order differs (96% vs 100% precision, 9% top-10 overlap in
 //! `docs/BACKEND_EVALUATION.md`). BM25 ranking is out of scope here.
 //!
+//! ## Node embeddings
+//!
+//! `nodes` keeps a single `embedding_1024` vector column, so
+//! [`NodeEmbeddingRecord::column`] is ignored on this backend: every write goes to
+//! `embedding_1024` regardless of the requested `embedding_384`..`embedding_4096`
+//! name. Vectors that are not 1024-dimensional are rejected by pgvector.
+//!
 //! ## Upgrading an existing database
 //!
 //! `CREATE TABLE IF NOT EXISTS` never adds columns, so the DDL also runs
@@ -50,7 +57,8 @@
 
 use crate::edge::CodeEdge;
 use crate::storage::{
-    ChunkEmbeddingRecord, FileMetadataRecord, ReconcileOutcome, SymbolEmbeddingRecord,
+    ChunkEmbeddingRecord, FileMetadataRecord, NodeEmbeddingRecord, ProjectMetadataRecord,
+    ReconcileOutcome, SymbolEmbeddingRecord,
 };
 use async_trait::async_trait;
 use codegraph_core::CodeNode;
@@ -158,8 +166,8 @@ pub struct ReconcileStats {
     pub stale_files: u64,
 }
 
-/// DDL for the chunk, edge, node, symbol-embedding and file-metadata tables. Every
-/// statement is idempotent.
+/// DDL for the chunk, edge, node, symbol-embedding, file-metadata and
+/// project-metadata tables. Every statement is idempotent.
 pub const SCHEMA_DDL: &str = r#"
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -248,6 +256,22 @@ CREATE TABLE IF NOT EXISTS file_metadata (
   PRIMARY KEY (project_id, file_path)
 );
 CREATE INDEX IF NOT EXISTS file_metadata_project ON file_metadata(project_id);
+
+CREATE TABLE IF NOT EXISTS project_metadata (
+  project_id        text PRIMARY KEY,
+  name              text NOT NULL,
+  root_path         text NOT NULL,
+  primary_language  text,
+  file_count        bigint NOT NULL DEFAULT 0,
+  node_count        bigint NOT NULL DEFAULT 0,
+  edge_count        bigint NOT NULL DEFAULT 0,
+  avg_coverage_score real NOT NULL DEFAULT 0,
+  last_analyzed     timestamptz NOT NULL DEFAULT now(),
+  codegraph_version text NOT NULL DEFAULT '',
+  organization_id   text,
+  domain            text,
+  metadata          jsonb NOT NULL DEFAULT '{}'::jsonb
+);
 "#;
 
 /// Staging table for `COPY`. The embedding is carried as text so we never have to
@@ -442,6 +466,53 @@ SELECT file_path, content_hash FROM file_metadata WHERE project_id = $1
 
 const DELETE_FILES_SQL: &str = r#"
 DELETE FROM file_metadata WHERE project_id = $1 AND file_path = ANY($2)
+"#;
+
+/// Node ids living in the files a delete request names.
+const NODE_IDS_BY_FILE_SQL: &str = r#"
+SELECT id FROM nodes WHERE project_id = $1 AND file_path = ANY($2)
+"#;
+
+const DELETE_EDGES_BY_ENDPOINTS_SQL: &str = r#"
+DELETE FROM edges WHERE project_id = $1 AND (from_id = ANY($2) OR to_id = ANY($2))
+"#;
+
+/// Update node vectors in one statement. `unnest` keeps id and embedding aligned by
+/// position, so a partial vector list cannot silently shift onto the wrong node.
+///
+/// `nodes` has a single `embedding_1024` column: [`NodeEmbeddingRecord::column`] is
+/// ignored here (SurrealDB keeps one column per dimension).
+///
+/// There is no `project_id` predicate because [`NodeEmbeddingRecord`] does not carry
+/// one; `nodes.id` is the primary key, so a matching id is unambiguous across
+/// projects.
+const UPDATE_NODE_EMBEDDINGS_SQL: &str = r#"
+UPDATE nodes AS n
+   SET embedding_1024 = v.embedding::vector
+  FROM (SELECT unnest($1::text[]) AS id, unnest($2::text[]) AS embedding) AS v
+ WHERE n.id = v.id
+"#;
+
+/// `last_analyzed` travels as RFC 3339 text and `metadata` as JSON text, both cast
+/// server-side, matching [`UPSERT_FILE_METADATA_SQL`].
+const UPSERT_PROJECT_METADATA_SQL: &str = r#"
+INSERT INTO project_metadata (project_id, name, root_path, primary_language,
+  file_count, node_count, edge_count, avg_coverage_score, last_analyzed,
+  codegraph_version, organization_id, domain, metadata)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::timestamptz, $10, $11, $12, $13::text::jsonb)
+ON CONFLICT (project_id) DO UPDATE SET
+  name = EXCLUDED.name,
+  root_path = EXCLUDED.root_path,
+  primary_language = EXCLUDED.primary_language,
+  file_count = EXCLUDED.file_count,
+  node_count = EXCLUDED.node_count,
+  edge_count = EXCLUDED.edge_count,
+  avg_coverage_score = EXCLUDED.avg_coverage_score,
+  last_analyzed = EXCLUDED.last_analyzed,
+  codegraph_version = EXCLUDED.codegraph_version,
+  organization_id = EXCLUDED.organization_id,
+  domain = EXCLUDED.domain,
+  metadata = EXCLUDED.metadata
 "#;
 
 const KNN_SQL: &str = r#"
@@ -1354,6 +1425,114 @@ impl PgStore {
         Ok(deleted)
     }
 
+    /// Delete every row owned by the named files: edges touching their nodes, then
+    /// symbol embeddings and chunks, then the nodes, then their file metadata.
+    ///
+    /// All five statements run in one transaction, ordered so dependants go before
+    /// the nodes they reference. Returns the sum of the five affected-row counts.
+    /// An empty slice deletes nothing and returns `Ok(0)`.
+    pub async fn delete_data_for_files(
+        &self,
+        project_id: &str,
+        file_paths: &[String],
+    ) -> Result<u64> {
+        if file_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let mut client = self.pool.get().await.map_err(db_err)?;
+        let transaction = client.transaction().await.map_err(db_err)?;
+
+        let node_rows = transaction
+            .query(NODE_IDS_BY_FILE_SQL, &[&project_id, &file_paths])
+            .await
+            .map_err(db_err)?;
+        let node_ids: Vec<String> = node_rows.iter().map(|row| row.get(0)).collect();
+
+        let mut deleted = 0u64;
+        if !node_ids.is_empty() {
+            deleted += transaction
+                .execute(DELETE_EDGES_BY_ENDPOINTS_SQL, &[&project_id, &node_ids])
+                .await
+                .map_err(db_err)?;
+            deleted += transaction
+                .execute(DELETE_STALE_SYMBOLS_SQL, &[&project_id, &node_ids])
+                .await
+                .map_err(db_err)?;
+            deleted += transaction
+                .execute(DELETE_STALE_CHUNKS_SQL, &[&project_id, &node_ids])
+                .await
+                .map_err(db_err)?;
+            deleted += transaction
+                .execute(DELETE_STALE_NODES_SQL, &[&project_id, &node_ids])
+                .await
+                .map_err(db_err)?;
+        }
+        deleted += transaction
+            .execute(DELETE_FILES_SQL, &[&project_id, &file_paths])
+            .await
+            .map_err(db_err)?;
+
+        transaction.commit().await.map_err(db_err)?;
+        Ok(deleted)
+    }
+
+    /// Write node vectors by id. [`NodeEmbeddingRecord::column`] is ignored: the
+    /// `nodes` table keeps a single `embedding_1024` vector column, so every row goes
+    /// there regardless of the dimension-specific name SurrealDB would use. pgvector
+    /// rejects vectors that are not 1024-dimensional.
+    ///
+    /// An empty slice returns `Ok(0)` without touching the database.
+    pub async fn update_node_embeddings(&self, rows: &[NodeEmbeddingRecord]) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        let embeddings: Vec<String> = rows.iter().map(|row| vector_text(&row.embedding)).collect();
+
+        let client = self.pool.get().await.map_err(db_err)?;
+        let updated = client
+            .execute(UPDATE_NODE_EMBEDDINGS_SQL, &[&ids, &embeddings])
+            .await
+            .map_err(db_err)?;
+        Ok(updated)
+    }
+
+    /// Insert or replace the project-level metadata row.
+    ///
+    /// `project_id` is the primary key, so re-indexing replaces the previous row
+    /// instead of appending one. `last_analyzed` is supplied by the caller (unlike
+    /// `file_metadata`, which stamps `now()`).
+    pub async fn upsert_project_metadata(&self, record: &ProjectMetadataRecord) -> Result<()> {
+        let last_analyzed = record.last_analyzed.to_rfc3339();
+        let metadata = metadata_text(Some(&record.metadata))?.unwrap_or_else(|| "{}".to_string());
+
+        let client = self.pool.get().await.map_err(db_err)?;
+        client
+            .execute(
+                UPSERT_PROJECT_METADATA_SQL,
+                &[
+                    &record.project_id,
+                    &record.name,
+                    &record.root_path,
+                    &record.primary_language,
+                    &record.file_count,
+                    &record.node_count,
+                    &record.edge_count,
+                    &record.avg_coverage_score,
+                    &last_analyzed,
+                    &record.codegraph_version,
+                    &record.organization_id,
+                    &record.domain,
+                    &metadata,
+                ],
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Remove catalog rows that this run did not re-emit, for the whole project.
     ///
     /// Mirrors `SurrealDbStorage::reconcile_catalog_by_file` without its per-file
@@ -1676,6 +1855,22 @@ impl crate::storage::IndexStorage for PgStore {
         Ok(PgStore::upsert_file_metadata(self, &rows).await?)
     }
 
+    async fn update_node_embeddings(&self, rows: &[NodeEmbeddingRecord]) -> anyhow::Result<u64> {
+        Ok(PgStore::update_node_embeddings(self, rows).await?)
+    }
+
+    async fn delete_data_for_files(
+        &self,
+        project_id: &str,
+        file_paths: &[String],
+    ) -> anyhow::Result<u64> {
+        Ok(PgStore::delete_data_for_files(self, project_id, file_paths).await?)
+    }
+
+    async fn upsert_project_metadata(&self, record: ProjectMetadataRecord) -> anyhow::Result<()> {
+        Ok(PgStore::upsert_project_metadata(self, &record).await?)
+    }
+
     async fn reconcile(
         &self,
         project_id: &str,
@@ -1788,13 +1983,21 @@ mod tests {
             }
         }
         assert_eq!(
-            table_count, 5,
-            "expected chunks + edges + nodes + symbol_embeddings + file_metadata tables"
+            table_count, 6,
+            "expected chunks + edges + nodes + symbol_embeddings + file_metadata + \
+             project_metadata tables"
         );
         assert_eq!(
             index_count, 17,
-            "expected 17 chunks/edges/nodes/symbol/file_metadata indexes"
+            "expected 17 chunks/edges/nodes/symbol/file_metadata indexes \
+             (project_metadata is keyed by its primary key and needs no extra index)"
         );
+    }
+
+    #[test]
+    fn pg_store_implements_index_storage() {
+        fn assert_impl<T: crate::storage::IndexStorage>() {}
+        assert_impl::<PgStore>();
     }
 
     #[test]
@@ -2683,6 +2886,267 @@ mod tests {
         assert!(hashes.contains_key("src/a.rs"));
         assert!(hashes.contains_key("src/c.rs"));
         assert!(!hashes.contains_key("src/b.rs"));
+    }
+
+    fn project_meta(project: &str, name: &str, node_count: i64) -> ProjectMetadataRecord {
+        ProjectMetadataRecord {
+            metadata: serde_json::json!({ "name": name }),
+            project_id: project.to_string(),
+            name: name.to_string(),
+            root_path: format!("/tmp/{name}"),
+            primary_language: Some("rust".to_string()),
+            file_count: 1,
+            node_count,
+            edge_count: 0,
+            avg_coverage_score: 0.5,
+            last_analyzed: chrono::Utc::now(),
+            codegraph_version: "test".to_string(),
+            organization_id: None,
+            domain: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn project_metadata_upsert_and_replace() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("project_meta");
+        store
+            .upsert_project_metadata(&project_meta(&project, "first", 3))
+            .await
+            .expect("first upsert");
+
+        let client = store.pool.get().await.expect("pool get");
+        let row = client
+            .query_one(
+                "SELECT name, root_path, node_count, metadata::text
+                   FROM project_metadata WHERE project_id = $1",
+                &[&project],
+            )
+            .await
+            .expect("select");
+        assert_eq!(row.get::<_, String>(0), "first");
+        assert_eq!(row.get::<_, String>(1), "/tmp/first");
+        assert_eq!(row.get::<_, i64>(2), 3);
+        let metadata: serde_json::Value =
+            serde_json::from_str(&row.get::<_, String>(3)).expect("metadata is JSON");
+        assert_eq!(metadata, serde_json::json!({ "name": "first" }));
+
+        store
+            .upsert_project_metadata(&project_meta(&project, "second", 7))
+            .await
+            .expect("second upsert");
+
+        let rows = client
+            .query(
+                "SELECT name, node_count FROM project_metadata WHERE project_id = $1",
+                &[&project],
+            )
+            .await
+            .expect("select after replace");
+        assert_eq!(
+            rows.len(),
+            1,
+            "project_id is the primary key: a re-upsert replaces the row"
+        );
+        assert_eq!(rows[0].get::<_, String>(0), "second");
+        assert_eq!(rows[0].get::<_, i64>(1), 7);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn update_node_embeddings_sets_vector() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("node_emb");
+        store
+            .upsert_nodes(&[
+                node_in("emb_a", &project, "src/a.rs"),
+                node_in("emb_b", &project, "src/a.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+
+        assert_eq!(
+            store
+                .update_node_embeddings(&[])
+                .await
+                .expect("empty batch"),
+            0,
+            "an empty batch touches nothing"
+        );
+
+        let rows = vec![NodeEmbeddingRecord {
+            id: "emb_a".to_string(),
+            column: "embedding_1024",
+            embedding: unit_vector(7),
+            updated_at: chrono::Utc::now(),
+        }];
+        let updated = store
+            .update_node_embeddings(&rows)
+            .await
+            .expect("update embeddings");
+        assert_eq!(updated, 1, "only emb_a matches");
+
+        let client = store.pool.get().await.expect("pool get");
+        let a_has_vector: bool = client
+            .query_one(
+                "SELECT embedding_1024 IS NOT NULL FROM nodes WHERE id = $1",
+                &[&"emb_a"],
+            )
+            .await
+            .expect("select emb_a")
+            .get(0);
+        let b_has_vector: bool = client
+            .query_one(
+                "SELECT embedding_1024 IS NOT NULL FROM nodes WHERE id = $1",
+                &[&"emb_b"],
+            )
+            .await
+            .expect("select emb_b")
+            .get(0);
+        assert!(a_has_vector, "emb_a received the vector");
+        assert!(!b_has_vector, "emb_b must keep a NULL vector");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn delete_data_for_files_clears_five_tables() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("file_purge");
+        store
+            .upsert_nodes(&[
+                node_in("purge_a1", &project, "src/a.rs"),
+                node_in("purge_a2", &project, "src/a.rs"),
+                node_in("purge_b1", &project, "src/b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_edges(&[
+                edge_row("purge_ab", &project, "purge_a1", "purge_b1"),
+                edge_row("purge_bb", &project, "purge_b1", "purge_b1"),
+            ])
+            .await
+            .expect("upsert edges");
+        store
+            .upsert_chunks(&[
+                ChunkRow {
+                    id: "purge_chunk_a".to_string(),
+                    project_id: project.clone(),
+                    chunk_index: 0,
+                    text: "text a".to_string(),
+                    parent_node: "purge_a1".to_string(),
+                    embedding: unit_vector(0),
+                    embedding_model: "test-model".to_string(),
+                },
+                ChunkRow {
+                    id: "purge_chunk_b".to_string(),
+                    project_id: project.clone(),
+                    chunk_index: 0,
+                    text: "text b".to_string(),
+                    parent_node: "purge_b1".to_string(),
+                    embedding: unit_vector(1),
+                    embedding_model: "test-model".to_string(),
+                },
+            ])
+            .await
+            .expect("upsert chunks");
+        let mut symbol_a = symbol_embedding("purge_sym_a", &project, "sym_a", unit_vector(2));
+        symbol_a.node_id = Some("purge_a1".to_string());
+        let mut symbol_b = symbol_embedding("purge_sym_b", &project, "sym_b", unit_vector(3));
+        symbol_b.node_id = Some("purge_b1".to_string());
+        store
+            .upsert_symbol_embeddings(&[symbol_a, symbol_b])
+            .await
+            .expect("upsert symbols");
+        store
+            .upsert_file_metadata(&[
+                file_meta(&project, "src/a.rs", "hash_a"),
+                file_meta(&project, "src/b.rs", "hash_b"),
+            ])
+            .await
+            .expect("upsert metadata");
+
+        let deleted = store
+            .delete_data_for_files(&project, &["src/a.rs".to_string()])
+            .await
+            .expect("delete_data_for_files");
+        assert_eq!(
+            deleted, 6,
+            "1 edge + 1 symbol + 1 chunk + 2 nodes + 1 metadata row"
+        );
+
+        let client = store.pool.get().await.expect("pool get");
+        let remaining_nodes: i64 = client
+            .query_one(
+                "SELECT count(*) FROM nodes WHERE project_id = $1",
+                &[&project],
+            )
+            .await
+            .expect("count nodes")
+            .get(0);
+        assert_eq!(remaining_nodes, 1, "b.rs survives the a.rs purge");
+        let b_node: i64 = client
+            .query_one("SELECT count(*) FROM nodes WHERE id = $1", &[&"purge_b1"])
+            .await
+            .expect("select b node")
+            .get(0);
+        assert_eq!(b_node, 1, "the b.rs node must not be deleted");
+
+        let stale_edges: i64 = client
+            .query_one(
+                "SELECT count(*) FROM edges WHERE project_id = $1 AND id = $2",
+                &[&project, &"purge_ab"],
+            )
+            .await
+            .expect("count stale edges")
+            .get(0);
+        assert_eq!(stale_edges, 0, "the edge touching a.rs is gone");
+        let surviving_edges: i64 = client
+            .query_one(
+                "SELECT count(*) FROM edges WHERE project_id = $1 AND id = $2",
+                &[&project, &"purge_bb"],
+            )
+            .await
+            .expect("count surviving edges")
+            .get(0);
+        assert_eq!(surviving_edges, 1, "the b.rs self-edge survives");
+
+        let stale_chunks: i64 = client
+            .query_one(
+                "SELECT count(*) FROM chunks WHERE project_id = $1 AND parent_node = $2",
+                &[&project, &"purge_a1"],
+            )
+            .await
+            .expect("count stale chunks")
+            .get(0);
+        assert_eq!(stale_chunks, 0);
+        let stale_symbols: i64 = client
+            .query_one(
+                "SELECT count(*) FROM symbol_embeddings WHERE project_id = $1 AND node_id = $2",
+                &[&project, &"purge_a1"],
+            )
+            .await
+            .expect("count stale symbols")
+            .get(0);
+        assert_eq!(stale_symbols, 0);
+
+        let hashes = store.file_hashes(&project).await.expect("file_hashes");
+        assert_eq!(hashes.len(), 1, "only b.rs metadata remains");
+        assert!(hashes.contains_key("src/b.rs"));
+        assert!(!hashes.contains_key("src/a.rs"));
     }
 
     #[tokio::test]

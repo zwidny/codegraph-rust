@@ -8,8 +8,9 @@
 //! [`IndexStorage`] trait describes only the operations `ProjectIndexer` calls
 //! today; both `SurrealDbStorage` and `PgStore` implement it.
 //!
-//! The writer queue (backpressure, batching, flush) stays a SurrealDB-side
-//! optimisation; a Postgres writer is deliberately left for a later step.
+//! The writer queue (backpressure, batching, flush) in `codegraph-mcp` drives this
+//! trait, so it is backend-neutral: wiring Postgres into it is a storage-pool
+//! change, not a queue change.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -246,6 +247,23 @@ impl FileMetadataRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectMetadataRecord {
+    pub metadata: JsonValue,
+    pub project_id: String,
+    pub name: String,
+    pub root_path: String,
+    pub primary_language: Option<String>,
+    pub file_count: i64,
+    pub node_count: i64,
+    pub edge_count: i64,
+    pub avg_coverage_score: f32,
+    pub last_analyzed: DateTime<Utc>,
+    pub codegraph_version: String,
+    pub organization_id: Option<String>,
+    pub domain: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeEmbeddingRecord {
     pub id: String,
@@ -429,8 +447,8 @@ pub struct ReconcileOutcome {
 /// The storage operations the indexing pipeline needs, independent of backend.
 ///
 /// Deliberately narrow: only what `ProjectIndexer` calls today. Bulk writes are
-/// expressed as `upsert_*` batches; the writer queue (backpressure, batching,
-/// flush) stays a SurrealDB-side optimisation until the Postgres writer exists.
+/// expressed as `upsert_*` batches, and the writer queue in `codegraph-mcp`
+/// (backpressure, batching, flush) drives this trait rather than a concrete store.
 #[async_trait]
 pub trait IndexStorage: Send + Sync {
     async fn upsert_nodes(&self, nodes: &[CodeNode]) -> Result<u64>;
@@ -438,6 +456,10 @@ pub trait IndexStorage: Send + Sync {
     async fn upsert_chunks(&self, chunks: &[ChunkEmbeddingRecord]) -> Result<u64>;
     async fn upsert_symbols(&self, symbols: &[SymbolEmbeddingRecord]) -> Result<u64>;
     async fn upsert_file_metadata(&self, files: &[FileMetadataRecord]) -> Result<u64>;
+
+    async fn update_node_embeddings(&self, rows: &[NodeEmbeddingRecord]) -> Result<u64>;
+    async fn delete_data_for_files(&self, project_id: &str, file_paths: &[String]) -> Result<u64>;
+    async fn upsert_project_metadata(&self, record: ProjectMetadataRecord) -> Result<()>;
 
     async fn reconcile(
         &self,

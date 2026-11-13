@@ -1,6 +1,6 @@
 use crate::edge::CodeEdge;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use codegraph_core::{CodeGraphError, CodeNode, GraphStore, NodeId, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -2338,10 +2338,10 @@ impl GraphStore for SurrealDbStorage {
 #[cfg(test)]
 pub(crate) use crate::storage::hex_lower;
 pub use crate::storage::{
-    ChunkEmbeddingRecord, FileMetadataRecord, NodeEmbeddingRecord, SURR_EMBEDDING_COLUMN_384,
-    SURR_EMBEDDING_COLUMN_768, SURR_EMBEDDING_COLUMN_1024, SURR_EMBEDDING_COLUMN_1536,
-    SURR_EMBEDDING_COLUMN_2048, SURR_EMBEDDING_COLUMN_2560, SURR_EMBEDDING_COLUMN_3072,
-    SURR_EMBEDDING_COLUMN_4096, SymbolEmbeddingRecord,
+    ChunkEmbeddingRecord, FileMetadataRecord, NodeEmbeddingRecord, ProjectMetadataRecord,
+    SURR_EMBEDDING_COLUMN_384, SURR_EMBEDDING_COLUMN_768, SURR_EMBEDDING_COLUMN_1024,
+    SURR_EMBEDDING_COLUMN_1536, SURR_EMBEDDING_COLUMN_2048, SURR_EMBEDDING_COLUMN_2560,
+    SURR_EMBEDDING_COLUMN_3072, SURR_EMBEDDING_COLUMN_4096, SymbolEmbeddingRecord,
 };
 
 pub struct SymbolEmbeddingUpsert<'a> {
@@ -2372,23 +2372,6 @@ impl<'a> From<&SymbolEmbeddingUpsert<'a>> for SymbolEmbeddingRecord {
             record.metadata.clone(),
         )
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ProjectMetadataRecord {
-    pub metadata: JsonValue,
-    pub project_id: String,
-    pub name: String,
-    pub root_path: String,
-    pub primary_language: Option<String>,
-    pub file_count: i64,
-    pub node_count: i64,
-    pub edge_count: i64,
-    pub avg_coverage_score: f32,
-    pub last_analyzed: DateTime<Utc>,
-    pub codegraph_version: String,
-    pub organization_id: Option<String>,
-    pub domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2820,6 +2803,31 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
         Ok(files.len() as u64)
     }
 
+    async fn update_node_embeddings(
+        &self,
+        rows: &[crate::storage::NodeEmbeddingRecord],
+    ) -> anyhow::Result<u64> {
+        self.update_node_embeddings_batch(rows).await?;
+        Ok(rows.len() as u64)
+    }
+
+    async fn delete_data_for_files(
+        &self,
+        project_id: &str,
+        file_paths: &[String],
+    ) -> anyhow::Result<u64> {
+        SurrealDbStorage::delete_data_for_files(self, project_id, file_paths).await?;
+        Ok(file_paths.len() as u64)
+    }
+
+    async fn upsert_project_metadata(
+        &self,
+        record: crate::storage::ProjectMetadataRecord,
+    ) -> anyhow::Result<()> {
+        SurrealDbStorage::upsert_project_metadata(self, record).await?;
+        Ok(())
+    }
+
     async fn reconcile(
         &self,
         project_id: &str,
@@ -2930,6 +2938,35 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_index_storage<T: crate::storage::IndexStorage>() {}
+
+    #[test]
+    fn surrealdb_storage_implements_index_storage() {
+        assert_index_storage::<SurrealDbStorage>();
+    }
+
+    /// `ProjectMetadataRecord` now lives in `crate::storage`; the SurrealDB adapter
+    /// re-exports it so existing `codegraph_graph::ProjectMetadataRecord` paths keep
+    /// resolving.
+    #[test]
+    fn project_metadata_record_is_reexported_by_surrealdb() {
+        let _: crate::storage::ProjectMetadataRecord = ProjectMetadataRecord {
+            metadata: serde_json::json!({}),
+            project_id: "p".into(),
+            name: "n".into(),
+            root_path: "/r".into(),
+            primary_language: None,
+            file_count: 0,
+            node_count: 0,
+            edge_count: 0,
+            avg_coverage_score: 0.0,
+            last_analyzed: chrono::Utc::now(),
+            codegraph_version: "v".into(),
+            organization_id: None,
+            domain: None,
+        };
+    }
 
     /// A stalled server write must surface as a timeout, not park the run forever.
     #[tokio::test]

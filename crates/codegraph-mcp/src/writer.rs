@@ -1,11 +1,15 @@
 // ABOUTME: Bounded asynchronous graph writer with durable ordering barriers.
 // ABOUTME: Separates database batching and queue memory from inference settings.
 
+//! The queue itself is backend-neutral: it holds `Arc<dyn IndexStorage>` handles, so
+//! a Postgres pool runs through the same batching, backpressure and flush barriers
+//! as SurrealDB.
+
 use anyhow::{Result, anyhow};
 use codegraph_core::CodeNode;
 use codegraph_graph::{
     ChunkEmbeddingRecord, FileMetadataRecord, NodeEmbeddingRecord, ProjectMetadataRecord,
-    SurrealDbStorage, SymbolEmbeddingRecord, edge::CodeEdge,
+    SymbolEmbeddingRecord, edge::CodeEdge, storage::IndexStorage,
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::Serialize;
@@ -17,7 +21,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 enum Job {
@@ -227,21 +231,32 @@ impl Job {
 }
 async fn execute(
     job: Job,
-    storage: Arc<Mutex<SurrealDbStorage>>,
+    storage: Arc<dyn IndexStorage>,
     metrics: &WriteMetrics,
     bytes: u64,
 ) -> Result<()> {
     let rows = job.rows();
-    let mut storage = storage.lock().await;
     match job {
-        Job::Nodes(rows) => storage.upsert_nodes_batch(&rows).await?,
-        Job::Edges(rows) => storage.upsert_edges_batch(&rows).await?,
-        Job::NodeEmbeddings(rows) => storage.update_node_embeddings_batch(&rows).await?,
-        Job::SymbolEmbeddings(rows) => storage.upsert_symbol_embeddings_batch(&rows).await?,
-        Job::ChunkEmbeddings(rows) => storage.upsert_chunk_embeddings_resilient(&rows).await?,
-        Job::FileMetadata(rows) => storage.upsert_file_metadata_batch(&rows).await?,
+        Job::Nodes(rows) => {
+            storage.upsert_nodes(&rows).await?;
+        }
+        Job::Edges(rows) => {
+            storage.upsert_edges(&rows).await?;
+        }
+        Job::NodeEmbeddings(rows) => {
+            storage.update_node_embeddings(&rows).await?;
+        }
+        Job::SymbolEmbeddings(rows) => {
+            storage.upsert_symbols(&rows).await?;
+        }
+        Job::ChunkEmbeddings(rows) => {
+            storage.upsert_chunks(&rows).await?;
+        }
+        Job::FileMetadata(rows) => {
+            storage.upsert_file_metadata(&rows).await?;
+        }
         Job::DeleteFiles { paths, project } => {
-            storage.delete_data_for_files(&project, &paths).await?
+            storage.delete_data_for_files(&project, &paths).await?;
         }
         Job::ProjectMetadata(row) => storage.upsert_project_metadata(row).await?,
         Job::Flush(_) | Job::Shutdown(_) => unreachable!("barriers handled by writer"),
@@ -281,7 +296,7 @@ pub(crate) struct SurrealWriterHandle {
 }
 
 impl SurrealWriterHandle {
-    pub(crate) fn new(pool: Vec<Arc<Mutex<SurrealDbStorage>>>) -> Self {
+    pub(crate) fn new(pool: Vec<Arc<dyn IndexStorage>>) -> Self {
         assert!(!pool.is_empty(), "writer requires a storage handle");
         let limits = Limits::from_env();
         let memory = Arc::new(Semaphore::new(limits.queue_bytes));
@@ -534,9 +549,9 @@ impl SurrealWriterHandle {
 mod tests {
     use super::*;
     use codegraph_core::{Language, Location, NodeType};
-    use codegraph_graph::SurrealDbConfig;
+    use codegraph_graph::{SurrealDbConfig, SurrealDbStorage};
 
-    async fn fixture() -> (SurrealWriterHandle, Arc<Mutex<SurrealDbStorage>>) {
+    async fn fixture() -> (SurrealWriterHandle, Arc<SurrealDbStorage>) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = SurrealDbConfig::embedded(dir.path());
         config.connection = "mem://".into();
@@ -549,14 +564,14 @@ mod tests {
                 .replace('.', "_")
         );
         config.auto_migrate = false;
-        let storage = SurrealDbStorage::new(config.clone()).await.unwrap();
+        let storage = Arc::new(SurrealDbStorage::new(config.clone()).await.unwrap());
         storage.db().query("DEFINE TABLE nodes SCHEMALESS; DEFINE FIELD name ON nodes TYPE string ASSERT $value != 'bad'; DEFINE TABLE project_metadata SCHEMALESS;").await.unwrap().check().unwrap();
-        let first = Arc::new(Mutex::new(storage));
-        let second = first.clone();
-        let mut writer = SurrealWriterHandle::new(vec![first.clone(), second]);
+        let first: Arc<dyn IndexStorage> = storage.clone();
+        let second: Arc<dyn IndexStorage> = storage.clone();
+        let mut writer = SurrealWriterHandle::new(vec![first, second]);
         writer.limits.rows = 1;
         writer.limits.bytes = 2048;
-        (writer, first)
+        (writer, storage)
     }
 
     fn node(name: &str) -> CodeNode {
@@ -602,8 +617,6 @@ mod tests {
         writer.enqueue_project_metadata(metadata()).await.unwrap();
         assert!(writer.flush().await.is_err());
         let mut response = storage
-            .lock()
-            .await
             .db()
             .query("SELECT * FROM project_metadata")
             .await
@@ -616,8 +629,6 @@ mod tests {
         writer.enqueue_project_metadata(metadata()).await.unwrap();
         writer.flush().await.unwrap();
         let mut response = storage
-            .lock()
-            .await
             .db()
             .query("SELECT * FROM project_metadata")
             .await

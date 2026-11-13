@@ -7,6 +7,7 @@ use crate::estimation::parse_files_with_unified_extraction as shared_unified_par
 use anyhow::{Context, Result, anyhow};
 use codegraph_core::{CodeNode, EdgeRelationship, EdgeType, NodeId, NodeType};
 use codegraph_graph::ChunkEmbeddingRecord;
+use codegraph_graph::storage::IndexStorage;
 use codegraph_graph::{
     FileMetadataRecord, NodeEmbeddingRecord, ProjectMetadataRecord, SURR_EMBEDDING_COLUMN_384,
     SURR_EMBEDDING_COLUMN_768, SURR_EMBEDDING_COLUMN_1024, SURR_EMBEDDING_COLUMN_1536,
@@ -380,7 +381,16 @@ impl ProjectIndexer {
                 .with_extraction_policy(extraction_policy_for_tier(config.indexing_tier));
             let project_root = config.project_root.clone();
             let (surreal, surreal_pool) = Self::connect_surreal(&project_root).await?;
-            let surreal_writer = SurrealWriterHandle::new(surreal_pool);
+            // The queue is backend-neutral. `SurrealDbStorage` is `#[derive(Clone)]`
+            // over `Arc` fields, so each handle clones a shared connection rather
+            // than opening a new one; the trait impl clones again per write.
+            let mut storage_pool: Vec<Arc<dyn IndexStorage>> =
+                Vec::with_capacity(surreal_pool.len());
+            for handle in &surreal_pool {
+                let storage = handle.lock().await.clone();
+                storage_pool.push(Arc::new(storage) as Arc<dyn IndexStorage>);
+            }
+            let surreal_writer = SurrealWriterHandle::new(storage_pool);
             let project_id = std::env::var("CODEGRAPH_PROJECT_ID")
                 .unwrap_or_else(|_| project_root.display().to_string());
             let organization_id = std::env::var("CODEGRAPH_ORGANIZATION_ID").ok();
