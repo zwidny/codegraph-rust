@@ -25,6 +25,20 @@
 //! Only whole-project reconciliation is implemented. The per-file `scope` parameter
 //! for partial indexing is deliberately deferred until the indexer is wired in.
 //!
+//! ## Node retrieval
+//!
+//! `nodes` can be searched three ways: [`PgStore::knn_nodes`] (pgvector cosine
+//! distance over `embedding_1024`), [`PgStore::full_text_nodes`] (`ts_rank_cd` over
+//! the generated `content_tsv`) and [`PgStore::hybrid_nodes`], which fuses both lists
+//! with Reciprocal Rank Fusion and keeps single-retriever hits.
+//!
+//! Full-text recall is made equivalent to SurrealDB's `EDGENGRAM(2,12)` by turning
+//! every query term into a prefix tsquery (`term:*`); the `english` configuration
+//! supplies the same stemming as `SNOWBALL`. **Ranking is not equivalent**: Postgres
+//! uses `ts_rank_cd`, not BM25, so even when both backends return the same node set
+//! the top-k order differs (96% vs 100% precision, 9% top-10 overlap in
+//! `docs/BACKEND_EVALUATION.md`). BM25 ranking is out of scope here.
+//!
 //! ## Upgrading an existing database
 //!
 //! `CREATE TABLE IF NOT EXISTS` never adds columns, so the DDL also runs
@@ -94,6 +108,20 @@ pub struct EdgeRow {
     pub from_id: String,
     pub to_id: String,
     pub edge_type: String,
+}
+
+/// One fused node hit produced by [`PgStore::hybrid_nodes`].
+///
+/// `rrf` is the Reciprocal Rank Fusion score, `vector_rank`/`text_rank` are the
+/// 1-based positions the node held in the KNN and full-text lists respectively.
+/// A node found by only one retriever keeps `None` for the other rank; the RRF
+/// formulation rewards appearing in both lists but never discards a single-list hit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub id: String,
+    pub rrf: f64,
+    pub vector_rank: Option<usize>,
+    pub text_rank: Option<usize>,
 }
 
 /// Per-table row counts removed by [`PgStore::reconcile`].
@@ -354,6 +382,27 @@ ORDER BY embedding <=> $1::text::vector
 LIMIT $3
 "#;
 
+/// Node-level KNN over `embedding_1024`. Nodes without a vector are skipped, so the
+/// limit counts candidates rather than rows that would sort as `NaN`.
+const KNN_NODES_SQL: &str = r#"
+SELECT id, (embedding_1024 <=> $1::text::vector) AS distance
+FROM nodes
+WHERE project_id = $2 AND embedding_1024 IS NOT NULL
+ORDER BY embedding_1024 <=> $1::text::vector
+LIMIT $3
+"#;
+
+/// Node-level full-text retrieval. Ranking uses `ts_rank_cd`, not BM25: the recall
+/// matches SurrealDB's BM25 but the ordering does not (see
+/// `docs/BACKEND_EVALUATION.md`).
+const FULL_TEXT_NODES_SQL: &str = r#"
+SELECT id, ts_rank_cd(content_tsv, to_tsquery('english', $1))::double precision AS rank
+FROM nodes
+WHERE project_id = $2 AND content_tsv @@ to_tsquery('english', $1)
+ORDER BY rank DESC, id ASC
+LIMIT $3
+"#;
+
 const REVERSE_DEPS_SQL: &str = r#"
 WITH RECURSIVE rd(id, depth) AS (
   SELECT from_id, 1 FROM edges
@@ -371,6 +420,20 @@ pub const DEFAULT_EDGE_TYPE: &str = "calls";
 
 /// Maximum traversal depth accepted by [`PgStore::reverse_deps`].
 pub const MAX_REVERSE_DEPTH: u32 = 10;
+
+/// Upper bound on `k` for every node-retrieval method, so a caller cannot ask the
+/// pool for an unbounded result set.
+pub const MAX_RETRIEVAL_K: usize = 200;
+
+/// `k` used by [`PgStore::hybrid_nodes`] when the caller passes 0.
+pub const DEFAULT_HYBRID_K: usize = 50;
+
+/// Damping constant of the original Reciprocal Rank Fusion formulation.
+const RRF_K: f64 = 60.0;
+
+/// Longest single term accepted by [`tsquery_prefix`]. Lexemes are capped at 2047
+/// bytes by Postgres; 64 keeps generated queries short and rejects pasted blobs.
+const MAX_TSQUERY_TERM_LEN: usize = 64;
 
 /// Rows per staging transaction. Larger inputs are split so a single transaction
 /// (and its temporary table) stays bounded.
@@ -437,6 +500,103 @@ pub(crate) fn metadata_text(value: Option<&serde_json::Value>) -> Result<Option<
         .map(serde_json::to_string)
         .transpose()
         .map_err(Into::into)
+}
+
+/// Build a `to_tsquery('english', ...)` argument from a free-form user query.
+///
+/// The query is split on everything that is not ASCII-or-Unicode alphanumeric or
+/// `_`, lowercased, and every surviving term becomes `term:*` (a prefix match).
+/// Prefix matching is what makes the node path equivalent to SurrealDB's
+/// `EDGENGRAM(2,12)` tokenizer: `term` matches `terms`, `terminate`, ... .
+///
+/// Returns `None` when no usable term is left, so callers skip the database instead
+/// of sending an empty tsquery (which Postgres rejects). Splitting already removes
+/// `'`, `"`, `&`, `|`, `!`, `(`, `)` and `:`, so no quoting is needed.
+///
+/// camelCase is **not** split: `HandleFile` becomes `handlefile:*`, which would only
+/// match tokens that start with the literal `handlefile`.
+pub(crate) fn tsquery_prefix(query: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let cleaned: String = raw
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+            .collect();
+        if cleaned.is_empty() || cleaned.chars().count() > MAX_TSQUERY_TERM_LEN {
+            continue;
+        }
+        terms.push(format!("{cleaned}:*"));
+    }
+
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" & "))
+    }
+}
+
+/// Reciprocal Rank Fusion score contribution of one 1-based rank.
+fn rrf_contribution(rank: usize) -> f64 {
+    1.0 / (RRF_K + rank as f64)
+}
+
+/// Fuse two ranked id lists with Reciprocal Rank Fusion.
+///
+/// `score(id) = sum over lists containing id of 1 / (60 + rank)`, where `rank` is the
+/// 1-based position in that list. Hits present in only one list are kept with the
+/// other rank left `None`; that partial credit is the point of RRF.
+///
+/// A repeated id inside one list counts only at its first position (later occurrences
+/// are ignored, and do not shift the ranks of the remaining ids). Output is sorted by
+/// `rrf` descending, ties broken by `id` ascending, so equal scores are deterministic.
+/// `limit == 0` means "no limit".
+pub(crate) fn rrf_fuse(vector_ids: &[String], text_ids: &[String], limit: usize) -> Vec<SearchHit> {
+    let mut fused: BTreeMap<String, SearchHit> = BTreeMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for (index, id) in vector_ids.iter().enumerate() {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        let rank = index + 1;
+        let hit = fused.entry(id.clone()).or_insert_with(|| SearchHit {
+            id: id.clone(),
+            rrf: 0.0,
+            vector_rank: None,
+            text_rank: None,
+        });
+        hit.rrf += rrf_contribution(rank);
+        hit.vector_rank = Some(rank);
+    }
+
+    seen.clear();
+    for (index, id) in text_ids.iter().enumerate() {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        let rank = index + 1;
+        let hit = fused.entry(id.clone()).or_insert_with(|| SearchHit {
+            id: id.clone(),
+            rrf: 0.0,
+            vector_rank: None,
+            text_rank: None,
+        });
+        hit.rrf += rrf_contribution(rank);
+        hit.text_rank = Some(rank);
+    }
+
+    let mut hits: Vec<SearchHit> = fused.into_values().collect();
+    hits.sort_by(|a, b| {
+        b.rrf
+            .partial_cmp(&a.rrf)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    if limit > 0 {
+        hits.truncate(limit);
+    }
+    hits
 }
 
 /// Parse pgvector's text output format (`[0.1,0.25,-1.5]`) back into floats.
@@ -862,6 +1022,102 @@ impl PgStore {
             .collect())
     }
 
+    /// Nearest nodes for `query`, restricted to one project. Returns `(node_id,
+    /// cosine_distance)` ordered by increasing distance. Nodes without an
+    /// `embedding_1024` are excluded, and `k` is capped at [`MAX_RETRIEVAL_K`].
+    pub async fn knn_nodes(
+        &self,
+        project_id: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let k = k.min(MAX_RETRIEVAL_K);
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let vector = vector_text(query);
+        let limit = i64::try_from(k).unwrap_or(i64::MAX);
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(KNN_NODES_SQL, &[&vector, &project_id, &limit])
+            .await
+            .map_err(db_err)?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                // pgvector's distance operators return `double precision`.
+                let distance: f64 = row.get(1);
+                (id, distance as f32)
+            })
+            .collect())
+    }
+
+    /// Full-text node retrieval over `nodes.content_tsv` (name + content).
+    ///
+    /// Each query term becomes a prefix match (`term:*`), which reproduces the
+    /// recall of SurrealDB's `EDGENGRAM(2,12)`; the Postgres `english` configuration
+    /// provides the same stemming as `SNOWBALL`. Ranking is `ts_rank_cd`, **not**
+    /// BM25, so the top-k order differs from SurrealDB even when the candidate sets
+    /// agree (see `docs/BACKEND_EVALUATION.md`).
+    ///
+    /// A query with no usable term returns an empty list without touching the
+    /// database, and `k` is capped at [`MAX_RETRIEVAL_K`].
+    pub async fn full_text_nodes(
+        &self,
+        project_id: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        let k = k.min(MAX_RETRIEVAL_K);
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(tsquery) = tsquery_prefix(query) else {
+            return Ok(Vec::new());
+        };
+
+        let limit = i64::try_from(k).unwrap_or(i64::MAX);
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(FULL_TEXT_NODES_SQL, &[&tsquery, &project_id, &limit])
+            .await
+            .map_err(db_err)?;
+
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// Fuse vector and full-text node retrieval with Reciprocal Rank Fusion.
+    ///
+    /// Both retrievers run concurrently and each contributes up to `k` candidates;
+    /// `k == 0` selects [`DEFAULT_HYBRID_K`] and larger values are capped at
+    /// [`MAX_RETRIEVAL_K`]. The first `k` fused hits are returned.
+    pub async fn hybrid_nodes(
+        &self,
+        project_id: &str,
+        query: &[f32],
+        text: &str,
+        k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let k = if k == 0 {
+            DEFAULT_HYBRID_K
+        } else {
+            k.min(MAX_RETRIEVAL_K)
+        };
+
+        let (vector_rows, text_rows) = tokio::join!(
+            self.knn_nodes(project_id, query, k),
+            self.full_text_nodes(project_id, text, k)
+        );
+
+        let vector_ids: Vec<String> = vector_rows?.into_iter().map(|(id, _)| id).collect();
+        let text_ids: Vec<String> = text_rows?.into_iter().map(|(id, _)| id).collect();
+
+        Ok(rrf_fuse(&vector_ids, &text_ids, k))
+    }
+
     /// Walk incoming `calls` edges up to `depth` hops (capped at
     /// [`MAX_REVERSE_DEPTH`]). Returns every distinct upstream node id.
     pub async fn reverse_deps(
@@ -1037,9 +1293,6 @@ impl PgStore {
         transaction.commit().await.map_err(db_err)?;
         Ok(stats)
     }
-
-    // TODO(migration): full-text ranking via `ts_rank_cd(content_tsv, query)`
-    // once the POC grows a BM25/tsquery path.
 }
 
 #[cfg(test)]
@@ -1224,6 +1477,141 @@ mod tests {
         );
     }
 
+    // ---- Node retrieval: tsquery construction ----
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn tsquery_prefix_lowercases_and_camel_splits() {
+        // The name is kept for traceability with the spec; the implementation does
+        // NOT split camelCase, so `HandleFile` stays one lowercase term.
+        assert_eq!(
+            tsquery_prefix("HandleFile"),
+            Some("handlefile:*".to_string())
+        );
+        assert_eq!(
+            tsquery_prefix("handle_file"),
+            Some("handle_file:*".to_string()),
+            "underscores survive the split"
+        );
+    }
+
+    #[test]
+    fn tsquery_prefix_multiple_terms() {
+        assert_eq!(
+            tsquery_prefix("parse error"),
+            Some("parse:* & error:*".to_string())
+        );
+        assert_eq!(
+            tsquery_prefix("  Parse\tERROR\n"),
+            Some("parse:* & error:*".to_string()),
+            "whitespace and case are normalised"
+        );
+    }
+
+    #[test]
+    fn tsquery_prefix_rejects_empty_and_symbols() {
+        assert_eq!(tsquery_prefix(""), None);
+        assert_eq!(tsquery_prefix("!!!"), None);
+        assert_eq!(tsquery_prefix("   \t\n"), None);
+
+        // Terms longer than MAX_TSQUERY_TERM_LEN are dropped rather than truncated.
+        let long = "a".repeat(MAX_TSQUERY_TERM_LEN + 1);
+        assert_eq!(tsquery_prefix(&long), None);
+        let at_limit = "a".repeat(MAX_TSQUERY_TERM_LEN);
+        assert_eq!(
+            tsquery_prefix(&format!("{at_limit} ok")),
+            Some(format!("{at_limit}:* & ok:*"))
+        );
+    }
+
+    #[test]
+    fn tsquery_prefix_strips_unsafe_chars() {
+        assert_eq!(
+            tsquery_prefix("a;b'"),
+            Some("a:* & b:*".to_string()),
+            "punctuation splits terms, so no tsquery operator can survive"
+        );
+        assert_eq!(
+            tsquery_prefix("a&b|c!d(e)f"),
+            Some("a:* & b:* & c:* & d:* & e:* & f:*".to_string())
+        );
+        // Non-ASCII alphanumerics split out entirely rather than reaching tsquery.
+        assert_eq!(tsquery_prefix("名字"), None);
+    }
+
+    // ---- Node retrieval: RRF fusion ----
+
+    #[test]
+    fn rrf_prefers_items_in_both_lists() {
+        let vector = ids(&["a", "b", "c"]);
+        let text = ids(&["b", "a", "d"]);
+
+        let hits = rrf_fuse(&vector, &text, 0);
+
+        let order: Vec<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["a", "b", "c", "d"],
+            "a and b appear in both lists; c and d in one each"
+        );
+
+        let both = 1.0 / 61.0 + 1.0 / 62.0;
+        assert!((hits[0].rrf - both).abs() < 1e-12);
+        assert!((hits[1].rrf - both).abs() < 1e-12);
+        assert!((hits[2].rrf - 1.0 / 63.0).abs() < 1e-12);
+        assert!((hits[3].rrf - 1.0 / 63.0).abs() < 1e-12);
+
+        assert_eq!(hits[0].vector_rank, Some(1));
+        assert_eq!(hits[0].text_rank, Some(2));
+        assert_eq!(hits[2].vector_rank, Some(3));
+        assert_eq!(hits[2].text_rank, None, "c is vector-only");
+        assert_eq!(hits[3].vector_rank, None, "d is text-only");
+        assert_eq!(hits[3].text_rank, Some(3));
+    }
+
+    #[test]
+    fn rrf_dedupes_within_a_list() {
+        let vector = ids(&["a", "a", "b"]);
+
+        let hits = rrf_fuse(&vector, &[], 0);
+
+        assert_eq!(hits.len(), 2, "a is counted once");
+        let a = hits.iter().find(|hit| hit.id == "a").expect("a present");
+        assert!(
+            (a.rrf - 1.0 / 61.0).abs() < 1e-12,
+            "a must score one first-place contribution, not two"
+        );
+        assert_eq!(a.vector_rank, Some(1));
+        let b = hits.iter().find(|hit| hit.id == "b").expect("b present");
+        assert_eq!(b.vector_rank, Some(3), "rank is the list position");
+    }
+
+    #[test]
+    fn rrf_limits_and_is_deterministic() {
+        let vector = ids(&["b", "a"]);
+        let text = ids(&["a", "b"]);
+
+        let all = rrf_fuse(&vector, &text, 0);
+        assert_eq!(
+            all.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "equal scores break ties by id ascending"
+        );
+
+        let limited = rrf_fuse(&vector, &text, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "a");
+    }
+
+    #[test]
+    fn rrf_empty_inputs() {
+        assert!(rrf_fuse(&[], &[], 0).is_empty());
+        assert!(rrf_fuse(&[], &[], 5).is_empty());
+    }
+
     // ---- Integration tests (require CODEGRAPH_PG_URL, run with --ignored) ----
 
     fn store_or_skip() -> Option<PgStore> {
@@ -1235,7 +1623,15 @@ mod tests {
     }
 
     fn project_id(tag: &str) -> String {
-        format!("poc_{tag}_{}", std::process::id())
+        // Unique per test *and* per run: a fixed id would collide on the second run
+        // of the suite against the same database (primary-key conflicts on edges).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("poc_{tag}_{}_{nanos}_{n}", std::process::id())
     }
 
     fn unit_vector(index: usize) -> Vec<f32> {
@@ -1294,14 +1690,14 @@ mod tests {
         client
             .execute(
                 "INSERT INTO edges (id, project_id, from_id, to_id, edge_type) VALUES ($1,$2,$3,$4,$5)",
-                &[&"dep_ab", &project, &"A", &"B", &DEFAULT_EDGE_TYPE],
+                &[&format!("{project}_dep_ab"), &project, &"A", &"B", &DEFAULT_EDGE_TYPE],
             )
             .await
             .expect("insert A->B");
         client
             .execute(
                 "INSERT INTO edges (id, project_id, from_id, to_id, edge_type) VALUES ($1,$2,$3,$4,$5)",
-                &[&"dep_bc", &project, &"B", &"C", &DEFAULT_EDGE_TYPE],
+                &[&format!("{project}_dep_bc"), &project, &"B", &"C", &DEFAULT_EDGE_TYPE],
             )
             .await
             .expect("insert B->C");
@@ -1614,14 +2010,24 @@ mod tests {
             .expect("upsert nodes");
         store
             .upsert_edges(&[
-                edge_row("e_keep", &project, "recon_ea", "recon_eb"),
-                edge_row("e_stale", &project, "recon_ea", "recon_eb"),
+                edge_row(
+                    &format!("{project}_e_keep"),
+                    &project,
+                    "recon_ea",
+                    "recon_eb",
+                ),
+                edge_row(
+                    &format!("{project}_e_stale"),
+                    &project,
+                    "recon_ea",
+                    "recon_eb",
+                ),
             ])
             .await
             .expect("upsert edges");
 
         let fresh_nodes = fresh_map(&[("a.rs", &["recon_ea", "recon_eb"])]);
-        let fresh_edges: BTreeSet<String> = ["e_keep".to_string()].into_iter().collect();
+        let fresh_edges: BTreeSet<String> = [format!("{project}_e_keep")].into_iter().collect();
         let stats = store
             .reconcile(&project, &fresh_nodes, &BTreeSet::new(), &fresh_edges)
             .await
@@ -1642,7 +2048,7 @@ mod tests {
             .iter()
             .map(|row| row.get(0))
             .collect();
-        assert_eq!(ids, vec!["e_keep".to_string()]);
+        assert_eq!(ids, vec![format!("{project}_e_keep")]);
     }
 
     #[tokio::test]
@@ -1715,5 +2121,162 @@ mod tests {
             .map(|row| row.get(0))
             .collect();
         assert_eq!(symbol_ids, vec!["recon_sym_kept".to_string()]);
+    }
+
+    // ---- Node retrieval: integration tests ----
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn knn_nodes_orders_by_distance() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("node_knn");
+        let mut near = node("nk_near", &project);
+        near.embedding = Some(unit_vector(0));
+        near.embedding_model = Some("test-model".to_string());
+        let mut middle = node("nk_middle", &project);
+        middle.embedding = Some(unit_vector(1));
+        middle.embedding_model = Some("test-model".to_string());
+        let mut far = node("nk_far", &project);
+        far.embedding = Some(unit_vector(2));
+        far.embedding_model = Some("test-model".to_string());
+        // No embedding: KNN must skip it, so only three candidates exist.
+        let vectorless = node("nk_no_vector", &project);
+        store
+            .upsert_nodes(&[near, middle, far, vectorless])
+            .await
+            .expect("upsert_nodes");
+
+        let hits = store
+            .knn_nodes(&project, &unit_vector(0), 10)
+            .await
+            .expect("knn_nodes");
+
+        assert_eq!(hits.len(), 3, "the vectorless node is excluded");
+        assert_eq!(hits[0].0, "nk_near", "the exact match ranks first");
+        assert!(hits[0].1.abs() < 1e-6, "identical vectors have distance 0");
+        assert!(
+            hits.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+            "distances are non-decreasing: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn full_text_nodes_matches_prefix_and_stem() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("node_fts");
+        let mut dimension = node("fts_dimension", &project);
+        dimension.name = "embedding_dimension".to_string();
+        dimension.content = Some("the embedding dimension used by the vector column".to_string());
+        let mut config = node("fts_config", &project);
+        config.name = "parse_config".to_string();
+        config.content = Some("parse config file".to_string());
+        store
+            .upsert_nodes(&[dimension, config])
+            .await
+            .expect("upsert_nodes");
+
+        let prefix = store
+            .full_text_nodes(&project, "emb", 10)
+            .await
+            .expect("prefix query");
+        let prefix_ids: Vec<&str> = prefix.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            prefix_ids,
+            vec!["fts_dimension"],
+            "`emb:*` matches embedding_dimension but not parse_config"
+        );
+
+        let singular = store
+            .full_text_nodes(&project, "embedding", 10)
+            .await
+            .expect("singular query");
+        let plural = store
+            .full_text_nodes(&project, "embeddings", 10)
+            .await
+            .expect("plural query");
+        assert_eq!(
+            singular, plural,
+            "the english stemmer maps both to the same lexeme"
+        );
+        assert_eq!(singular.len(), 1);
+        assert_eq!(singular[0].0, "fts_dimension");
+
+        assert!(
+            store
+                .full_text_nodes(&project, "!!!", 10)
+                .await
+                .expect("symbol query")
+                .is_empty(),
+            "a query with no usable term never reaches the database"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn hybrid_nodes_merges_both_sources() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("node_hybrid");
+        let mut both = node("hyb_both", &project);
+        both.name = "hybrid needle".to_string();
+        both.content = Some("needle appears in both retrievers".to_string());
+        both.embedding = Some(unit_vector(0));
+        both.embedding_model = Some("test-model".to_string());
+
+        let mut vector_only = node("hyb_vector", &project);
+        vector_only.name = "vector only".to_string();
+        vector_only.content = Some("nothing relevant here".to_string());
+        vector_only.embedding = Some(unit_vector(0));
+        vector_only.embedding_model = Some("test-model".to_string());
+
+        let mut text_only = node("hyb_text", &project);
+        text_only.name = "text only".to_string();
+        text_only.content = Some("needle only in this node".to_string());
+
+        store
+            .upsert_nodes(&[both, vector_only, text_only])
+            .await
+            .expect("upsert_nodes");
+
+        let hits = store
+            .hybrid_nodes(&project, &unit_vector(0), "needle", 10)
+            .await
+            .expect("hybrid_nodes");
+
+        let order: Vec<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(
+            order[0], "hyb_both",
+            "the node found by both retrievers wins: {order:?}"
+        );
+        assert!(
+            order.contains(&"hyb_vector"),
+            "vector-only hit is kept: {order:?}"
+        );
+        assert!(
+            order.contains(&"hyb_text"),
+            "text-only hit is kept: {order:?}"
+        );
+
+        let by_id = |id: &str| {
+            hits.iter()
+                .find(|hit| hit.id == id)
+                .unwrap_or_else(|| panic!("missing {id} in {order:?}"))
+        };
+        assert!(by_id("hyb_both").vector_rank.is_some());
+        assert!(by_id("hyb_both").text_rank.is_some());
+        assert!(by_id("hyb_vector").text_rank.is_none());
+        assert!(by_id("hyb_text").vector_rank.is_none());
     }
 }
