@@ -774,7 +774,6 @@ impl CodeGraphMCPServer {
         peer: Option<Peer<RoleServer>>,
         meta: Meta,
     ) -> Result<Value, McpError> {
-        use codegraph_graph::GraphFunctions;
         use codegraph_mcp_core::ProgressNotifier;
         use std::sync::Arc;
 
@@ -817,53 +816,23 @@ impl CodeGraphMCPServer {
             })?;
         let config = config_manager.config();
 
-        // Create the backend-neutral graph query object over SurrealDB
-        let graph: Arc<dyn codegraph_graph::GraphQuery> = {
-            use codegraph_graph::{GraphFunctions, SurrealDbStorage, SurrealGraph};
-
-            // Shared SurrealDB server from CODEGRAPH_SURREALDB_URL, or the default
-            // local server when it is unset. The embedded store is opt-in via a
-            // surrealkv:// URL.
-            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let surrealdb_config = codegraph_graph::SurrealDbConfig::for_project(&project_root);
-
-            let storage = SurrealDbStorage::new(surrealdb_config).await.map_err(|e| {
-                let error_msg = format!("Failed to open SurrealDB storage: {}", e);
-                let notifier = progress_notifier.clone();
-                let error_for_spawn = error_msg.clone();
-                tokio::spawn(async move {
-                    notifier.notify_error(&error_for_spawn).await;
-                });
-                DebugLogger::log_agent_finish(false, None, Some(&error_msg));
-                McpError {
-                    code: rmcp::model::ErrorCode(-32603),
-                    message: error_msg.into(),
-                    data: None,
+        // Create the backend-neutral graph query object for the configured backend.
+        // `CODEGRAPH_BACKEND` picks SurrealDB (default) or Postgres.
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let graph: Arc<dyn codegraph_graph::GraphQuery> =
+            match build_graph_query(&project_root).await {
+                Ok(graph) => graph,
+                Err(error) => {
+                    let error_msg = error.message.to_string();
+                    let notifier = progress_notifier.clone();
+                    let error_for_spawn = error_msg.clone();
+                    tokio::spawn(async move {
+                        notifier.notify_error(&error_for_spawn).await;
+                    });
+                    DebugLogger::log_agent_finish(false, None, Some(&error_msg));
+                    return Err(error);
                 }
-            })?;
-
-            // Derive project_id from env or canonical working directory for consistent DB selection
-            let env_project = std::env::var("CODEGRAPH_PROJECT_ID")
-                .ok()
-                .filter(|v| !v.trim().is_empty());
-            let cwd_fallback = std::env::current_dir()
-                .ok()
-                .map(|p| p.display().to_string());
-            let raw_project = env_project
-                .clone()
-                .or(cwd_fallback)
-                .unwrap_or_else(|| "default-project".to_string());
-
-            let canonical_project = Path::new(&raw_project)
-                .canonicalize()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| raw_project.clone());
-
-            Arc::new(SurrealGraph::new(GraphFunctions::new_with_project_id(
-                storage.db(),
-                canonical_project,
-            )))
-        };
+            };
 
         // Health check: ensure the active project has indexed nodes
         match graph.count_nodes_for_project().await {
@@ -1348,13 +1317,89 @@ mod graph_tool_input_schema_tests {
     }
 }
 
+/// Build the graph query object for the configured backend.
+///
+/// `CODEGRAPH_BACKEND` decides: SurrealDB by default, Postgres when selected.
+/// Both paths derive the same project id from `CODEGRAPH_PROJECT_ID` or the
+/// canonical working directory, because the tools are keyed by it.
+async fn build_graph_query(
+    project_root: &std::path::Path,
+) -> Result<Arc<dyn codegraph_graph::GraphQuery>, McpError> {
+    let backend = codegraph_mcp::StorageBackend::from_env().map_err(|error| McpError {
+        code: rmcp::model::ErrorCode(-32603),
+        message: format!("Invalid CODEGRAPH_BACKEND: {error}").into(),
+        data: None,
+    })?;
+
+    let env_project = std::env::var("CODEGRAPH_PROJECT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let cwd_fallback = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let raw_project = env_project
+        .or(cwd_fallback)
+        .unwrap_or_else(|| "default-project".to_string());
+    let canonical_project = std::path::Path::new(&raw_project)
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or(raw_project);
+
+    match backend {
+        codegraph_mcp::StorageBackend::Surreal => {
+            use codegraph_graph::{GraphFunctions, SurrealDbStorage, SurrealGraph};
+            let config = codegraph_graph::SurrealDbConfig::for_project(project_root);
+            let storage = SurrealDbStorage::new(config)
+                .await
+                .map_err(|error| McpError {
+                    code: rmcp::model::ErrorCode(-32603),
+                    message: format!("Failed to open SurrealDB storage: {error}").into(),
+                    data: None,
+                })?;
+            Ok(Arc::new(SurrealGraph::new(
+                GraphFunctions::new_with_project_id(storage.db(), canonical_project),
+            )))
+        }
+        #[cfg(feature = "postgres")]
+        codegraph_mcp::StorageBackend::Postgres => {
+            use codegraph_graph::postgres_graph::PgGraph;
+            use codegraph_graph::postgres_storage::PgStore;
+            let store = PgStore::connect("").map_err(|error| McpError {
+                code: rmcp::model::ErrorCode(-32603),
+                message: format!("Failed to open Postgres storage: {error}").into(),
+                data: None,
+            })?;
+            // The tools read the graph; they must not create schema.
+            if !store.schema_present().await.map_err(|error| McpError {
+                code: rmcp::model::ErrorCode(-32603),
+                message: format!("Failed to check Postgres schema: {error}").into(),
+                data: None,
+            })? {
+                return Err(McpError {
+                    code: rmcp::model::ErrorCode(-32603),
+                    message:
+                        "project not indexed: the Postgres schema is missing at CODEGRAPH_PG_URL; \
+                              run `codegraph index` first"
+                            .into(),
+                    data: None,
+                });
+            }
+            Ok(Arc::new(PgGraph::new(Arc::new(store), canonical_project)))
+        }
+        #[cfg(not(feature = "postgres"))]
+        codegraph_mcp::StorageBackend::Postgres => Err(McpError {
+            code: rmcp::model::ErrorCode(-32603),
+            message: "CODEGRAPH_BACKEND=postgres requires a build with --features postgres".into(),
+            data: None,
+        }),
+    }
+}
+
 /// Build a `GraphToolExecutor` bound to the project store in the working directory.
 ///
 /// Mirrors the construction the agentic workflow performs, without the progress
 /// notifier. Kept separate so the direct tools can build it lazily and share it.
 async fn build_graph_tool_executor() -> Result<Arc<GraphToolExecutor>, McpError> {
-    use codegraph_graph::{GraphFunctions, SurrealDbStorage, SurrealGraph};
-
     let config_manager =
         codegraph_core::config_manager::ConfigManager::load().map_err(|e| McpError {
             code: rmcp::model::ErrorCode(-32603),
@@ -1364,33 +1409,9 @@ async fn build_graph_tool_executor() -> Result<Arc<GraphToolExecutor>, McpError>
     let config = config_manager.config();
 
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let surrealdb_config = codegraph_graph::SurrealDbConfig::for_project(&project_root);
-    let storage = SurrealDbStorage::new(surrealdb_config)
-        .await
-        .map_err(|e| McpError {
-            code: rmcp::model::ErrorCode(-32603),
-            message: format!("Failed to open SurrealDB storage: {e}").into(),
-            data: None,
-        })?;
 
-    let raw_project = std::env::var("CODEGRAPH_PROJECT_ID")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.display().to_string())
-        })
-        .unwrap_or_else(|| "default-project".to_string());
-    let canonical_project = Path::new(&raw_project)
-        .canonicalize()
-        .map(|p| p.display().to_string())
-        .unwrap_or(raw_project);
-
-    // The tools talk to the backend-neutral trait; SurrealGraph is the adapter.
-    let graph: Arc<dyn codegraph_graph::GraphQuery> = Arc::new(SurrealGraph::new(
-        GraphFunctions::new_with_project_id(storage.db(), canonical_project),
-    ));
+    // The tools talk to the backend-neutral trait; the backend decides the adapter.
+    let graph = build_graph_query(&project_root).await?;
 
     let embedding_generator = Arc::new(
         codegraph_vector::EmbeddingGenerator::with_config(&config)
