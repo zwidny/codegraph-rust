@@ -47,6 +47,8 @@ is why most of `plan` needs no new storage concepts at all: `upsert_nodes`, `ups
 
 ```rust
 pub struct SymbolMatch {
+    /// Bare node id; `#[serde(skip)]` so the printed JSON keeps its six keys.
+    pub id: String,
     pub name: String,
     pub node_type: Option<String>,
     pub language: Option<String>,
@@ -75,6 +77,8 @@ pub struct PlanNodeRow {
 |---|---|---|
 | `find_nodes_by_name(project, symbol, limit) -> Vec<SymbolMatch>` | query | `name = $2 OR name LIKE $2 \|\| '%'` |
 | `callers_of_name(project, target, limit) -> Vec<CallRelation>` | query | `edges JOIN nodes ON edges.from_id = nodes.id WHERE nodes.name = $2 AND edge_type = 'calls'` |
+| `callers_of_id(project, node_id, limit) -> Vec<CallRelation>` | query `--file` | same join, but filters `edges.to_id = $2` so one definition's callers are not mixed with every same-named one |
+| `callees_of_id(project, node_id, limit) -> Vec<CallRelation>` | query `--file` | mirror, filtering `edges.from_id = $2` |
 | `callees_of_name(project, target, limit) -> Vec<CallRelation>` | query | mirror, joining `to_id` |
 | `node_identities(project) -> Vec<(String, String, String)>` | plan verify | `SELECT id, name, file_path FROM nodes` |
 | `edge_endpoints(project) -> Vec<EdgeEndpoint>` | plan verify/show | `SELECT from_id, to_id, edge_type FROM edges` (type is needed so `plan show` round-trips the kind) |
@@ -117,3 +121,18 @@ compressed blob and is read with `metadata.resolution_method` in SurrealQL; in P
 | `name LIKE $2 || '%'` treats `%` and `_` in a symbol name as wildcards | Escape `%`, `_`, `\` before building the pattern; test a symbol containing `_` |
 | Plan drafts share the `nodes` table, so a plan id must never collide with a project id | `draft_project_id` already prefixes `plan:`; keep that invariant and assert it in a test |
 | `limit` semantics differ (`LIMIT` in SurrealQL vs Postgres) | Both clamp to 1..=1000 in the implementation |
+
+## `--file` resolves same-name ambiguity
+
+`codegraph query <name> --callers` matches by name, so a name with 85 definitions
+(alacritty has 85 `new`s) merges every definition's callers into one answer.
+`--file <path>` filters the matches to that file and then asks for the edges of
+that exact node id via `callers_of_id` / `callees_of_id`.
+
+Ordering matters and is pinned by a test: the file filter runs **before** the row
+limit. Filtering after a 3-row limit silently returned zero matches, because the
+target definition was the 70th same-named node. With `--file`, the lookup uses the
+1000-row ceiling and truncates afterwards.
+
+Known limits: more than 1000 same-named definitions can still hide the target, and
+the empty-result hint does not yet say so.
