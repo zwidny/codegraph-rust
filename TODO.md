@@ -189,6 +189,9 @@ the storage it is meant to measure). Read it before proposing another storage-la
 - **`ingestion_write_test` flakes under parallel threads.** `bulk_ingestion_is_repeatable_and_
   cleanup_is_typed_and_scoped` fails ~2/20 on a clean HEAD with `The query was not executed due
   to a failed transaction`; `--test-threads=1` is stable. Pre-existing `mem://` engine issue.
+  The same wording showed up once in 10 parallel runs of
+  `incremental_catalog_matches_full_graph_and_removes_stale_definitions`
+  (`reconciliation_test`), with 5/5 green when serialised — same engine, not a new failure mode.
 
 ## TODO
 

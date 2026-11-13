@@ -14,6 +14,11 @@ pub fn run(test_name: &str, variables: &[(&str, Option<&str>)]) -> bool {
     let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"));
     child.args(["--exact", name, "--nocapture", "--test-threads=1"]);
     child.env(MARKER, name);
+    // These suites exercise the SurrealDB path and call `surreal_storage()`.
+    // A developer shell that exported CODEGRAPH_BACKEND=postgres would otherwise
+    // flip the child onto Postgres and panic there; explicit variables below can
+    // still opt in.
+    child.env_remove("CODEGRAPH_BACKEND");
     for (key, value) in variables {
         match value {
             Some(value) => {

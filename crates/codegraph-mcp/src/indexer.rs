@@ -2,6 +2,23 @@
 // ABOUTME: Coordinates parsing, embeddings, and persistence into SurrealDB.
 #![allow(dead_code, unused_variables, unused_imports)]
 
+//! Storage backend selection for an indexing run.
+//!
+//! `CODEGRAPH_BACKEND` picks where indexing writes go. Unset / empty means the
+//! default SurrealDB backend; `surreal` and `surrealdb` are accepted aliases.
+//! `postgres` / `pg` select the pgvector-backed `PgStore` instead. Any other
+//! value is a configuration error rather than a silent fallback.
+//!
+//! Known limitations of the Postgres backend today:
+//!
+//! - it requires a build with `--features postgres`;
+//! - it reads the connection URL from `CODEGRAPH_PG_URL`;
+//! - **partial indexing (single file / subdirectory) fails**: `reconcile` with
+//!   `Some(scope)` returns `scoped reconciliation is not implemented for the
+//!   Postgres backend yet`;
+//! - the retrieval side (MCP tools / `GraphQueries`) still talks to SurrealDB,
+//!   so switching the write backend does not change query paths.
+
 use crate::analyzers::{AnalyzerSettings, find_tool_on_path, required_tools_for_languages};
 use crate::estimation::parse_files_with_unified_extraction as shared_unified_parse;
 use anyhow::{Context, Result, anyhow, bail};
@@ -211,12 +228,36 @@ pub(crate) fn extraction_policy_for_tier(
     }
 }
 
+/// Storage backend for one indexing run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageBackend {
+    Surreal,
+    Postgres,
+}
+
+impl StorageBackend {
+    /// `CODEGRAPH_BACKEND` selects the backend: empty / `surreal` / `surrealdb`
+    /// mean SurrealDB, `postgres` / `pg` mean Postgres. Anything else is a
+    /// configuration error rather than a silent fallback.
+    pub(crate) fn from_env() -> Result<Self> {
+        let raw = std::env::var("CODEGRAPH_BACKEND").unwrap_or_default();
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "surreal" | "surrealdb" => Ok(Self::Surreal),
+            "postgres" | "pg" => Ok(Self::Postgres),
+            other => Err(anyhow!(
+                "unknown CODEGRAPH_BACKEND `{other}`; expected `surreal` or `postgres`"
+            )),
+        }
+    }
+}
+
 pub struct ProjectIndexer {
     config: IndexerConfig,
     global_config: codegraph_core::config_manager::CodeGraphConfig,
     progress: MultiProgress,
     parser: TreeSitterParser,
-    surreal: Arc<TokioMutex<SurrealDbStorage>>,
+    /// Present on the SurrealDB backend; `None` when `CODEGRAPH_BACKEND=postgres`.
+    surreal: Option<Arc<TokioMutex<SurrealDbStorage>>>,
     /// Backend-neutral view of the same store `surreal` points at, so the
     /// indexing run no longer issues SurrealQL directly.
     storage: Arc<dyn codegraph_graph::storage::IndexStorage>,
@@ -365,21 +406,42 @@ impl ProjectIndexer {
                 .with_project_root(&config.project_root)
                 .with_extraction_policy(extraction_policy_for_tier(config.indexing_tier));
             let project_root = config.project_root.clone();
-            let (surreal, surreal_pool) = Self::connect_surreal(&project_root).await?;
-            // The queue is backend-neutral. `SurrealDbStorage` is `#[derive(Clone)]`
-            // over `Arc` fields, so each handle clones a shared connection rather
-            // than opening a new one; the trait impl clones again per write.
-            let mut storage_pool: Vec<Arc<dyn IndexStorage>> =
-                Vec::with_capacity(surreal_pool.len());
-            for handle in &surreal_pool {
-                let storage = handle.lock().await.clone();
-                storage_pool.push(Arc::new(storage) as Arc<dyn IndexStorage>);
-            }
-            let storage = Arc::clone(
-                storage_pool
-                    .first()
-                    .ok_or_else(|| anyhow!("surreal storage pool is empty"))?,
-            );
+            let backend = StorageBackend::from_env()?;
+            let (surreal, storage, storage_pool) = match backend {
+                StorageBackend::Surreal => {
+                    let (surreal, surreal_pool) = Self::connect_surreal(&project_root).await?;
+                    // The queue is backend-neutral. `SurrealDbStorage` is
+                    // `#[derive(Clone)]` over `Arc` fields, so each handle clones a
+                    // shared connection rather than opening a new one; the trait
+                    // impl clones again per write.
+                    let mut storage_pool: Vec<Arc<dyn IndexStorage>> =
+                        Vec::with_capacity(surreal_pool.len());
+                    for handle in &surreal_pool {
+                        let cloned = handle.lock().await.clone();
+                        storage_pool.push(Arc::new(cloned) as Arc<dyn IndexStorage>);
+                    }
+                    let storage = Arc::clone(
+                        storage_pool
+                            .first()
+                            .ok_or_else(|| anyhow!("surreal storage pool is empty"))?,
+                    );
+                    (Some(surreal), storage, storage_pool)
+                }
+                #[cfg(feature = "postgres")]
+                StorageBackend::Postgres => {
+                    let store = codegraph_graph::postgres_storage::PgStore::connect("")?;
+                    store.ensure_schema().await?;
+                    let storage: Arc<dyn IndexStorage> = Arc::new(store);
+                    info!("🗄️ Storage backend: Postgres (pgvector)");
+                    (None, Arc::clone(&storage), vec![storage])
+                }
+                #[cfg(not(feature = "postgres"))]
+                StorageBackend::Postgres => {
+                    return Err(anyhow!(
+                        "CODEGRAPH_BACKEND=postgres requires a build with --features postgres"
+                    ));
+                }
+            };
             let surreal_writer = SurrealWriterHandle::new(storage_pool);
             let project_id = std::env::var("CODEGRAPH_PROJECT_ID")
                 .unwrap_or_else(|_| project_root.display().to_string());
@@ -552,12 +614,20 @@ impl ProjectIndexer {
             let vector_mode = codegraph_graph::vector_indexes::VectorIndexMode::from_env()?;
             let vector_tables = Self::vector_tables(policies);
             if vector_mode == codegraph_graph::vector_indexes::VectorIndexMode::Selected {
-                codegraph_graph::vector_indexes::ensure_ready(
-                    &surreal.lock().await.db(),
-                    vector_dim,
-                    &vector_tables,
-                )
-                .await?;
+                // SurrealDB vector indexes are created here; Postgres applies its
+                // own pgvector DDL in `PgStore::ensure_schema`.
+                if let Some(surreal) = surreal.as_ref() {
+                    codegraph_graph::vector_indexes::ensure_ready(
+                        &surreal.lock().await.db(),
+                        vector_dim,
+                        &vector_tables,
+                    )
+                    .await?;
+                } else {
+                    debug!(
+                        "vector index setup skipped: Postgres backend uses its own pgvector DDL"
+                    );
+                }
             }
             #[cfg(feature = "embeddings")]
             let embedder = if let Some(mut embedder) = embedder {
@@ -3197,8 +3267,15 @@ impl ProjectIndexer {
         }
     }
 
+    /// SurrealDB handle for the running indexer.
+    ///
+    /// Only the SurrealDB backend owns one: calling this with
+    /// `CODEGRAPH_BACKEND=postgres` panics, because there is no SurrealDB handle.
     pub async fn surreal_storage(&self) -> Arc<TokioMutex<SurrealDbStorage>> {
-        Arc::clone(&self.surreal)
+        self.surreal
+            .as_ref()
+            .expect("surreal_storage() requires the SurrealDB backend")
+            .clone()
     }
 
     /// Name kept for history; it now reads through IndexStorage so it is backend-neutral.
@@ -3223,7 +3300,12 @@ impl ProjectIndexer {
         file_path: &str,
     ) -> Result<Option<serde_json::Value>> {
         let db = {
-            let storage = self.surreal.lock().await;
+            let storage = self
+                .surreal
+                .as_ref()
+                .expect("test helper requires the SurrealDB backend")
+                .lock()
+                .await;
             storage.db()
         };
 
@@ -4915,6 +4997,84 @@ mod scip_coverage_tests {
             remaining,
             vec![PathBuf::from("src/a.rs"), PathBuf::from("web/c.ts")],
             "filtering must preserve the scanned order of the remaining files"
+        );
+    }
+}
+
+#[cfg(test)]
+mod storage_backend_tests {
+    use super::*;
+
+    /// `std::env::set_var` is process-wide, so backend-selection tests must not
+    /// run concurrently with each other.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Serialises the test and restores `CODEGRAPH_BACKEND` to "unset" on drop,
+    /// including when an assertion panics.
+    struct BackendEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BackendEnvGuard {
+        fn new(value: Option<&str>) -> Self {
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match value {
+                Some(value) => unsafe { std::env::set_var("CODEGRAPH_BACKEND", value) },
+                None => unsafe { std::env::remove_var("CODEGRAPH_BACKEND") },
+            }
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for BackendEnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("CODEGRAPH_BACKEND") };
+        }
+    }
+
+    #[test]
+    fn backend_from_env_defaults_to_surreal() {
+        let _guard = BackendEnvGuard::new(None);
+        assert_eq!(
+            StorageBackend::from_env().expect("unset CODEGRAPH_BACKEND must be valid"),
+            StorageBackend::Surreal
+        );
+    }
+
+    #[test]
+    fn backend_from_env_accepts_surreal_aliases() {
+        for value in ["surreal", "surrealdb", " Surreal "] {
+            let _guard = BackendEnvGuard::new(Some(value));
+            assert_eq!(
+                StorageBackend::from_env().expect("surreal alias must be accepted"),
+                StorageBackend::Surreal,
+                "`{value}` must select the SurrealDB backend"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_from_env_accepts_postgres_aliases() {
+        for value in ["postgres", "PG"] {
+            let _guard = BackendEnvGuard::new(Some(value));
+            assert_eq!(
+                StorageBackend::from_env().expect("postgres alias must be accepted"),
+                StorageBackend::Postgres,
+                "`{value}` must select the Postgres backend"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_from_env_rejects_unknown() {
+        let _guard = BackendEnvGuard::new(Some("mysql"));
+        let error = StorageBackend::from_env().expect_err("`mysql` must not be accepted");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown CODEGRAPH_BACKEND"),
+            "unexpected error message: {message}"
         );
     }
 }
