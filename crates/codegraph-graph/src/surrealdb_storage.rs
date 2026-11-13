@@ -375,7 +375,7 @@ impl SurrealDbStorage {
             } else {
                 scope.project_root.join(candidate)
             };
-            let absolute = lexical_normalize_path(&absolute);
+            let absolute = crate::storage::lexical_normalize_path(&absolute);
             absolute == scope.scan_root || absolute.starts_with(&scope.scan_root)
         };
 
@@ -2848,6 +2848,7 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
         fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
         fresh_chunk_ids: &BTreeSet<String>,
         fresh_edge_ids: &BTreeSet<String>,
+        scope: Option<&ReconcileScope>,
     ) -> anyhow::Result<crate::storage::ReconcileOutcome> {
         // `reconcile_catalog_by_file` reports nothing back, so the outcome is zeroed
         // rather than guessed; adding counts would change an existing signature.
@@ -2856,7 +2857,7 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
             fresh_nodes_by_file,
             fresh_chunk_ids,
             fresh_edge_ids,
-            None,
+            scope,
         )
         .await?;
         Ok(crate::storage::ReconcileOutcome::default())
@@ -3429,31 +3430,4 @@ pub struct SymbolRow {
     pub qualified_name: Option<String>,
 }
 
-/// Restricts a catalog reconciliation to files under one scan root.
-///
-/// Without a scope, every node the current scan did not re-emit is treated as deleted.
-/// Scoped reconciliation only touches files under `scan_root`, so indexing a single
-/// file or a subdirectory cannot wipe the rest of the project's graph.
-#[derive(Debug, Clone)]
-pub struct ReconcileScope {
-    /// Canonical project root that stored relative `file_path` values resolve against.
-    pub project_root: PathBuf,
-    /// Canonical directory or file the current scan covered.
-    pub scan_root: PathBuf,
-}
-
-/// Resolve `.` and `..` lexically without touching the filesystem, so paths for
-/// deleted files still normalize the same way as paths for files that exist.
-fn lexical_normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
-}
+pub use crate::storage::ReconcileScope;

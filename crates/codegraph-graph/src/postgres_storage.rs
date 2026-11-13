@@ -22,8 +22,10 @@
 //! the edge rule a rebuild leaves behind edges whose endpoints still exist, which is
 //! how 6,421 stale edges accumulated on the SurrealDB side.
 //!
-//! Only whole-project reconciliation is implemented. The per-file `scope` parameter
-//! for partial indexing is deliberately deferred until the indexer is wired in.
+//! Only whole-project reconciliation is implemented. `IndexStorage::reconcile` accepts
+//! the per-file `scope` parameter for partial indexing but rejects a `Some(scope)` with
+//! an explicit `Configuration` error: failing loudly is safer than a prefix guess that
+//! would delete rows outside the scan.
 //!
 //! ## Node retrieval
 //!
@@ -58,7 +60,7 @@
 use crate::edge::CodeEdge;
 use crate::storage::{
     ChunkEmbeddingRecord, FileMetadataRecord, NodeEmbeddingRecord, ProjectMetadataRecord,
-    ReconcileOutcome, SymbolEmbeddingRecord,
+    ReconcileOutcome, ReconcileScope, SymbolEmbeddingRecord,
 };
 use async_trait::async_trait;
 use codegraph_core::CodeNode;
@@ -1909,13 +1911,28 @@ impl crate::storage::IndexStorage for PgStore {
         Ok(PgStore::upsert_project_metadata(self, &record).await?)
     }
 
+    /// Whole-project reconciliation only.
+    ///
+    /// A `Some(scope)` is a deliberate, explicit failure rather than a silent
+    /// whole-project pass: scoped deletes need `ReconcileScope`'s path
+    /// normalization (relative paths, Windows separators, `..` handling), and a
+    /// prefix guess would delete more than the scan covered.
     async fn reconcile(
         &self,
         project_id: &str,
         fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
         fresh_chunk_ids: &BTreeSet<String>,
         fresh_edge_ids: &BTreeSet<String>,
+        scope: Option<&ReconcileScope>,
     ) -> anyhow::Result<ReconcileOutcome> {
+        if scope.is_some() {
+            return Err(CodeGraphError::Configuration(
+                "scoped reconciliation is not implemented for the Postgres backend yet; \
+                 run a full index instead of a partial one"
+                    .to_string(),
+            )
+            .into());
+        }
         let stats = PgStore::reconcile(
             self,
             project_id,
@@ -2480,6 +2497,37 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("poc_{tag}_{}_{nanos}_{n}", std::process::id())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn reconcile_rejects_scope_on_postgres() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("scoped_reconcile");
+        let scope = ReconcileScope {
+            project_root: std::path::PathBuf::from("/repo"),
+            scan_root: std::path::PathBuf::from("/repo/packages/core"),
+        };
+        let error = IndexStorage::reconcile(
+            &store,
+            &project,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Some(&scope),
+        )
+        .await
+        .expect_err("a scoped reconciliation must be rejected on the Postgres backend");
+        let message = error.to_string();
+        assert!(
+            message.contains("scoped reconciliation is not implemented"),
+            "unexpected error message: {message}"
+        );
     }
 
     fn unit_vector(index: usize) -> Vec<f32> {
