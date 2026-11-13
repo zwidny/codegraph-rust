@@ -1,6 +1,8 @@
 # Indexing is not deterministic when LSP enrichment is enabled
 
-Status: open issue, pre-existing (not introduced by the `fn::*` → Rust migration).
+Status: **mitigated** — SCIP plus `CODEGRAPH_LSP_FALLBACK=0` removes the language server from
+the path entirely. See [Recommendation](#recommendation). The analysis below still describes
+the mechanism.
 
 ## Symptom
 
@@ -113,12 +115,40 @@ timing-dependent.
 
 ## Recommendation
 
-1. Now: document option 1 (`fast` = reproducible) and keep `balanced` as the
-   quality-first default.
-2. Next: quantify option 3 — run `fast` vs `balanced` and compare `resolved_edges`
-   quality. If LSP's extra names do not meaningfully raise resolution, adopt option
-   3 (decisive and cheaper than option 2).
-3. Only if both fail: implement option 2.
+**Use a compiler index for every language and turn the fallback off.**
+
+```bash
+export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"   # rust + ts + go
+export CODEGRAPH_LSP_FALLBACK=0
+codegraph index . --index-tier full
+```
+
+This is option 4, and it is what the measurements now support. `full` still keeps
+the reference edges and the dataflow analyzers; only the language server is gone.
+Measured on EasyTier (847 scanned files, same machine, `--index-tier full`):
+
+| Configuration | Time | Edges | Resolved | Coverage |
+|---|---|---|---|---|
+| LSP fallback on, rust SCIP only | 69.84 s | 247,476 | 69.93% | 560/847 |
+| fallback off, rust SCIP only | 25.97 s | 246,291 | 69.62% | 560/847 |
+| **fallback off, rust+ts+go SCIP** | **25.89 s** | **251,217** | **70.09%** | **715/847** |
+
+The language-server fallback bought **0.48% of edges for 44 seconds**, and its own
+results drifted between runs (the symptom table above). Adding the TypeScript and
+Go indexes recovered more than the fallback ever provided, at lower cost.
+
+Rejected alternatives:
+
+1. `--index-tier fast` — reproducible but drops reference edges and the dataflow
+   analyzers too.
+2. Wait for LSP progress before requesting symbols — still timing-dependent, and
+   not every server emits `$/progress`.
+3. Stop feeding LSP data into resolution while keeping the server — keeps 44 s of
+   latency for enrichment that no longer affects the graph.
+
+Remaining gap: Kotlin (13 files) needs `scip-java` and JDK 11+, C (1 file) needs
+`compile_commands.json`. Those files stay AST-only until they get an index; with
+`CODEGRAPH_LSP_FALLBACK=0` they no longer start a server.
 
 ## Reproducing
 
