@@ -45,6 +45,7 @@ fn serde_compatible_value(value: surrealdb::types::Value) -> surrealdb::types::V
 
 pub mod analysis;
 pub mod edge;
+pub mod graph_types;
 pub mod storage;
 
 #[cfg(feature = "postgres")]
@@ -60,6 +61,7 @@ pub mod surrealdb_storage;
 pub mod vector_indexes;
 
 pub use edge::*;
+pub use graph_types::*;
 
 #[cfg(feature = "surrealdb")]
 pub use graph_functions::*;

@@ -120,9 +120,8 @@ mod mock_model {
             .unwrap()
             .check()
             .unwrap();
-        let functions = Arc::new(GraphFunctions::new_with_project_id(
-            storage.db(),
-            "lats-test",
+        let functions = Arc::new(codegraph_graph::SurrealGraph::new(
+            GraphFunctions::new_with_project_id(storage.db(), "lats-test"),
         ));
         let factory = GraphToolFactory::new(Arc::new(GraphToolExecutor::new(
             functions,

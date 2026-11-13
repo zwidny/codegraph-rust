@@ -293,9 +293,8 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
-        let functions = Arc::new(GraphFunctions::new_with_project_id(
-            storage.db(),
-            "rig-test",
+        let functions = Arc::new(codegraph_graph::SurrealGraph::new(
+            GraphFunctions::new_with_project_id(storage.db(), "rig-test"),
         ));
         let executor = Arc::new(GraphToolExecutor::new(
             functions,

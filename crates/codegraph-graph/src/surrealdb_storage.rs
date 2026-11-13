@@ -1,4 +1,9 @@
 use crate::edge::CodeEdge;
+use crate::graph_functions::GraphFunctions;
+use crate::graph_types::{
+    CallChainNode, CircularDependency, ComplexityHotspot, CouplingMetricsResult, DependencyNode,
+    HubNode, NodeEdgeSummary,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use codegraph_core::{CodeGraphError, CodeNode, GraphStore, NodeId, Result};
@@ -3128,6 +3133,13 @@ mod tests {
         assert_index_storage::<SurrealDbStorage>();
     }
 
+    fn assert_graph_query<T: crate::graph_types::GraphQuery>() {}
+
+    #[test]
+    fn surreal_graph_implements_graph_query() {
+        assert_graph_query::<SurrealGraph>();
+    }
+
     /// `ProjectMetadataRecord` now lives in `crate::storage`; the SurrealDB adapter
     /// re-exports it so existing `codegraph_graph::ProjectMetadataRecord` paths keep
     /// resolving.
@@ -3442,6 +3454,114 @@ crate::impl_surreal_serde!(
     SurrealNodeRecord,
     ChunkEmbeddingRecord
 );
+
+/// `GraphFunctions` behind the backend-neutral query trait.
+pub struct SurrealGraph {
+    functions: GraphFunctions,
+}
+
+impl SurrealGraph {
+    pub fn new(functions: GraphFunctions) -> Self {
+        Self { functions }
+    }
+}
+
+#[async_trait]
+impl crate::graph_types::GraphQuery for SurrealGraph {
+    fn project_id(&self) -> &str {
+        self.functions.project_id()
+    }
+
+    fn with_project_id(&self, project_id: &str) -> Arc<dyn crate::graph_types::GraphQuery> {
+        Arc::new(Self {
+            functions: self.functions.with_project_id(project_id.to_string()),
+        })
+    }
+
+    async fn get_transitive_dependencies(
+        &self,
+        node_id: &str,
+        edge_type: &str,
+        depth: i32,
+    ) -> Result<Vec<DependencyNode>> {
+        self.functions
+            .get_transitive_dependencies(node_id, edge_type, depth)
+            .await
+    }
+
+    async fn get_reverse_dependencies(
+        &self,
+        node_id: &str,
+        edge_type: &str,
+        depth: i32,
+    ) -> Result<Vec<DependencyNode>> {
+        self.functions
+            .get_reverse_dependencies(node_id, edge_type, depth)
+            .await
+    }
+
+    async fn trace_call_chain(
+        &self,
+        from_node: &str,
+        max_depth: i32,
+    ) -> Result<Vec<CallChainNode>> {
+        self.functions.trace_call_chain(from_node, max_depth).await
+    }
+
+    async fn calculate_coupling_metrics(&self, node_id: &str) -> Result<CouplingMetricsResult> {
+        self.functions.calculate_coupling_metrics(node_id).await
+    }
+
+    async fn get_hub_nodes(&self, min_degree: i32) -> Result<Vec<HubNode>> {
+        self.functions.get_hub_nodes(min_degree).await
+    }
+
+    async fn get_complexity_hotspots(
+        &self,
+        min_complexity: f32,
+        limit: i32,
+    ) -> Result<Vec<ComplexityHotspot>> {
+        self.functions
+            .get_complexity_hotspots(min_complexity, limit)
+            .await
+    }
+
+    async fn get_node_edge_summary(&self, node_id: &str) -> Result<NodeEdgeSummary> {
+        self.functions.get_node_edge_summary(node_id).await
+    }
+
+    async fn count_nodes_for_project(&self) -> Result<usize> {
+        self.functions.count_nodes_for_project().await
+    }
+
+    async fn detect_circular_dependencies(
+        &self,
+        edge_type: &str,
+    ) -> Result<Vec<CircularDependency>> {
+        self.functions.detect_circular_dependencies(edge_type).await
+    }
+
+    async fn semantic_search_with_context(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        dimension: usize,
+        limit: usize,
+        threshold: f32,
+        include_graph_context: bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.functions
+            .semantic_search_with_context(
+                query_text,
+                query_embedding,
+                dimension,
+                limit,
+                threshold,
+                include_graph_context,
+            )
+            .await
+    }
+}
 
 /// A symbol row loaded from storage to seed a partial re-index's resolution catalog.
 #[derive(Debug, Clone)]

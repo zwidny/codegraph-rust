@@ -817,9 +817,9 @@ impl CodeGraphMCPServer {
             })?;
         let config = config_manager.config();
 
-        // Create GraphFunctions with SurrealDB connection
-        let graph_functions = {
-            use codegraph_graph::SurrealDbStorage;
+        // Create the backend-neutral graph query object over SurrealDB
+        let graph: Arc<dyn codegraph_graph::GraphQuery> = {
+            use codegraph_graph::{GraphFunctions, SurrealDbStorage, SurrealGraph};
 
             // Shared SurrealDB server from CODEGRAPH_SURREALDB_URL, or the default
             // local server when it is unset. The embedded store is opt-in via a
@@ -859,21 +859,21 @@ impl CodeGraphMCPServer {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| raw_project.clone());
 
-            Arc::new(GraphFunctions::new_with_project_id(
+            Arc::new(SurrealGraph::new(GraphFunctions::new_with_project_id(
                 storage.db(),
                 canonical_project,
-            ))
+            )))
         };
 
         // Health check: ensure the active project has indexed nodes
-        match graph_functions.count_nodes_for_project().await {
+        match graph.count_nodes_for_project().await {
             Ok(0) => tracing::warn!(
                 "Project '{}' has zero nodes indexed. Ensure CODEGRAPH_PROJECT_ID matches the indexed project and rerun `codegraph index`.",
-                graph_functions.project_id()
+                graph.project_id()
             ),
             Ok(count) => tracing::info!(
                 "Project '{}' has {} indexed nodes available for analysis",
-                graph_functions.project_id(),
+                graph.project_id(),
                 count
             ),
             Err(e) => tracing::warn!(
@@ -901,7 +901,7 @@ impl CodeGraphMCPServer {
 
         // Create GraphToolExecutor with shared embedding generator
         let tool_executor = Arc::new(GraphToolExecutor::new(
-            graph_functions,
+            graph,
             Arc::new(config.clone()),
             embedding_generator,
         ));
@@ -1353,7 +1353,7 @@ mod graph_tool_input_schema_tests {
 /// Mirrors the construction the agentic workflow performs, without the progress
 /// notifier. Kept separate so the direct tools can build it lazily and share it.
 async fn build_graph_tool_executor() -> Result<Arc<GraphToolExecutor>, McpError> {
-    use codegraph_graph::{GraphFunctions, SurrealDbStorage};
+    use codegraph_graph::{GraphFunctions, SurrealDbStorage, SurrealGraph};
 
     let config_manager =
         codegraph_core::config_manager::ConfigManager::load().map_err(|e| McpError {
@@ -1387,9 +1387,9 @@ async fn build_graph_tool_executor() -> Result<Arc<GraphToolExecutor>, McpError>
         .map(|p| p.display().to_string())
         .unwrap_or(raw_project);
 
-    let graph_functions = Arc::new(GraphFunctions::new_with_project_id(
-        storage.db(),
-        canonical_project,
+    // The tools talk to the backend-neutral trait; SurrealGraph is the adapter.
+    let graph: Arc<dyn codegraph_graph::GraphQuery> = Arc::new(SurrealGraph::new(
+        GraphFunctions::new_with_project_id(storage.db(), canonical_project),
     ));
 
     let embedding_generator = Arc::new(
@@ -1403,7 +1403,7 @@ async fn build_graph_tool_executor() -> Result<Arc<GraphToolExecutor>, McpError>
     );
 
     Ok(Arc::new(GraphToolExecutor::new(
-        graph_functions,
+        graph,
         Arc::new(config.clone()),
         embedding_generator,
     )))

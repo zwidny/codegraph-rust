@@ -10,6 +10,12 @@ use surrealdb::types::{SurrealValue as _, ToSql, Value as SurrealValue};
 use surrealdb::{Surreal, engine::any::Any};
 use tracing::{debug, error, warn};
 
+pub use crate::graph_types::{
+    CallChainNode, CallerInfo, CircularDependency, ComplexityHotspot, CouplingMetrics,
+    CouplingMetricsResult, DependencyNode, EdgeTypeCount, HubNode, NodeEdgeSummary, NodeInfo,
+    NodeLocation, NodeReference,
+};
+
 /// Convert SurrealDB Value to clean serde_json::Value using accessor methods
 /// Avoids externally-tagged enum serialization that produces {"None": ...}, {"Number": {"Int": ...}}
 fn surreal_to_json(value: SurrealValue) -> serde_json::Value {
@@ -1610,43 +1616,6 @@ impl GraphFunctions {
 // Type Definitions for Function Results
 // ============================================================================
 
-/// Node with dependency depth information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DependencyNode {
-    pub id: String,
-    pub name: String,
-    pub kind: Option<String>,
-    pub location: Option<NodeLocation>,
-    pub language: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "codegraph_core::deserialize_content_string"
-    )]
-    pub content: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-    pub dependency_depth: Option<i32>,
-    pub dependent_depth: Option<i32>,
-}
-
-/// Node identity plus the relationship types that touch it.
-///
-/// Produced by [`GraphFunctions::get_node_edge_summary`] so an empty dependency result can
-/// be explained rather than returned as a bare empty array.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct NodeEdgeSummary {
-    /// Whether the node exists in this project's index.
-    pub found: bool,
-    pub id: Option<String>,
-    pub name: Option<String>,
-    pub kind: Option<String>,
-    pub file_path: Option<String>,
-    pub start_line: Option<i64>,
-    #[serde(default)]
-    pub incoming_edge_types: Vec<String>,
-    #[serde(default)]
-    pub outgoing_edge_types: Vec<String>,
-}
-
 /// `CODEGRAPH_NATIVE_ANALYSIS` selects the Rust implementation for switched-over
 /// analysis methods. Default off: SurrealQL stays authoritative until each method is
 /// proven equal on real data.
@@ -1674,68 +1643,6 @@ fn normalize_node_id(input: &str) -> Option<String> {
     Some(clean.to_string())
 }
 
-/// Circular dependency pair
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CircularDependency {
-    pub node1_id: String,
-    pub node2_id: String,
-    pub node1: NodeInfo,
-    pub node2: NodeInfo,
-    pub dependency_type: String,
-}
-
-/// Call chain node with caller information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CallChainNode {
-    pub id: String,
-    pub name: String,
-    pub kind: Option<String>,
-    pub location: Option<NodeLocation>,
-    pub language: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "codegraph_core::deserialize_content_string"
-    )]
-    pub content: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-    pub call_depth: Option<i32>,
-    pub called_by: Option<Vec<CallerInfo>>,
-}
-
-/// Coupling metrics result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CouplingMetricsResult {
-    pub node: NodeInfo,
-    pub metrics: CouplingMetrics,
-    pub dependents: Vec<NodeReference>,
-    pub dependencies: Vec<NodeReference>,
-}
-
-/// Coupling metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CouplingMetrics {
-    pub afferent_coupling: i32,
-    pub efferent_coupling: i32,
-    pub total_coupling: i32,
-    pub instability: f64,
-    pub stability: f64,
-    pub is_stable: bool,
-    pub is_unstable: bool,
-    pub coupling_category: String,
-}
-
-/// Hub node with degree information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HubNode {
-    pub node_id: String,
-    pub node: NodeInfo,
-    pub afferent_degree: i32,
-    pub efferent_degree: i32,
-    pub total_degree: i32,
-    pub incoming_by_type: Vec<EdgeTypeCount>,
-    pub outgoing_by_type: Vec<EdgeTypeCount>,
-}
-
 /// Directory summary for bootstrap
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectorySummary {
@@ -1744,71 +1651,6 @@ pub struct DirectorySummary {
     pub full_path: String,
     pub depth: Option<i32>,
     pub file_count: i32,
-}
-
-/// Edge type count
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EdgeTypeCount {
-    pub edge_type: String,
-    pub count: i32,
-}
-
-/// Node information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeInfo {
-    pub id: String,
-    pub name: String,
-    pub kind: Option<String>,
-    pub location: Option<NodeLocation>,
-    pub language: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "codegraph_core::deserialize_content_string"
-    )]
-    pub content: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-}
-
-/// Node reference (minimal info)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeReference {
-    pub id: String,
-    pub name: String,
-    pub kind: Option<String>,
-    pub location: Option<NodeLocation>,
-}
-
-/// Caller information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CallerInfo {
-    pub id: String,
-    pub name: String,
-    pub kind: Option<String>,
-}
-
-/// Node location information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeLocation {
-    pub file_path: String,
-    pub start_line: Option<i32>,
-    pub end_line: Option<i32>,
-}
-
-/// Complexity hotspot with risk metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComplexityHotspot {
-    pub id: String,
-    pub name: String,
-    pub kind: Option<String>,
-    pub language: Option<String>,
-    pub file_path: Option<String>,
-    pub start_line: Option<i32>,
-    pub end_line: Option<i32>,
-    pub complexity: f32,
-    pub afferent_coupling: i32,
-    pub efferent_coupling: i32,
-    pub instability: f32,
-    pub risk_score: f32,
 }
 
 #[cfg(test)]
