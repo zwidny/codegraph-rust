@@ -587,8 +587,13 @@ pub struct ReconcileScope {
 
 /// Resolve `.` and `..` lexically without touching the filesystem, so paths for
 /// deleted files still normalize the same way as paths for files that exist.
-// Only the SurrealDB backend consults a scope today; the Postgres adapter rejects it.
-#[cfg_attr(not(feature = "surrealdb"), allow(dead_code))]
+///
+/// Both backends use it: SurrealDB and Postgres each decide `in_scope` from the
+/// same normalized path comparison.
+#[cfg_attr(
+    not(any(feature = "surrealdb", feature = "postgres")),
+    allow(dead_code)
+)]
 pub(crate) fn lexical_normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {

@@ -22,10 +22,11 @@
 //! the edge rule a rebuild leaves behind edges whose endpoints still exist, which is
 //! how 6,421 stale edges accumulated on the SurrealDB side.
 //!
-//! Only whole-project reconciliation is implemented. `IndexStorage::reconcile` accepts
-//! the per-file `scope` parameter for partial indexing but rejects a `Some(scope)` with
-//! an explicit `Configuration` error: failing loudly is safer than a prefix guess that
-//! would delete rows outside the scan.
+//! Scoped reconciliation mirrors SurrealDB's `in_scope` rule: with `Some(scope)`, a
+//! file may only be treated as deleted when its normalized path equals `scan_root` or
+//! lies below it. Files outside the scan root keep their nodes, edges, chunks,
+//! embeddings and metadata, which is what makes single-file and subdirectory indexing
+//! safe. Without a scope every file in the project is in scope.
 //!
 //! ## Node retrieval
 //!
@@ -70,6 +71,7 @@ use crate::storage::{
 use async_trait::async_trait;
 use codegraph_core::CodeNode;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use codegraph_core::{CodeGraphError, Result};
 use deadpool_postgres::Pool;
@@ -961,20 +963,23 @@ pub(crate) fn parse_vector_text(text: &str) -> Result<Vec<f32>> {
 ///
 /// Two cases, both derived from the stored `(id, file_path)` snapshot:
 /// * a file present in the store but absent from `fresh_nodes_by_file` disappeared,
-///   so every node it holds is stale;
+///   so every node it holds is stale — **only when that file is inside the scan
+///   scope**;
 /// * for a surviving file, everything stored under it but missing from its fresh id
 ///   list shrank away.
 ///
-/// Nodes without a `file_path` never enter `existing_by_file` and are therefore never
-/// reported; they cannot be attributed to any scanned file.
+/// The second case needs no scope check: a key of `fresh_nodes_by_file` was scanned by
+/// construction. Nodes without a `file_path` never enter `existing_by_file` and are
+/// therefore never reported; they cannot be attributed to any scanned file.
 fn compute_stale_nodes(
     existing_by_file: &BTreeMap<String, Vec<String>>,
     fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
+    in_scope: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
     let mut stale = Vec::new();
 
     for (file, existing) in existing_by_file {
-        if !fresh_nodes_by_file.contains_key(file) {
+        if !fresh_nodes_by_file.contains_key(file) && in_scope(file) {
             stale.extend(existing.iter().cloned());
         }
     }
@@ -998,15 +1003,18 @@ fn compute_stale_nodes(
 /// Files present in the store but absent from this run's scan.
 ///
 /// `file_metadata` is keyed by `(project_id, file_path)`, so a vanished file has no
-/// fresh node list to diff against; the key set difference is the whole answer. The
-/// output is sorted so callers (and tests) see a deterministic list.
+/// fresh node list to diff against; the key set difference is the whole answer. A file
+/// outside the scan scope is not vanished — the run simply did not cover it — so the
+/// key difference is filtered through `in_scope`. The output is sorted so callers (and
+/// tests) see a deterministic list.
 fn compute_vanished_files(
     existing_by_file: &BTreeMap<String, Vec<String>>,
     fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
+    in_scope: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
     let mut vanished: Vec<String> = existing_by_file
         .keys()
-        .filter(|file| !fresh_nodes_by_file.contains_key(*file))
+        .filter(|file| !fresh_nodes_by_file.contains_key(*file) && in_scope(file))
         .cloned()
         .collect();
     vanished.sort();
@@ -1753,11 +1761,13 @@ impl PgStore {
         Ok(())
     }
 
-    /// Remove catalog rows that this run did not re-emit, for the whole project.
+    /// Remove catalog rows that this run did not re-emit.
     ///
-    /// Mirrors `SurrealDbStorage::reconcile_catalog_by_file` without its per-file
-    /// `scope`: partial indexing is not wired up yet, so every file in the project is
-    /// in scope.
+    /// Mirrors `SurrealDbStorage::reconcile_catalog_by_file`, including its per-file
+    /// `scope`. With `Some(scope)` only files whose normalized path equals
+    /// `scan_root` or lies below it may be treated as deleted; every other file keeps
+    /// its rows, so a single-file or subdirectory index cannot wipe the rest of the
+    /// project. Without a scope every file in the project is in scope.
     ///
     /// * nodes: files that disappeared entirely, plus ids missing from a surviving
     ///   file's fresh list;
@@ -1781,6 +1791,7 @@ impl PgStore {
         fresh_nodes_by_file: &BTreeMap<String, Vec<String>>,
         fresh_chunk_ids: &BTreeSet<String>,
         fresh_edge_ids: &BTreeSet<String>,
+        scope: Option<&ReconcileScope>,
     ) -> Result<ReconcileStats> {
         let mut client = self.pool.get().await.map_err(db_err)?;
 
@@ -1800,8 +1811,26 @@ impl PgStore {
             existing_by_file.entry(file).or_default().push(id);
         }
 
+        // Without a scope every stored file is in scope; with one, only files under
+        // `scan_root` may be treated as deleted. Stored paths are usually relative to
+        // the project root, so they resolve against it and normalize lexically before
+        // the prefix test — identical to the SurrealDB implementation.
+        let in_scope = |file: &str| -> bool {
+            let Some(scope) = scope else {
+                return true;
+            };
+            let candidate = Path::new(file);
+            let absolute = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                scope.project_root.join(candidate)
+            };
+            let absolute = crate::storage::lexical_normalize_path(&absolute);
+            absolute == scope.scan_root || absolute.starts_with(&scope.scan_root)
+        };
+
         // Step 2: nodes the run did not re-emit.
-        let stale_nodes = compute_stale_nodes(&existing_by_file, fresh_nodes_by_file);
+        let stale_nodes = compute_stale_nodes(&existing_by_file, fresh_nodes_by_file, &in_scope);
 
         // Step 3: edges whose endpoints survived but which were not re-emitted.
         let stale_edges = if fresh_edge_ids.is_empty() {
@@ -1827,7 +1856,8 @@ impl PgStore {
         let has_unreemitted_chunk_pass = !fresh_chunk_ids.is_empty() && !fresh_node_ids.is_empty();
 
         // Step 5: files whose metadata must go because they no longer exist.
-        let vanished_files = compute_vanished_files(&existing_by_file, fresh_nodes_by_file);
+        let vanished_files =
+            compute_vanished_files(&existing_by_file, fresh_nodes_by_file, &in_scope);
 
         if stale_nodes.is_empty()
             && stale_edges.is_empty()
@@ -2096,12 +2126,13 @@ impl crate::storage::IndexStorage for PgStore {
         Ok(PgStore::upsert_project_metadata(self, &record).await?)
     }
 
-    /// Whole-project reconciliation only.
+    /// Catalog reconciliation, optionally restricted to one scan root.
     ///
-    /// A `Some(scope)` is a deliberate, explicit failure rather than a silent
-    /// whole-project pass: scoped deletes need `ReconcileScope`'s path
-    /// normalization (relative paths, Windows separators, `..` handling), and a
-    /// prefix guess would delete more than the scan covered.
+    /// `Some(scope)` limits destructive reconciliation to files at or below
+    /// `scan_root`, evaluated after joining relative `file_path` values onto
+    /// `project_root` and normalizing them lexically. Files outside that root are left
+    /// untouched, so single-file and subdirectory indexing are safe. `None` keeps the
+    /// whole-project behaviour.
     async fn reconcile(
         &self,
         project_id: &str,
@@ -2110,20 +2141,13 @@ impl crate::storage::IndexStorage for PgStore {
         fresh_edge_ids: &BTreeSet<String>,
         scope: Option<&ReconcileScope>,
     ) -> anyhow::Result<ReconcileOutcome> {
-        if scope.is_some() {
-            return Err(CodeGraphError::Configuration(
-                "scoped reconciliation is not implemented for the Postgres backend yet; \
-                 run a full index instead of a partial one"
-                    .to_string(),
-            )
-            .into());
-        }
         let stats = PgStore::reconcile(
             self,
             project_id,
             fresh_nodes_by_file,
             fresh_chunk_ids,
             fresh_edge_ids,
+            scope,
         )
         .await?;
         Ok(reconcile_stats_to_outcome(stats))
@@ -2617,7 +2641,7 @@ mod tests {
         let existing = fresh_map(&[("a.rs", &["a1", "a2"]), ("b.rs", &["b1"])]);
         let fresh = fresh_map(&[("a.rs", &["a1"])]);
 
-        let mut stale = compute_stale_nodes(&existing, &fresh);
+        let mut stale = compute_stale_nodes(&existing, &fresh, &|_| true);
         stale.sort();
 
         assert_eq!(
@@ -2628,14 +2652,55 @@ mod tests {
     }
 
     #[test]
+    fn compute_stale_nodes_respects_scope() {
+        let existing = fresh_map(&[("a.rs", &["1"]), ("b.rs", &["2"])]);
+        let fresh = fresh_map(&[]);
+
+        let stale = compute_stale_nodes(&existing, &fresh, &|file| file == "a.rs");
+
+        assert_eq!(
+            stale,
+            vec!["1".to_string()],
+            "only the in-scope vanished file loses its nodes; b.rs belongs to another scan"
+        );
+    }
+
+    #[test]
+    fn compute_stale_nodes_without_scope_keeps_previous_behaviour() {
+        let existing = fresh_map(&[("a.rs", &["1"]), ("b.rs", &["2"])]);
+        let fresh = fresh_map(&[]);
+
+        let mut stale = compute_stale_nodes(&existing, &fresh, &|_| true);
+        stale.sort();
+
+        assert_eq!(
+            stale,
+            vec!["1".to_string(), "2".to_string()],
+            "an always-true scope is the old whole-project behaviour"
+        );
+    }
+
+    #[test]
     fn vanished_files_is_difference_of_keys() {
         let existing = fresh_map(&[("a.rs", &["a1"]), ("b.rs", &["b1"]), ("c.rs", &["c1"])]);
         let fresh = fresh_map(&[("a.rs", &["a1"]), ("c.rs", &["c1"])]);
 
         assert_eq!(
-            compute_vanished_files(&existing, &fresh),
+            compute_vanished_files(&existing, &fresh, &|_| true),
             vec!["b.rs".to_string()],
             "only files missing from the fresh scan are vanished"
+        );
+    }
+
+    #[test]
+    fn compute_vanished_files_respects_scope() {
+        let existing = fresh_map(&[("a.rs", &["1"]), ("b.rs", &["2"])]);
+        let fresh = fresh_map(&[]);
+
+        assert_eq!(
+            compute_vanished_files(&existing, &fresh, &|file| file == "a.rs"),
+            vec!["a.rs".to_string()],
+            "a file outside the scan root is not vanished, it simply was not scanned"
         );
     }
 
@@ -2953,19 +3018,112 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
-    async fn reconcile_rejects_scope_on_postgres() {
+    async fn scoped_reconcile_leaves_other_files_alone() {
         let Some(store) = store_or_skip() else {
             return;
         };
         store.ensure_schema().await.expect("ensure_schema");
 
-        use crate::storage::IndexStorage;
-        let project = project_id("scoped_reconcile");
+        let project = project_id("scoped_keep");
+        store
+            .upsert_nodes(&[
+                node_in("scoped_a1", &project, "src/a.rs"),
+                node_in("scoped_a2", &project, "src/a.rs"),
+                node_in("scoped_b1", &project, "src/b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_edges(&[
+                edge_row("scoped_ab", &project, "scoped_a1", "scoped_b1"),
+                edge_row("scoped_bb", &project, "scoped_b1", "scoped_b1"),
+            ])
+            .await
+            .expect("upsert edges");
+
+        // Single-file scan: only the first a.rs node was re-emitted.
+        let fresh = fresh_map(&[("src/a.rs", &["scoped_a1"])]);
         let scope = ReconcileScope {
             project_root: std::path::PathBuf::from("/repo"),
-            scan_root: std::path::PathBuf::from("/repo/packages/core"),
+            scan_root: std::path::PathBuf::from("/repo/src/a.rs"),
         };
-        let error = IndexStorage::reconcile(
+        let stats = PgStore::reconcile(
+            &store,
+            &project,
+            &fresh,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Some(&scope),
+        )
+        .await
+        .expect("scoped reconcile");
+
+        assert_eq!(
+            stats.stale_nodes, 1,
+            "only a.rs's un-reemitted node is stale"
+        );
+        assert_eq!(stats.stale_files, 0, "no file vanished inside the scope");
+
+        let client = store.pool.get().await.expect("pool get");
+        let b_nodes: i64 = client
+            .query_one(
+                "SELECT count(*) FROM nodes WHERE project_id = $1 AND file_path = $2",
+                &[&project, &"src/b.rs"],
+            )
+            .await
+            .expect("count b nodes")
+            .get(0);
+        assert_eq!(b_nodes, 1, "b.rs is outside the scan root and must survive");
+        let b_edges: i64 = client
+            .query_one(
+                "SELECT count(*) FROM edges WHERE project_id = $1 AND id = $2",
+                &[&project, &"scoped_bb"],
+            )
+            .await
+            .expect("count b edges")
+            .get(0);
+        assert_eq!(b_edges, 1, "the b.rs self-edge must survive");
+        let a1: i64 = client
+            .query_one(
+                "SELECT count(*) FROM nodes WHERE project_id = $1 AND id = $2",
+                &[&project, &"scoped_a1"],
+            )
+            .await
+            .expect("count a1")
+            .get(0);
+        assert_eq!(a1, 1, "the re-emitted node survives");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn scoped_reconcile_removes_a_vanished_file_inside_the_scan_root() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("scoped_vanish_in");
+        store
+            .upsert_nodes(&[
+                node_in("vanish_in_a1", &project, "src/a.rs"),
+                node_in("vanish_in_a2", &project, "src/a.rs"),
+                node_in("vanish_in_b1", &project, "src/b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_file_metadata(&[
+                file_meta(&project, "src/a.rs", "hash_a"),
+                file_meta(&project, "src/b.rs", "hash_b"),
+            ])
+            .await
+            .expect("upsert metadata");
+
+        let scope = ReconcileScope {
+            project_root: std::path::PathBuf::from("/repo"),
+            scan_root: std::path::PathBuf::from("/repo/src/a.rs"),
+        };
+        let stats = PgStore::reconcile(
             &store,
             &project,
             &BTreeMap::new(),
@@ -2974,11 +3132,111 @@ mod tests {
             Some(&scope),
         )
         .await
-        .expect_err("a scoped reconciliation must be rejected on the Postgres backend");
-        let message = error.to_string();
+        .expect("scoped reconcile");
+
+        assert_eq!(stats.stale_nodes, 2, "both a.rs nodes are gone");
+        assert_eq!(stats.stale_files, 1, "only a.rs metadata is removed");
+
+        let hashes = store.file_hashes(&project).await.expect("file_hashes");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes.get("src/b.rs").map(String::as_str), Some("hash_b"));
+        let b_nodes: i64 = store.node_count(&project).await.expect("node_count");
+        assert_eq!(b_nodes, 1, "only the b.rs node remains");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn scoped_reconcile_ignores_a_vanished_file_outside_the_scan_root() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("scoped_vanish_out");
+        store
+            .upsert_nodes(&[
+                node_in("vanish_out_a1", &project, "src/a.rs"),
+                node_in("vanish_out_b1", &project, "src/b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_file_metadata(&[
+                file_meta(&project, "src/a.rs", "hash_a"),
+                file_meta(&project, "src/b.rs", "hash_b"),
+            ])
+            .await
+            .expect("upsert metadata");
+
+        // A scan root that covers no stored file: nothing may be treated as deleted.
+        let scope = ReconcileScope {
+            project_root: std::path::PathBuf::from("/repo"),
+            scan_root: std::path::PathBuf::from("/repo/src/other"),
+        };
+        let stats = PgStore::reconcile(
+            &store,
+            &project,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Some(&scope),
+        )
+        .await
+        .expect("scoped reconcile");
+
+        assert_eq!(stats.stale_nodes, 0, "no node lies inside the scan root");
+        assert_eq!(stats.stale_files, 0, "no file lies inside the scan root");
+        assert_eq!(store.node_count(&project).await.expect("node_count"), 2);
+        assert_eq!(store.file_hashes(&project).await.expect("hashes").len(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn unscoped_reconcile_still_clears_vanished_files() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("unscoped_vanish");
+        store
+            .upsert_nodes(&[
+                node_in("unscoped_a1", &project, "src/a.rs"),
+                node_in("unscoped_b1", &project, "src/b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+        store
+            .upsert_file_metadata(&[
+                file_meta(&project, "src/a.rs", "hash_a"),
+                file_meta(&project, "src/b.rs", "hash_b"),
+            ])
+            .await
+            .expect("upsert metadata");
+
+        let stats = PgStore::reconcile(
+            &store,
+            &project,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+        )
+        .await
+        .expect("reconcile without scope");
+
+        assert_eq!(
+            stats.stale_nodes, 2,
+            "whole-project reconciliation clears all"
+        );
+        assert_eq!(stats.stale_files, 2, "both files vanished");
+        assert_eq!(store.node_count(&project).await.expect("node_count"), 0);
         assert!(
-            message.contains("scoped reconciliation is not implemented"),
-            "unexpected error message: {message}"
+            store
+                .file_hashes(&project)
+                .await
+                .expect("hashes")
+                .is_empty()
         );
     }
 
@@ -3396,7 +3654,7 @@ mod tests {
 
         let fresh = fresh_map(&[("a.rs", &["recon_a1"])]);
         let stats = store
-            .reconcile(&project, &fresh, &BTreeSet::new(), &BTreeSet::new())
+            .reconcile(&project, &fresh, &BTreeSet::new(), &BTreeSet::new(), None)
             .await
             .expect("reconcile");
 
@@ -3458,7 +3716,7 @@ mod tests {
         let fresh_nodes = fresh_map(&[("a.rs", &["recon_ea", "recon_eb"])]);
         let fresh_edges: BTreeSet<String> = [format!("{project}_e_keep")].into_iter().collect();
         let stats = store
-            .reconcile(&project, &fresh_nodes, &BTreeSet::new(), &fresh_edges)
+            .reconcile(&project, &fresh_nodes, &BTreeSet::new(), &fresh_edges, None)
             .await
             .expect("reconcile");
 
@@ -3518,7 +3776,7 @@ mod tests {
 
         let fresh = fresh_map(&[("a.rs", &["recon_kept"])]);
         let stats = store
-            .reconcile(&project, &fresh, &BTreeSet::new(), &BTreeSet::new())
+            .reconcile(&project, &fresh, &BTreeSet::new(), &BTreeSet::new(), None)
             .await
             .expect("reconcile");
 
@@ -3929,7 +4187,7 @@ mod tests {
 
         let fresh = fresh_map(&[("src/a.rs", &["recon_file_a"])]);
         let stats = store
-            .reconcile(&project, &fresh, &BTreeSet::new(), &BTreeSet::new())
+            .reconcile(&project, &fresh, &BTreeSet::new(), &BTreeSet::new(), None)
             .await
             .expect("reconcile");
 
