@@ -8,9 +8,11 @@
 //! both backends: `analysis::hubs`, `analysis::expand_bfs`, `analysis::trace_bfs` and
 //! `analysis::score_hotspots` are the single source of truth for ranking and traversal.
 //!
-//! `detect_circular_dependencies` is **not implemented** here and returns an explicit
-//! configuration error instead of silently returning empty data; every other method,
-//! including `semantic_search_with_context`, is implemented.
+//! `detect_circular_dependencies` is aligned with the native SurrealDB path: it loads the
+//! edges of one type, asks `analysis::mutual_pairs` for the bidirectional pairs (self-loops
+//! excluded, each pair once, smaller id first) and hydrates both endpoints, dropping pairs
+//! whose nodes cannot be found. Every method on the trait is implemented here, including
+//! `semantic_search_with_context`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,8 +21,8 @@ use async_trait::async_trait;
 use codegraph_core::{CodeGraphError, Result};
 
 use crate::analysis::{
-    DEPENDENCY_EDGE_TYPES, Direction, EdgeRow as AnalysisEdgeRow, expand_bfs, hubs, safe_depth,
-    safe_depth_for_call_chain, score_hotspots, trace_bfs,
+    DEPENDENCY_EDGE_TYPES, Direction, EdgeRow as AnalysisEdgeRow, expand_bfs, hubs, mutual_pairs,
+    safe_depth, safe_depth_for_call_chain, score_hotspots, trace_bfs,
 };
 use crate::graph_types::{
     CallChainNode, CallerInfo, CircularDependency, ComplexityHotspot, CouplingMetrics,
@@ -776,14 +778,48 @@ impl crate::graph_types::GraphQuery for PgGraph {
         Ok(self.store.node_count(&self.project_id).await? as usize)
     }
 
-    /// Not implemented on the Postgres backend yet; see the module documentation.
+    /// Bidirectional (`a -> b` and `b -> a`) edges of one type, both endpoints hydrated.
+    ///
+    /// Mirrors `GraphFunctions::detect_circular_dependencies_native` and
+    /// `fn::detect_circular_dependencies` in `schema/codegraph_v2.surql`:
+    /// - `edge_type` matching is case-insensitive (the value is lowercased before loading);
+    /// - self-loops never form a cycle;
+    /// - each `(a, b)` pair is reported once, with the smaller id first;
+    /// - a pair whose endpoints cannot be hydrated is dropped, matching the schema's
+    ///   `WHERE node1 != NONE AND node2 != NONE`.
     async fn detect_circular_dependencies(
         &self,
-        _edge_type: &str,
+        edge_type: &str,
     ) -> Result<Vec<CircularDependency>> {
-        Err(CodeGraphError::Configuration(
-            "circular dependency detection is not implemented for the Postgres backend yet".into(),
-        ))
+        let dependency_type = edge_type.to_lowercase();
+        let edges = self.load_typed_edges(&dependency_type).await?;
+        let pairs = mutual_pairs(&edges, &dependency_type);
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ids: Vec<String> = Vec::with_capacity(pairs.len() * 2);
+        for (left, right) in &pairs {
+            ids.push(left.clone());
+            ids.push(right.clone());
+        }
+        let by_id = self.load_nodes(&ids).await?;
+
+        let mut out = Vec::with_capacity(pairs.len());
+        for (left, right) in pairs {
+            let (Some(node1), Some(node2)) = (by_id.get(&left), by_id.get(&right)) else {
+                continue;
+            };
+            out.push(CircularDependency {
+                node1_id: left,
+                node2_id: right,
+                node1: node1.clone(),
+                node2: node2.clone(),
+                dependency_type: dependency_type.clone(),
+            });
+        }
+
+        Ok(out)
     }
 
     /// Hybrid node search backed by pgvector and Postgres full-text indexes.
@@ -1430,26 +1466,163 @@ mod tests {
         assert_eq!(graph.count_nodes_for_project().await.expect("count"), 3);
     }
 
-    /// The one unimplemented method must fail loudly, never return silent empty data.
+    /// A project with no edges has no cycles.
     #[tokio::test]
     #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
-    async fn circular_dependency_detection_fails_loudly() {
+    async fn circular_dependencies_of_an_empty_project_returns_nothing() {
         let Some(store) = store_or_skip() else {
             return;
         };
-        let project = project_id("unimplemented");
-        let graph = PgGraph::new(Arc::new(store), project);
+        let project = project_id("cycles_empty");
+        store.ensure_schema().await.expect("ensure_schema");
 
-        let cycle_error = graph
+        store
+            .upsert_nodes(&[node("lonely", &project)])
+            .await
+            .expect("upsert_nodes");
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
+        let cycles = graph
             .detect_circular_dependencies("calls")
             .await
-            .expect_err("circular dependency detection must not be silently empty");
+            .expect("detect_circular_dependencies");
+        assert!(cycles.is_empty(), "no edges, no cycles: {cycles:?}");
+    }
+
+    /// A→B plus B→A is exactly one cycle over that edge type.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn circular_dependencies_finds_a_mutual_pair() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("cycles_pair");
+        store.ensure_schema().await.expect("ensure_schema");
+
+        store
+            .upsert_nodes(&[node("a", &project), node("b", &project)])
+            .await
+            .expect("upsert_nodes");
+        store
+            .upsert_edges(&[
+                edge(&format!("{project}_e1"), &project, "a", "b", "calls"),
+                edge(&format!("{project}_e2"), &project, "b", "a", "calls"),
+            ])
+            .await
+            .expect("upsert_edges");
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
+        let cycles = graph
+            .detect_circular_dependencies("calls")
+            .await
+            .expect("detect_circular_dependencies");
+
+        assert_eq!(cycles.len(), 1, "one mutual pair: {cycles:?}");
+        let cycle = &cycles[0];
+        assert_eq!(cycle.dependency_type, "calls");
+        // Direction is not asserted: `mutual_pairs` reports the smaller id first, but the
+        // pair membership is what the contract guarantees.
+        let mut pair = [cycle.node1_id.as_str(), cycle.node2_id.as_str()];
+        pair.sort();
+        assert_eq!(pair, ["a", "b"], "pair membership, direction-agnostic");
+        assert_eq!(cycle.node1.id, cycle.node1_id, "node1 must be hydrated");
+        assert_eq!(cycle.node2.id, cycle.node2_id, "node2 must be hydrated");
+    }
+
+    /// A one-way edge is a dependency, not a cycle.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn circular_dependencies_ignores_one_way_edges() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("cycles_one_way");
+        store.ensure_schema().await.expect("ensure_schema");
+
+        store
+            .upsert_nodes(&[node("a", &project), node("b", &project)])
+            .await
+            .expect("upsert_nodes");
+        store
+            .upsert_edges(&[edge(&format!("{project}_e1"), &project, "a", "b", "calls")])
+            .await
+            .expect("upsert_edges");
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
+        let cycles = graph
+            .detect_circular_dependencies("calls")
+            .await
+            .expect("detect_circular_dependencies");
+        assert!(cycles.is_empty(), "one-way edge is no cycle: {cycles:?}");
+    }
+
+    /// The edge type filters the scan: a cycle over `imports` is invisible to `calls`.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn circular_dependencies_honours_edge_type() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("cycles_edge_type");
+        store.ensure_schema().await.expect("ensure_schema");
+
+        store
+            .upsert_nodes(&[node("a", &project), node("b", &project)])
+            .await
+            .expect("upsert_nodes");
+        store
+            .upsert_edges(&[
+                edge(&format!("{project}_e1"), &project, "a", "b", "imports"),
+                edge(&format!("{project}_e2"), &project, "b", "a", "imports"),
+            ])
+            .await
+            .expect("upsert_edges");
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
         assert!(
-            cycle_error
-                .to_string()
-                .contains("not implemented for the Postgres backend"),
-            "unexpected message: {cycle_error}"
+            graph
+                .detect_circular_dependencies("calls")
+                .await
+                .expect("detect_circular_dependencies")
+                .is_empty(),
+            "no calls edges exist"
         );
+        assert_eq!(
+            graph
+                .detect_circular_dependencies("imports")
+                .await
+                .expect("detect_circular_dependencies")
+                .len(),
+            1,
+            "the imports cycle is found"
+        );
+    }
+
+    /// A self-loop must not be reported as a two-node cycle.
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn circular_dependencies_skips_self_loops() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let project = project_id("cycles_self_loop");
+        store.ensure_schema().await.expect("ensure_schema");
+
+        store
+            .upsert_nodes(&[node("a", &project)])
+            .await
+            .expect("upsert_nodes");
+        store
+            .upsert_edges(&[edge(&format!("{project}_e1"), &project, "a", "a", "calls")])
+            .await
+            .expect("upsert_edges");
+
+        let graph = PgGraph::new(Arc::new(store), project.clone());
+        let cycles = graph
+            .detect_circular_dependencies("calls")
+            .await
+            .expect("detect_circular_dependencies");
+        assert!(cycles.is_empty(), "self-loops are not cycles: {cycles:?}");
     }
 
     /// The vector list reaches node granularity: the closest chunk decides the parent.
