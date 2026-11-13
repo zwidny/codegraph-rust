@@ -138,6 +138,28 @@ coverage ranking, so top-10 lists will differ even when recall is comparable. Th
 (vector + full text + RRF) therefore needs a relevance comparison on 20 real queries before the
 switch — plan for RRF fusion in SQL or the application.
 
+### 3. Full-text recall and ranking
+
+12,887 real nodes (name + content) loaded into both backends, 20 identifiers from the codebase
+(`handle`, `parse`, `embedding`, `config`, `error`, `vector`, ...). Ground truth for "did it
+find the right documents" is a `LIKE '%word%'` scan over name+content.
+
+| Metric | SurrealDB (`@1@`) | Postgres (`tsvector @@ tsquery`) |
+|---|---|---|
+| Precision of top-10 (result really contains the word) | **96%** | **100%** |
+| top-10 Jaccard overlap between backends | **9%** | |
+
+**Recall is equivalent; ranking is not.** Both backends return relevant documents, but in a
+completely different order, because BM25 and `ts_rank_cd` are different models (BM25 is
+probabilistic with document-length normalisation; `ts_rank_cd` is a coverage/density heuristic).
+
+Consequence for the hybrid path: RRF only uses **ranks**, so a 9% top-10 overlap means the
+fused result order will change after migration even though recall stays the same. If ranking
+stability matters, implement BM25 scoring in Rust (document length + term frequencies are both
+available from the corpus) rather than relying on `ts_rank_cd`. That is a small addition to
+`AnalysisCore` and would also make the ranking backend-independent — which is the stated goal of
+`docs/INTERNAL_FUNCTION_MIGRATION.md`.
+
 ## What SurrealDB is actually used for here
 
 Inventory of the current schema and queries (8 tables, 55 indexes, 28 HNSW definitions,
@@ -172,10 +194,17 @@ part that talks to the database:
 | Multi-tenancy | namespace/database | Postgres schema per project |
 | Reconciliation | node/chunk/edge sweep | same logic, PG SQL |
 
-Estimated 2-3 weeks. Both prerequisite validations are done (see above): graph traversal is
-34-640x faster in both directions, and vector recall matches (6.8 vs 6.5 out of 10 against
-exact). The only remaining unknown is full-text **ranking** — `ts_rank_cd` is not BM25, so a
-20-query relevance comparison of the hybrid path is still required before the switch.
+Estimated 2-3 weeks. All three validations are done:
+
+- graph traversal is 34-640x faster in both directions;
+- vector recall matches against exact KNN (6.8 vs 6.5 out of 10);
+- full-text recall matches (96% vs 100% precision) but **ranking does not** (9% top-10
+  overlap), because BM25 and `ts_rank_cd` are different models.
+
+The one design decision this forces: implement BM25 in Rust (`AnalysisCore`) and feed the
+`tsvector` corpus, instead of using `ts_rank_cd`. That keeps ranking backend-independent and
+stable across the migration — which is the same goal `docs/INTERNAL_FUNCTION_MIGRATION.md`
+already states ("Backend lock-in").
 
 ## Expected effect on indexing
 
