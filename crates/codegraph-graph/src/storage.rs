@@ -264,6 +264,16 @@ pub struct ProjectMetadataRecord {
     pub domain: Option<String>,
 }
 
+/// One node's identity as seen from a file scan, used to redirect edges whose
+/// endpoint id changed because a line moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeInFile {
+    pub id: String,
+    pub file_path: String,
+    pub name: String,
+    pub node_type: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeEmbeddingRecord {
     pub id: String,
@@ -486,4 +496,32 @@ pub trait IndexStorage: Send + Sync {
         from_node: &str,
         depth: u32,
     ) -> Result<Vec<String>>;
+
+    /// The `metadata.input_fingerprint` stored with the project's metadata row,
+    /// or `None` when the row (or the key) is absent.
+    async fn project_fingerprint(&self, project_id: &str) -> Result<Option<String>>;
+
+    /// Drop the project metadata row before a re-index mutates the graph.
+    async fn delete_project_metadata(&self, project_id: &str) -> Result<()>;
+
+    /// Whether a project metadata row exists (`is_indexed` / verification probes).
+    async fn has_project_metadata(&self, project_id: &str) -> Result<bool>;
+
+    /// Every stored file metadata row for the project, keyed by path on the
+    /// caller's side. Used by incremental change detection.
+    async fn file_metadata(&self, project_id: &str) -> Result<Vec<FileMetadataRecord>>;
+
+    /// Nodes whose `file_path` is one of `files`, with ids already decoded to
+    /// the plain stored form. Backends differ on whether the raw id carries a
+    /// table prefix, so decoding is the backend's job.
+    async fn nodes_in_files(&self, project_id: &str, files: &[String]) -> Result<Vec<NodeInFile>>;
+
+    /// Point every edge whose `to_id` is `old` at `new` instead. `from_id` is
+    /// deliberately untouched: this mirrors the existing SurrealQL redirect.
+    async fn retarget_edges(&self, project_id: &str, old: &str, new: &str) -> Result<u64>;
+
+    /// Make sure the vector indexes exist for `dimension`. `tables` names the
+    /// tables to check; backends that create indexes in their DDL may ignore it.
+    /// Returns whether the indexes are ready.
+    async fn ensure_vector_indexes(&self, dimension: usize, tables: &[String]) -> Result<bool>;
 }

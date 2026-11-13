@@ -468,6 +468,44 @@ const DELETE_FILES_SQL: &str = r#"
 DELETE FROM file_metadata WHERE project_id = $1 AND file_path = ANY($2)
 "#;
 
+/// Reads the incremental-index fingerprint out of the JSON metadata blob. A missing
+/// key yields NULL, which maps to `None` rather than an error.
+const PROJECT_FINGERPRINT_SQL: &str = r#"
+SELECT metadata->>'input_fingerprint' FROM project_metadata WHERE project_id = $1
+"#;
+
+const DELETE_PROJECT_METADATA_SQL: &str = r#"
+DELETE FROM project_metadata WHERE project_id = $1
+"#;
+
+const HAS_PROJECT_METADATA_SQL: &str = r#"
+SELECT EXISTS(SELECT 1 FROM project_metadata WHERE project_id = $1) AS present
+"#;
+
+/// Full file-metadata scan. Timestamps travel as RFC 3339 text so the backend does
+/// not need `tokio-postgres`'s chrono feature; both timestamp columns are nullable.
+const FILE_METADATA_SQL: &str = r#"
+SELECT file_path, content_hash,
+       to_char(modified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+       file_size,
+       to_char(last_indexed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+       node_count, edge_count, language, parse_errors
+FROM file_metadata WHERE project_id = $1 ORDER BY file_path
+"#;
+
+/// Node identities for the files a re-index touched. `node_type` is nullable, so it
+/// is coalesced to an empty string to match [`crate::storage::NodeInFile`].
+const NODES_IN_FILES_SQL: &str = r#"
+SELECT id, file_path, name, COALESCE(node_type, '') FROM nodes
+WHERE project_id = $1 AND file_path = ANY($2) ORDER BY id
+"#;
+
+/// Repoint inbound edges after a symbol's id moved. Only `to_id` is rewritten: this
+/// mirrors the SurrealQL redirect, which leaves `from_id` alone.
+const RETARGET_EDGES_SQL: &str = r#"
+UPDATE edges SET to_id = $3 WHERE project_id = $1 AND to_id = $2
+"#;
+
 /// Node ids living in the files a delete request names.
 const NODE_IDS_BY_FILE_SQL: &str = r#"
 SELECT id FROM nodes WHERE project_id = $1 AND file_path = ANY($2)
@@ -1940,6 +1978,141 @@ impl crate::storage::IndexStorage for PgStore {
     ) -> anyhow::Result<Vec<String>> {
         Ok(PgStore::reverse_deps(self, project_id, from_node, depth).await?)
     }
+
+    /// Returns `metadata->>'input_fingerprint'`. A missing row or a NULL key both
+    /// surface as `None`.
+    async fn project_fingerprint(&self, project_id: &str) -> anyhow::Result<Option<String>> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let row = client
+            .query_opt(PROJECT_FINGERPRINT_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|row| row.get::<_, Option<String>>(0)))
+    }
+
+    async fn delete_project_metadata(&self, project_id: &str) -> anyhow::Result<()> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        client
+            .execute(DELETE_PROJECT_METADATA_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn has_project_metadata(&self, project_id: &str) -> anyhow::Result<bool> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let present: bool = client
+            .query_one(HAS_PROJECT_METADATA_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?
+            .get(0);
+        Ok(present)
+    }
+
+    /// Rows are ordered by `file_path` so callers receive a deterministic list.
+    ///
+    /// `modified_at` and `last_indexed_at` are nullable in the table but not in
+    /// [`FileMetadataRecord`], so a NULL timestamp is filled with `Utc::now()`.
+    /// `parse_errors` is stored as JSON text; a value that fails to parse is
+    /// returned as `Some(vec![raw])` so the original text is not lost.
+    async fn file_metadata(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::storage::FileMetadataRecord>> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(FILE_METADATA_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+
+        let parse_timestamp = |text: &str| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .map_err(|error| {
+                    CodeGraphError::Database(format!("invalid timestamp {text:?}: {error}"))
+                })
+        };
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let modified_at = match row.get::<_, Option<String>>(2) {
+                Some(text) => parse_timestamp(&text)?,
+                None => chrono::Utc::now(),
+            };
+            let last_indexed_at = match row.get::<_, Option<String>>(4) {
+                Some(text) => parse_timestamp(&text)?,
+                None => chrono::Utc::now(),
+            };
+            let parse_errors = match row.get::<_, Option<String>>(8) {
+                Some(raw) => {
+                    Some(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_else(|_| vec![raw]))
+                }
+                None => None,
+            };
+            records.push(crate::storage::FileMetadataRecord {
+                file_path: row.get(0),
+                project_id: project_id.to_string(),
+                content_hash: row.get(1),
+                modified_at,
+                file_size: row.get::<_, Option<i64>>(3).unwrap_or_default(),
+                last_indexed_at,
+                node_count: row.get::<_, i32>(5) as i64,
+                edge_count: row.get::<_, i32>(6) as i64,
+                language: row.get(7),
+                parse_errors,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Unlike SurrealDB, Postgres stores node ids as bare strings, so no
+    /// `nodes:` prefix or quoting has to be stripped here. A NULL `file_path`
+    /// becomes an empty string; the `ANY($2)` predicate already excludes it.
+    async fn nodes_in_files(
+        &self,
+        project_id: &str,
+        files: &[String],
+    ) -> anyhow::Result<Vec<crate::storage::NodeInFile>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let client = self.pool.get().await.map_err(db_err)?;
+        let rows = client
+            .query(NODES_IN_FILES_SQL, &[&project_id, &files])
+            .await
+            .map_err(db_err)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::storage::NodeInFile {
+                id: row.get(0),
+                file_path: row.get::<_, Option<String>>(1).unwrap_or_default(),
+                name: row.get(2),
+                node_type: row.get(3),
+            })
+            .collect())
+    }
+
+    /// Returns the number of edges whose `to_id` moved.
+    async fn retarget_edges(&self, project_id: &str, old: &str, new: &str) -> anyhow::Result<u64> {
+        let client = self.pool.get().await.map_err(db_err)?;
+        Ok(client
+            .execute(RETARGET_EDGES_SQL, &[&project_id, &old, &new])
+            .await
+            .map_err(db_err)?)
+    }
+
+    /// Always `true`: the HNSW indexes are built by [`SCHEMA_DDL`], so there is
+    /// nothing to check at runtime. `dimension` and `tables` are ignored because
+    /// this backend keeps a single fixed-dimension `embedding_1024` column.
+    async fn ensure_vector_indexes(
+        &self,
+        _dimension: usize,
+        _tables: &[String],
+    ) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -3340,6 +3513,212 @@ mod tests {
         assert!(by_id("hyb_both").text_rank.is_some());
         assert!(by_id("hyb_vector").text_rank.is_none());
         assert!(by_id("hyb_text").vector_rank.is_none());
+    }
+
+    // ---- IndexStorage additions: fingerprint / metadata / retarget ----
+
+    fn project_with_metadata(project: &str, metadata: serde_json::Value) -> ProjectMetadataRecord {
+        ProjectMetadataRecord {
+            metadata,
+            project_id: project.to_string(),
+            name: "fingerprint-fixture".to_string(),
+            root_path: "/tmp/fingerprint-fixture".to_string(),
+            primary_language: Some("rust".to_string()),
+            file_count: 1,
+            node_count: 1,
+            edge_count: 0,
+            avg_coverage_score: 0.0,
+            last_analyzed: chrono::Utc::now(),
+            codegraph_version: "test".to_string(),
+            organization_id: None,
+            domain: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn project_fingerprint_reads_and_clears() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("fingerprint");
+        store
+            .upsert_project_metadata(&project_with_metadata(
+                &project,
+                serde_json::json!({ "input_fingerprint": "fp1" }),
+            ))
+            .await
+            .expect("upsert project metadata");
+
+        let fingerprint = store
+            .project_fingerprint(&project)
+            .await
+            .expect("project_fingerprint");
+        assert_eq!(fingerprint.as_deref(), Some("fp1"));
+        assert!(
+            store
+                .has_project_metadata(&project)
+                .await
+                .expect("has_project_metadata"),
+            "the metadata row must exist before deletion"
+        );
+
+        store
+            .delete_project_metadata(&project)
+            .await
+            .expect("delete_project_metadata");
+        assert_eq!(
+            store
+                .project_fingerprint(&project)
+                .await
+                .expect("after delete"),
+            None,
+            "a deleted row must not yield a fingerprint"
+        );
+        assert!(
+            !store
+                .has_project_metadata(&project)
+                .await
+                .expect("has_project_metadata after delete"),
+            "the metadata row must be gone"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn file_metadata_roundtrips_rows() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("file_metadata_rows");
+        let modified_at = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+            .expect("fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let mut second = file_meta(&project, "src/b.rs", "hash_b");
+        second.modified_at = Some(modified_at);
+        second.file_size = Some(77);
+        second.node_count = 4;
+        second.edge_count = 2;
+        second.language = Some("rust".to_string());
+        second.parse_errors = Some("[\"e1\",\"e2\"]".to_string());
+
+        store
+            .upsert_file_metadata(&[file_meta(&project, "src/a.rs", "hash_a"), second.clone()])
+            .await
+            .expect("upsert file metadata");
+
+        let records = store.file_metadata(&project).await.expect("file_metadata");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/b.rs"],
+            "rows must be ordered by file_path"
+        );
+
+        let b = &records[1];
+        assert_eq!(b.project_id, project);
+        assert_eq!(b.content_hash, "hash_b");
+        assert_eq!(b.modified_at, modified_at);
+        assert_eq!(b.file_size, 77);
+        assert_eq!(b.node_count, 4);
+        assert_eq!(b.edge_count, 2);
+        assert_eq!(b.language.as_deref(), Some("rust"));
+        assert_eq!(
+            b.parse_errors.as_deref(),
+            Some(["e1".to_string(), "e2".to_string()].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn nodes_in_files_returns_only_named_files() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("nodes_in_files");
+        store
+            .upsert_nodes(&[
+                node_in("nif_a1", &project, "a.rs"),
+                node_in("nif_a2", &project, "a.rs"),
+                node_in("nif_b1", &project, "b.rs"),
+            ])
+            .await
+            .expect("upsert nodes");
+
+        let nodes = store
+            .nodes_in_files(&project, &["a.rs".to_string()])
+            .await
+            .expect("nodes_in_files");
+        assert_eq!(nodes.len(), 2, "only a.rs nodes may be returned");
+        assert!(
+            nodes.iter().all(|node| node.file_path == "a.rs"),
+            "no b.rs row may leak into the result"
+        );
+        assert!(
+            nodes.iter().all(|node| !node.node_type.is_empty()),
+            "node_type must carry the stored kind"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn retarget_edges_moves_to_endpoint() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let project = project_id("retarget");
+        store
+            .upsert_edges(&[edge_row("retarget_e1", &project, "A", "B")])
+            .await
+            .expect("upsert edge");
+
+        let moved = store
+            .retarget_edges(&project, "B", "C")
+            .await
+            .expect("retarget_edges");
+        assert_eq!(moved, 1, "exactly one edge points at B");
+
+        let client = store.pool.get().await.expect("pool get");
+        let to_id: String = client
+            .query_one(
+                "SELECT to_id FROM edges WHERE project_id = $1 AND id = $2",
+                &[&project, &"retarget_e1"],
+            )
+            .await
+            .expect("select retargeted edge")
+            .get(0);
+        assert_eq!(to_id, "C", "the edge must now point at the new id");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn ensure_vector_indexes_is_true() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+
+        use crate::storage::IndexStorage;
+        let ready = store
+            .ensure_vector_indexes(1024, &["nodes".to_string(), "chunks".to_string()])
+            .await
+            .expect("ensure_vector_indexes");
+        assert!(ready, "Postgres builds its HNSW indexes in SCHEMA_DDL");
     }
 }
 

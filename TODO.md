@@ -310,6 +310,54 @@ Nothing is wired up yet.
 | Stale SCIP error message | **Fixed in `291192f`**: the import now warns `SCIP index … is older than N of M captured sources` (mtime comparison, non-fatal) and position failures carry `<path>:<line>:<col> (end …, encoding N) … the index is probably stale`. The mtime heuristic can misfire on `git checkout`/`touch` — it only warns, so that is cosmetic |
 | Occurrence-aware edge ids | ~31% of this repo's 96,733 edges share `(from,to,type)` with another edge (max 71 occurrences of one `references`). Deliberate (`edge.rs` keeps distinct call sites distinct), but degree/coupling metrics must `DISTINCT` or they over-count |
 
+### 6. Postgres + pgvector backend — **in progress**
+
+Evaluation is settled (107x write, 56x KNN, 156x full-text; see
+[docs/BACKEND_EVALUATION.md](docs/BACKEND_EVALUATION.md)). The migration proceeds in
+reviewable slices so nothing lands as an unreviewable rewrite of `indexer.rs`.
+
+**Landed** (all behind `--features postgres`; the SurrealDB path is untouched and its
+suites stay green):
+
+| Commit | What it added |
+|---|---|
+| `f41e924` | Scaffold: `chunks` / `edges` DDL + upsert |
+| `a47922d` | `nodes` + `symbol_embeddings` |
+| `8678f79` | Reconciliation, including the stale-edge rule that once left 6,421 edges behind |
+| `890f987` | `knn_nodes` / `full_text_nodes` / `hybrid_nodes` (RRF) |
+| `347cdf1` | `file_metadata` (composite key, incremental change detection) |
+| `5ad994d` | `IndexStorage` trait + both backend impls |
+| `f8436c6` | Writer queue drives `Arc<dyn IndexStorage>`; `project_metadata` table |
+
+**Still open:**
+
+| Item | Why it blocks |
+|---|---|
+| 7 more `IndexStorage` methods | The indexer still issues raw SurrealQL for the project fingerprint, `DELETE project_metadata`, reconcile, vector-index readiness, file metadata reads, and edge retargeting |
+| `CODEGRAPH_BACKEND=postgres` | Nothing constructs a `PgStore` in production yet |
+| `GraphQueries` parity | hub / coupling / call chain / subgraph are SurrealQL-only |
+| End-to-end run | The 107x write figure has only been measured on a synthetic harness, not through a real `codegraph index` |
+
+**Semantics that deliberately differ, do not "fix" silently:**
+
+- `nodes` has one vector column (`embedding_1024`); `NodeEmbeddingRecord.column` is ignored,
+  so a non-1024 dimension is rejected by pgvector rather than rejected by the client.
+- `PG` implements RRF and `ts_rank_cd`; SurrealDB uses BM25. Recall is equivalent
+  (96% vs 100%) but ranking order differs (top-10 overlap 9%). Do not expect identical
+  search results across backends.
+- `tsquery_prefix` does not split camelCase (`HandleFile` → `handlefile:*`), unlike
+  SurrealDB's CAMEL tokenizer. Known recall gap for camelCase identifiers.
+- `delete_data_for_files` returns submitted paths on SurrealDB and rows affected on Postgres.
+
+**Traps already paid for** (do not rediscover):
+
+| Trap | Fix |
+|---|---|
+| `ts_rank_cd` returns `real`, tokio-postgres cannot decode into `f64` | `::double precision` in SQL |
+| `$n::vector` / `$n::timestamptz` make Postgres infer the parameter type, so binding a `String` fails with "error serializing parameter N" | `$n::text::vector` / `$n::text::timestamptz` |
+| `edges.id` is a global primary key, so fixed test ids collide on the second run | project-scoped ids; `project_id()` carries a nanosecond stamp + counter |
+| Removing the writer's `Mutex` means writer and indexer no longer share a lock | Safe only because every write-shaped raw query is preceded by `flush_surreal_writer()` (an ordering convention, not a guarantee) |
+
 ## Useful commands
 
 ```bash

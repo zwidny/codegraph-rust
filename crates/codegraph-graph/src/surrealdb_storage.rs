@@ -2737,6 +2737,20 @@ fn parse_count(values: Vec<JsonValue>) -> Result<i64> {
     }
 }
 
+/// Strip the record prefix and quoting from a `nodes` id returned by SurrealDB.
+///
+/// Mirrors `codegraph_mcp::indexer::decode_node_id`: SurrealDB renders an id as
+/// `nodes:<id>` (and quotes ids that need it with backticks or angle brackets),
+/// while the rest of the pipeline keys nodes by the bare id. Postgres stores the
+/// bare id already, so its backend does not call this.
+fn decode_node_id(raw: &str) -> &str {
+    raw.strip_prefix("nodes:")
+        .unwrap_or(raw)
+        .trim_matches('`')
+        .trim_matches('⟨')
+        .trim_matches('⟩')
+}
+
 /// Count rows of one project-scoped table.
 async fn surreal_count(
     db: Arc<Surreal<Any>>,
@@ -2932,6 +2946,150 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
             .get_reverse_dependencies(from_node, "calls", depth as i32)
             .await?;
         Ok(deps.into_iter().map(|dependency| dependency.id).collect())
+    }
+
+    async fn project_fingerprint(&self, project_id: &str) -> anyhow::Result<Option<String>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT metadata.input_fingerprint AS fingerprint FROM project_metadata \
+                 WHERE project_id = $project",
+            )
+            .bind(("project", project_id.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("fingerprint query failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("fingerprint query failed: {e}")))?;
+        let markers: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("fingerprint decode failed: {e}")))?;
+        Ok(markers
+            .first()
+            .and_then(|value| value.get("fingerprint"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string))
+    }
+
+    async fn delete_project_metadata(&self, project_id: &str) -> anyhow::Result<()> {
+        self.db
+            .query("DELETE project_metadata WHERE project_id = $project")
+            .bind(("project", project_id.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("project metadata delete failed: {e}")))?
+            .check()
+            .map_err(|e| {
+                CodeGraphError::Database(format!("project metadata delete failed: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn has_project_metadata(&self, project_id: &str) -> anyhow::Result<bool> {
+        // Reuses `surreal_count` rather than duplicating the same
+        // `count() ... GROUP ALL` probe; its `unwrap_or(0)` already covers "no row".
+        let count = surreal_count(self.db(), "project_metadata", project_id).await?;
+        Ok(count > 0)
+    }
+
+    async fn file_metadata(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::storage::FileMetadataRecord>> {
+        Ok(self.get_file_metadata_for_project(project_id).await?)
+    }
+
+    async fn nodes_in_files(
+        &self,
+        project_id: &str,
+        files: &[String],
+    ) -> anyhow::Result<Vec<crate::storage::NodeInFile>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut response = self
+            .db
+            .query(
+                "SELECT <string> id AS id, file_path, name, node_type FROM nodes \
+                 WHERE project_id = $project AND file_path IN $files;",
+            )
+            .bind(("project", project_id.to_string()))
+            .bind(("files", files.to_vec()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("nodes-in-files query failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("nodes-in-files query failed: {e}")))?;
+        let rows: Vec<JsonValue> = response
+            .take(0)
+            .map_err(|e| CodeGraphError::Database(format!("nodes-in-files decode failed: {e}")))?;
+
+        let mut nodes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(raw_id) = row.get("id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            nodes.push(crate::storage::NodeInFile {
+                id: decode_node_id(raw_id).to_string(),
+                file_path: row
+                    .get("file_path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                name: row
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                node_type: row
+                    .get("node_type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        Ok(nodes)
+    }
+
+    async fn retarget_edges(&self, project_id: &str, old: &str, new: &str) -> anyhow::Result<u64> {
+        self.db
+            .query(
+                "UPDATE edges SET to = type::record('nodes', $new) \
+                 WHERE project_id = $project AND to = type::record('nodes', $old);",
+            )
+            .bind(("project", project_id.to_string()))
+            .bind(("old", old.to_string()))
+            .bind(("new", new.to_string()))
+            .await
+            .map_err(|e| CodeGraphError::Database(format!("edge retarget failed: {e}")))?
+            .check()
+            .map_err(|e| CodeGraphError::Database(format!("edge retarget failed: {e}")))?;
+        // This statement does not report an affected-row count, so the caller
+        // cannot learn how many edges moved. It returns 0 by contract rather
+        // than inventing a number.
+        Ok(0)
+    }
+
+    async fn ensure_vector_indexes(
+        &self,
+        dimension: usize,
+        tables: &[String],
+    ) -> anyhow::Result<bool> {
+        // `vector_indexes::ensure_ready` keys its DDL on `&'static str` table
+        // names, so the caller's owned strings are mapped back onto the three
+        // supported tables. An unknown name is a configuration error, mirroring
+        // the check inside `definitions`.
+        let tables: Result<Vec<&'static str>> = tables
+            .iter()
+            .map(|table| match table.as_str() {
+                "nodes" => Ok("nodes"),
+                "chunks" => Ok("chunks"),
+                "symbol_embeddings" => Ok("symbol_embeddings"),
+                other => Err(CodeGraphError::Configuration(format!(
+                    "Unsupported vector table: {other}"
+                ))),
+            })
+            .collect();
+        let tables = tables?;
+        Ok(crate::vector_indexes::ensure_ready(&self.db(), dimension, &tables).await?)
     }
 }
 
