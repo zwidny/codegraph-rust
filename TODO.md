@@ -146,6 +146,24 @@ pure write time. Overall the run acknowledged 477,248 rows (nodes + edges + chun
 Conclusion: **stop optimising this path in the client.** Only fewer rows or a faster store
 changes it. **Do not re-run the batch, HNSW, REFERENCE or concurrency experiments.**
 
+### Backend evaluation: SurrealDB vs Postgres + pgvector — measured
+
+The write path is capped by `surrealkv`'s **single-threaded flusher** (`src/ring/pipeline.rs`:
+"The flusher is the only user"), not by our code. A full comparison on the same machine and
+data is recorded in [docs/BACKEND_EVALUATION.md](docs/BACKEND_EVALUATION.md):
+
+| Operation | SurrealDB | Postgres 16 + pgvector | Speedup |
+|---|---|---|---|
+| Write 62,233 rows × 1024-d | ~600 s | **5.62 s** | **107x** |
+| KNN K=10 | 39.0 ms | **0.69 ms** | **56x** |
+| Full-text search | 25.0 ms | **0.16 ms** | **156x** |
+| Reverse deps, depth 1 (1,324 rows) | **420 ms** | **1.7 ms** | **247x** |
+| Reverse deps, depth 3 | **2,040 ms** | **59.7 ms** | **34x** |
+
+That document also lists the **13 falsified hypotheses** and two methodology traps (single-request
+benchmarks do not predict concurrent behaviour; `array::map(... rand::float() ...)` costs more than
+the storage it is meant to measure). Read it before proposing another storage-layer optimisation.
+
 ### What was learned (do not re-derive)
 
 - `embeddings_and_writes` is a **database write** phase: GPU 0%, embedding container 0.4%
