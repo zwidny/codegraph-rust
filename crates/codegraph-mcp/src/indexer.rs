@@ -1367,9 +1367,17 @@ impl ProjectIndexer {
             }
 
             let lsp_files = files_without_scip_coverage(&self.project_root, &files, &scip_covered);
+            let fallback_enabled = lsp_fallback_enabled();
+            if !fallback_enabled && !lsp_files.is_empty() {
+                info!(
+                    "🧠 LSP fallback disabled (CODEGRAPH_LSP_FALLBACK): {} files without SCIP coverage keep AST-only results",
+                    lsp_files.len()
+                );
+            }
             if analyzer_settings.lsp_enabled()
                 && !analyzer_languages.is_empty()
                 && !lsp_files.is_empty()
+                && fallback_enabled
             {
                 let start = std::time::Instant::now();
                 info!(
@@ -4637,6 +4645,23 @@ pub(crate) fn files_without_scip_coverage(
         .collect()
 }
 
+/// Whether files without SCIP coverage may fall back to a language server.
+///
+/// On by default. `CODEGRAPH_LSP_FALLBACK=0|false|off|no` turns it off: those
+/// files keep AST-only results instead of starting a language server.
+///
+/// On EasyTier this skips 287 files and roughly 35 s of a 65 s full index
+/// (kotlin-language-server alone needs 24 s to initialise), and removes the
+/// language-server non-determinism documented in docs/LSP_DETERMINISM.md.
+fn lsp_fallback_enabled() -> bool {
+    !matches!(
+        std::env::var("CODEGRAPH_LSP_FALLBACK")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if value == "0" || value == "false" || value == "off" || value == "no"
+    )
+}
+
 /// One `CODEGRAPH_SCIP_INDEX` entry: a SCIP artifact plus the optional directory
 /// prefix its document paths are relative to (for indexes generated in a subdirectory).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5063,6 +5088,71 @@ mod scip_coverage_tests {
             vec![PathBuf::from("src/a.rs"), PathBuf::from("web/c.ts")],
             "filtering must preserve the scanned order of the remaining files"
         );
+    }
+}
+
+#[cfg(test)]
+mod lsp_fallback_tests {
+    use super::*;
+
+    /// `CODEGRAPH_LSP_FALLBACK` is read from the process environment, so these
+    /// tests must not overlap with each other.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Serialises the test and removes `CODEGRAPH_LSP_FALLBACK` on drop,
+    /// including when an assertion panics.
+    struct FallbackEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FallbackEnvGuard {
+        fn new(value: Option<&str>) -> Self {
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match value {
+                Some(value) => unsafe { std::env::set_var("CODEGRAPH_LSP_FALLBACK", value) },
+                None => unsafe { std::env::remove_var("CODEGRAPH_LSP_FALLBACK") },
+            }
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for FallbackEnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("CODEGRAPH_LSP_FALLBACK") };
+        }
+    }
+
+    #[test]
+    fn lsp_fallback_defaults_to_enabled() {
+        let _guard = FallbackEnvGuard::new(None);
+        assert!(
+            lsp_fallback_enabled(),
+            "unset CODEGRAPH_LSP_FALLBACK must keep the language-server fallback enabled"
+        );
+    }
+
+    #[test]
+    fn lsp_fallback_accepts_disabling_values() {
+        for value in ["0", "false", "OFF", " no "] {
+            let _guard = FallbackEnvGuard::new(Some(value));
+            assert!(
+                !lsp_fallback_enabled(),
+                "CODEGRAPH_LSP_FALLBACK={value:?} must disable the language-server fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn lsp_fallback_keeps_enabled_for_other_values() {
+        for value in ["1", "true", "yes", "anything"] {
+            let _guard = FallbackEnvGuard::new(Some(value));
+            assert!(
+                lsp_fallback_enabled(),
+                "CODEGRAPH_LSP_FALLBACK={value:?} must keep the language-server fallback enabled"
+            );
+        }
     }
 }
 
