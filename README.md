@@ -9,7 +9,9 @@ graph arm does embed the query, which is why its latency is higher on the locate
 Rust rows were re-measured **2026-11-14 on the PostgreSQL backend** (265 files) with
 `scripts/benchmarks/mcp_value.py --generate 40/15/12` (deterministic sampling; n is per row).
 The repository changed since 2026-11-04, so these are fresh task samples, not the same
-symbols. Python rows are the 2026-11-04 **SurrealDB** measurement, pending a Postgres re-run.
+symbols. Responses are **compact JSON**, and one-hop edges are opt-in
+(`include_graph_context`, default false), both of which cut bytes. Python rows are the
+2026-11-04 **SurrealDB** measurement, pending a Postgres re-run.
 
 Real agents mostly send **keyword phrases**, not full questions: across 338 sampled
 `semantic_code_search` calls, 90% were phrases, 7% bare identifiers, 2% sentences. The locate
@@ -18,27 +20,29 @@ row uses the harder `--codegraph-query question` arm; the phrase arm measured 62
 
 | Question | Repo | grep | CodeGraph | Result |
 |---|---|---|---|---|
-| Where is X defined? | Rust | **62%** hit@1 · **90%** hit@5 · **16.2 KB** · **0.01 s** | 68% · 72% · 25.8 KB · 0.24 s | comparable hit@1; grep wins hit@5, reads ~half, ~24x faster |
+| Where is X defined? | Rust | **62%** hit@1 · **90%** hit@5 · **16.2 KB** · **0.01 s** | 68% · 72% · **10.8 KB** (2.9 KB top-3) · 0.18 s | better hit@1, worse hit@5, fewer bytes, slower |
 | Where is X defined? | Python | **86%** · 3.9 KB · 8 ms | 64% · 17.3 KB · 0.96 s | grep wins outright (2026-11-04) |
-| Who calls X? | Rust | **100%** recall · 77% precision · 8.7 KB · **0.01 s** | 97% · **100%** · **5.2 KB** · 0.06 s | graph trades a little recall for precision + fewer bytes |
+| Who calls X? | Rust | **100%** recall · 77% precision · 8.7 KB · **0.01 s** | 97% · **100%** · **4.8 KB** · 0.06 s | graph trades a little recall for precision + fewer bytes |
 | Who calls X? | Python | 100% · 69% · 9.2 KB · 8 ms | 100% · **100%** · 5.7 KB · 0.12 s | same trade-off (2026-11-04) |
-| What does X reach? (depth 2) | Rust | 27% recall · 7% precision · 99.1 KB · 0.13 s | **100%** · **78%** · **9.3 KB** · **0.06 s** | graph gives the only usable answer |
+| What does X reach? (depth 2) | Rust | 27% recall · 7% precision · 99.1 KB · 0.13 s | **100%** · **78%** · **8.0 KB** · 0.08 s | graph gives the only usable answer |
 | What does X reach? (depth 2) | Python | 15% · 7% · 78 KB · 0.15 s | **100%** · 100% · **18.2 KB** · 0.17 s | same (2026-11-04) |
 
 `grep`'s caller **recall is not comparable evidence**: it counts every textual mention of the
 name (definition, comments, strings), so a true caller file is almost always hit even when
 grep misattributes the hit. Read the caller rows by **precision** — 77% vs 100% — not recall.
 
-The honest read: for *"where is this symbol"*, the graph is comparable at hit@1 (68% vs 62%)
-but worse at hit@5 (72% vs 90%), reads ~1.6x more (25.8 vs 16.2 KB) and is ~24x slower — grep
-is the cheaper locator. The graph earns its cost on **relationships**: caller lists become
-precise instead of a pile of textual matches (77% -> 100% precision), and a two-hop question
-that grep answers at 27% recall / 7% precision / 99 KB becomes answerable at all (100% / 78% /
-9.3 KB). Doc-comment "concept" questions remain the weak spot.
+The honest read: for *"where is this symbol"* the graph is slightly better at hit@1 (68% vs
+62%) but worse at hit@5 (72% vs 90%). With compact JSON and one-hop edges off by default its
+full payload is 10.8 KB, below grep's 16.2 KB (2.9 KB if only the first 3 inspected rows are
+counted); it is still ~18x slower. The graph earns its cost on **relationships**: caller lists
+become precise instead of a pile of textual matches (77% -> 100% precision), and a two-hop
+question that grep answers at 27% recall / 7% precision / 99 KB becomes answerable at all
+(100% / 78% / 8.0 KB). Doc-comment "concept" questions remain the weak spot.
 
-CodeGraph bytes are the full JSON payload, mean over the sample, with code snippets truncated
-to the default `content_chars` cap (2000 chars). Rust locate reads 25.8 KB because each of the
-10 rows carries its content plus one-hop edges; impact and chain read 5.2 / 9.3 KB.
+CodeGraph bytes are the compact JSON payload, mean over the sample. Locate is 10.8 KB for the
+full 10-row response (2.9 KB if only the first `budget_files` = 3 inspected rows are counted);
+impact 4.8 KB, chain 8.0 KB. Snippets are capped at the default `content_chars` (2000 chars);
+one-hop edges are excluded unless `include_graph_context: true` is passed.
 
 ### On a real agent (opencode + SWE-bench)
 

@@ -1176,7 +1176,6 @@ impl crate::graph_types::GraphQuery for PgGraph {
                 "text_score": text_scores.get(&id).copied().unwrap_or(0.0),
                 "combined_score": combined_score,
                 "match_sources": match_sources,
-                "matched_symbols": [],
             });
 
             if let (Some(outgoing), Some(incoming), Some(object)) =

@@ -497,7 +497,7 @@ impl CodeGraphMCPServer {
             Ok(result) => {
                 log_tool_call(name, "ok", started.elapsed().as_millis());
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
+                    serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()),
                 )]))
             }
             Err(error) => {
@@ -518,7 +518,7 @@ impl CodeGraphMCPServer {
     }
 
     #[tool(
-        description = "Vector similarity search over indexed code (no LLM). Params: query (string), limit (int, default 10), threshold (number). Each row has vector_score (cosine, filtered by threshold), text_score (BM25 over name+content+doc; ts_rank_cd fallback), and combined_score (RRF rank 1/(60+rank), ordering only); score_semantics restates this."
+        description = "Vector similarity search over indexed code (no LLM). Params: query (string), limit (int, default 10), threshold (number), include_graph_context (bool, optional, default false; set true to also return one-hop incoming_edges/outgoing_edges per row). Each row has vector_score (cosine, filtered by threshold), text_score (BM25 over name+content+doc; ts_rank_cd fallback), and combined_score (RRF rank 1/(60+rank), ordering only); score_semantics restates this."
     )]
     async fn semantic_code_search(
         &self,

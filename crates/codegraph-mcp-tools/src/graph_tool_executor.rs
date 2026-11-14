@@ -865,8 +865,10 @@ impl GraphToolExecutor {
         // Step 2: Get embedding dimension from shared generator (auto-detected)
         let dimension = self.embedding_generator.dimension();
 
-        // Step 3: Call semantic search function with graph enrichment (always enabled)
-        let include_graph_context = true; // Always enabled per requirements
+        // Step 3: Call semantic search function, optionally with graph enrichment.
+        // Graph context is off by default to keep responses small; callers opt in
+        // with `include_graph_context: true` when they need one-hop edges.
+        let include_graph_context = params["include_graph_context"].as_bool().unwrap_or(false);
 
         let t_search = std::time::Instant::now();
         let candidates = self

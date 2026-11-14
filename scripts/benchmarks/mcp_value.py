@@ -593,12 +593,16 @@ def codegraph_arm(task, client, limit, budget_files, query=None):
     rows = data.get("result", []) if isinstance(data, dict) else data
     candidates = [normalize_path(row.get("file_path", ""), task["root"]) for row in rows]
     candidates = [c for c in candidates if c]
-    # Same budget as the grep arm: an agent inspects the first few candidates only.
+    # Same budget as the grep arm: an agent inspects the first few candidates only, so
+    # bill only the first `budget_files` rows (compact) rather than the whole payload.
+    inspected = rows[:budget_files]
+    bytes_top = len(json.dumps(inspected, separators=(",", ":")).encode())
     return {
         "rank": hit_rank(candidates[:budget_files], task["truth"]),
         "query": cg_query,
         "rounds": 1,
-        "bytes": len(payload.encode()),
+        "bytes": bytes_top,
+        "bytes_full": len(payload.encode()),
         "candidates": candidates[:10],
         "ms": int((time.time() - started) * 1000),
     }

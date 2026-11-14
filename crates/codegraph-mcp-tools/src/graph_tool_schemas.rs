@@ -269,6 +269,11 @@ impl GraphToolSchemas {
                         "minimum": 0.0,
                         "maximum": 1.0,
                         "default": 0.4
+                    },
+                    "include_graph_context": {
+                        "type": "boolean",
+                        "description": "Also return one-hop incoming_edges/outgoing_edges per row (optional, default false). Off keeps the response small; use get_reverse_dependencies or trace_call_chain for graph traversal.",
+                        "default": false
                     }
                 },
                 "required": ["query"]
