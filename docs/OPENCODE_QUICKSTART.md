@@ -70,6 +70,7 @@ export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"
 | Rust | `rust-analyzer scip .` |
 | TS/JS | `scip-typescript index` |
 | Go | `scip-go` |
+| Python | `scip-python index`（项目根运行，勿加 `--cwd`，否则得 72 字节空索引） |
 
 ---
 

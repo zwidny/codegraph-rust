@@ -23,6 +23,7 @@ pub enum ScipLanguage {
     Rust,
     TypeScript,
     Go,
+    Python,
 }
 
 impl ScipLanguage {
@@ -31,6 +32,7 @@ impl ScipLanguage {
             Self::Rust => "rust",
             Self::TypeScript => "typescript",
             Self::Go => "go",
+            Self::Python => "python",
         }
     }
 
@@ -39,6 +41,7 @@ impl ScipLanguage {
             Self::Rust => &["rs"],
             Self::TypeScript => &["ts", "tsx", "js", "jsx", "vue"],
             Self::Go => &["go"],
+            Self::Python => &["py", "pyi"],
         }
     }
 }
@@ -86,6 +89,31 @@ pub fn plan_indexes(root: &Path, out_dir: &Path) -> Vec<ScipPlan> {
             args: vec![
                 "scip".to_string(),
                 ".".to_string(),
+                "--output".to_string(),
+                path_arg(&output),
+            ],
+            output,
+        });
+    }
+
+    if root.join("pyproject.toml").is_file()
+        || root.join("setup.py").is_file()
+        || root.join("requirements.txt").is_file()
+    {
+        let output = out_dir.join("python.scip");
+        let name = root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "python".to_string());
+        plans.push(ScipPlan {
+            language: ScipLanguage::Python,
+            subdir: PathBuf::new(),
+            program: "scip-python".to_string(),
+            args: vec![
+                "index".to_string(),
+                "--project-name".to_string(),
+                name,
                 "--output".to_string(),
                 path_arg(&output),
             ],
@@ -207,6 +235,23 @@ pub fn ensure_indexes(root: &Path, out_dir: &Path, strict: bool) -> Result<Vec<S
                 plan.program, output.status
             );
             continue;
+        }
+
+        if plan.language == ScipLanguage::Python {
+            let size = std::fs::metadata(&plan.output)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if size <= 1024 {
+                if strict {
+                    bail!(
+                        "scip-python produced an empty/short index (<1KB) for {cache_key}; an index of ~72 bytes means zero documents (do not pass --cwd)"
+                    );
+                }
+                warn!(
+                    "scip-python produced an empty/short index (<1KB) for {cache_key}; skipping its compiler-index enrichment (an index of ~72 bytes means zero documents; do not pass --cwd)"
+                );
+                continue;
+            }
         }
 
         std::fs::create_dir_all(out_dir).with_context(|| {
@@ -470,6 +515,79 @@ mod tests {
         assert_eq!(plan.output.file_name().unwrap(), "go-easytier-go.scip");
         assert!(plan.spec().ends_with("@easytier-go"));
         assert_eq!(plan.cache_key(), "go:easytier-go");
+    }
+
+    #[test]
+    fn detects_python_from_pyproject() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let out = root.join(".codegraph/scip");
+        write(root, "pyproject.toml", "[project]\nname = \"demo\"\n");
+        write(root, "src/mypkg/core.py", "x = 1\n");
+
+        let plans = plan_indexes(root, &out);
+        let python: Vec<_> = plans
+            .iter()
+            .filter(|plan| plan.language == ScipLanguage::Python)
+            .collect();
+
+        assert_eq!(python.len(), 1);
+        let plan = python[0];
+        assert!(plan.subdir.as_os_str().is_empty());
+        assert_eq!(plan.program, "scip-python");
+        assert_eq!(plan.args[0], "index");
+        assert!(plan.args.iter().any(|arg| arg == "--project-name"));
+        assert!(plan.args.iter().any(|arg| arg == "--output"));
+        assert!(!plan.args.iter().any(|arg| arg == "--cwd"));
+        assert_eq!(plan.output, out.join("python.scip"));
+        assert_eq!(plan.cache_key(), "python:");
+    }
+
+    #[test]
+    fn detects_python_from_requirements_only() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let out = root.join(".codegraph/scip");
+        write(root, "requirements.txt", "requests\n");
+        write(root, "app.py", "print('hi')\n");
+
+        let plans = plan_indexes(root, &out);
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.language == ScipLanguage::Python)
+        );
+    }
+
+    #[test]
+    fn detects_python_from_setup_py() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let out = root.join(".codegraph/scip");
+        write(root, "setup.py", "from setuptools import setup\nsetup()\n");
+
+        let plans = plan_indexes(root, &out);
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.language == ScipLanguage::Python)
+        );
+    }
+
+    #[test]
+    fn python_root_only_not_subdir() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let out = root.join(".codegraph/scip");
+        write(root, "sub/pyproject.toml", "[project]\nname = \"sub\"\n");
+        write(root, "sub/mypkg/core.py", "x = 1\n");
+
+        let plans = plan_indexes(root, &out);
+        assert!(
+            !plans
+                .iter()
+                .any(|plan| plan.language == ScipLanguage::Python)
+        );
     }
 
     #[test]

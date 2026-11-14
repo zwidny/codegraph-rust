@@ -67,7 +67,8 @@ language-server process and no per-language tool check at index time:
 
 - Generate an index per language with `scripts/scip-index.sh` (which drives the language's
   own indexer: `rust-analyzer scip` for Rust, `scip-typescript index` for TS/JS,
-  `scip-go` for Go).
+  `scip-go` for Go, and `scip-python index` for Python — run it from the project root,
+  never with `--cwd`, which yields a 72-byte empty index).
 - Pass the paths in `CODEGRAPH_SCIP_INDEX` (comma-separated, `path@subdir` for an index
   built inside a subdirectory). The same index is imported on every tier.
 - A language without an index stays AST-only; import fails loudly when no document matches

@@ -78,6 +78,7 @@ curl -s http://127.0.0.1:8766/v1/models   # 期望：F2LLM-v2-0.6B
 | Rust | `rust-analyzer scip .` |
 | TS/JS | `scip-typescript index` |
 | Go | `scip-go` |
+| Python | `scip-python index`（项目根运行，勿加 `--cwd`，否则得 72 字节空索引） |
 
 生成并导出：
 

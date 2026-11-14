@@ -228,6 +228,7 @@ import pre-built compiler indexes:
 rust-analyzer scip .                          # Rust
 NODE_OPTIONS=--max-old-space-size=16384 scip-typescript index --pnpm-workspaces   # TS/JS
 scip-go                                       # Go
+scip-python index --project-name <name> --output python.scip   # Python (run from the project root; do NOT pass --cwd)
 
 CODEGRAPH_SCIP_INDEX="/abs/rust.scip,/abs/go.scip@easytier-go" \
   codegraph index . --index-tier balanced
