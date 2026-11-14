@@ -150,7 +150,70 @@ def load_env_layers(root):
     return merged
 
 
+def use_postgres(env):
+    backend = (env.get("CODEGRAPH_BACKEND") or "").lower()
+    if backend == "postgres":
+        return True
+    if backend == "surreal":
+        return False
+    return bool(env.get("CODEGRAPH_PG_URL"))
+
+
+def surreal_to_pg(statement):
+    """Translate the handful of SurrealQL shapes this sampler issues into PostgreSQL."""
+    import re as _re
+
+    sql = statement.replace("count()", "count(*)")
+    sql = _re.sub(r"\bto AS\b", "to_id AS", sql)
+    sql = _re.sub(r"\bfrom AS\b", "from_id AS", sql)
+    sql = sql.replace("metadata.source_file", "metadata->>'source_file'")
+
+    def fix_in(match):
+        inner = match.group(1).replace('"', "'")
+        return f"IN ({inner})"
+
+    sql = _re.sub(r"IN \[(.*?)\]", fix_in, sql, flags=_re.S)
+    # Remaining double-quoted tokens are string literals the sampler JSON-encoded (the
+    # project id); PostgreSQL needs single quotes. No identifiers are quoted here.
+    sql = _re.sub(r'"([^"]*)"', r"'\1'", sql)
+    return sql
+
+
+def _pg_psql(env):
+    configured = env.get("CODEGRAPH_PG_PSQL")
+    if configured:
+        import shlex
+
+        return shlex.split(configured)
+    if shutil.which("psql"):
+        url = env.get("CODEGRAPH_PG_URL")
+        if not url:
+            raise SystemExit("CODEGRAPH_PG_URL is not set; cannot sample the Postgres index")
+        return ["psql", url]
+    # Fall back to the reference container so a host without psql can still sample.
+    return ["docker", "exec", "-i", "codegraph-pg", "psql", "-U", "codegraph", "-d", "codegraph"]
+
+
+def pg_query(env, statement, params):
+    for name, value in params.items():
+        statement = statement.replace(f"${name}", json.dumps(value))
+    wrapped = (
+        "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json)::text "
+        f"FROM ({statement.rstrip().rstrip(';')}) t;"
+    )
+    result = subprocess.run(
+        _pg_psql(env) + ["-t", "-A", "-c", wrapped],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"postgres sample failed: {result.stderr.strip()[:400]}")
+    body = result.stdout.strip()
+    return json.loads(body) if body else []
+
+
 def sql_query(env, statement, params):
+    if use_postgres(env):
+        return pg_query(env, surreal_to_pg(statement), params)
     url = env.get("CODEGRAPH_SURREALDB_URL", "")
     if not url.startswith(("ws://", "wss://", "http://", "https://")):
         raise SystemExit("CODEGRAPH_SURREALDB_URL is not set; cannot sample the index")
