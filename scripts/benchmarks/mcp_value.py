@@ -299,7 +299,7 @@ def generate_tasks(root, count, seed, min_name_len=8):
         env,
         "SELECT name, count() AS c FROM nodes "
         f"WHERE project_id = {json.dumps(project)} "
-        "AND node_type IN ['Function', 'Method', 'Struct', 'Trait'] GROUP BY name LIMIT 5000;",
+        "AND node_type IN ['Function', 'Method', 'Struct', 'Trait'] GROUP BY name ORDER BY name LIMIT 5000;",
         {},
     )
     unique = sorted(
@@ -315,7 +315,7 @@ def generate_tasks(root, count, seed, min_name_len=8):
     rows = sql_query(
         env,
         "SELECT name, file_path, start_line, content FROM nodes "
-        f"WHERE project_id = {json.dumps(project)} AND name IN [{quoted}];",
+        f"WHERE project_id = {json.dumps(project)} AND name IN [{quoted}] ORDER BY name;",
         {},
     )
     random.shuffle(rows)
@@ -585,9 +585,10 @@ class Mcp:
         self.process.terminate()
 
 
-def codegraph_arm(task, client, limit, budget_files):
+def codegraph_arm(task, client, limit, budget_files, query=None):
     started = time.time()
-    payload = client.call("semantic_code_search", {"query": task["question"], "limit": limit})
+    cg_query = query if query is not None else task["question"]
+    payload = client.call("semantic_code_search", {"query": cg_query, "limit": limit})
     data = json.loads(payload)
     rows = data.get("result", []) if isinstance(data, dict) else data
     candidates = [normalize_path(row.get("file_path", ""), task["root"]) for row in rows]
@@ -595,6 +596,7 @@ def codegraph_arm(task, client, limit, budget_files):
     # Same budget as the grep arm: an agent inspects the first few candidates only.
     return {
         "rank": hit_rank(candidates[:budget_files], task["truth"]),
+        "query": cg_query,
         "rounds": 1,
         "bytes": len(payload.encode()),
         "candidates": candidates[:10],
@@ -666,7 +668,7 @@ def generate_impact_tasks(root, count, seed, min_name_len=8, min_callers=2, max_
     counts = sql_query(
         env,
         "SELECT to AS target, count() AS c FROM edges "
-        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' GROUP BY target LIMIT 4000;",
+        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' GROUP BY target ORDER BY target LIMIT 4000;",
         {},
     )
     wanted = [
@@ -682,7 +684,7 @@ def generate_impact_tasks(root, count, seed, min_name_len=8, min_callers=2, max_
     nodes = sql_query(
         env,
         "SELECT id, name, file_path FROM nodes "
-        f"WHERE project_id = {json.dumps(project)} LIMIT 20000;",
+        f"WHERE project_id = {json.dumps(project)} ORDER BY id LIMIT 20000;",
         {},
     )
     by_id = {str(row["id"]): row for row in nodes}
@@ -691,7 +693,7 @@ def generate_impact_tasks(root, count, seed, min_name_len=8, min_callers=2, max_
     edge_rows = sql_query(
         env,
         "SELECT to AS target, from AS caller, metadata.source_file AS site FROM edges "
-        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' LIMIT 50000;",
+        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' ORDER BY target, caller LIMIT 50000;",
         {},
     )
     truth_by_target = {}
@@ -817,14 +819,14 @@ def generate_chain_tasks(root, count, seed, depth=2, min_name_len=8, min_reach=3
     nodes = sql_query(
         env,
         "SELECT id, name, file_path FROM nodes "
-        f"WHERE project_id = {json.dumps(project)} LIMIT 20000;",
+        f"WHERE project_id = {json.dumps(project)} ORDER BY id LIMIT 20000;",
         {},
     )
     by_id = {str(row["id"]): row for row in nodes}
     edge_rows = sql_query(
         env,
         "SELECT from AS src, to AS dst FROM edges "
-        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' LIMIT 50000;",
+        f"WHERE project_id = {json.dumps(project)} AND edge_type = 'calls' ORDER BY src, dst LIMIT 50000;",
         {},
     )
     adjacency = {}
@@ -1101,6 +1103,9 @@ def main():
     parser.add_argument("--json-out", type=Path, help="write the raw report here")
     parser.add_argument("--command", default=" ".join(DEFAULT_COMMAND), help="MCP server command")
     parser.add_argument("--skip-codegraph", action="store_true", help="run the grep arm only")
+    parser.add_argument("--codegraph-query", choices=("question", "phrase"), default="question",
+                        help="what to send to semantic_code_search: the full question, or the task "
+                             "keywords (how an agent usually queries)")
     args = parser.parse_args()
 
     root = args.project.resolve()
@@ -1135,7 +1140,11 @@ def main():
             record = {"id": task["id"], "kind": task["kind"], "question": task["question"], "truth": task["truth"]}
             record["grep"] = grep_arm(task, root, args.max_rounds, args.budget_files)
             if client:
-                record["codegraph"] = codegraph_arm(task, client, args.limit, args.budget_files)
+                if args.codegraph_query == "phrase":
+                    cg_query = " ".join(task.get("keywords") or []) or task["question"]
+                else:
+                    cg_query = task["question"]
+                record["codegraph"] = codegraph_arm(task, client, args.limit, args.budget_files, query=cg_query)
             per_task.append(record)
     finally:
         if client:
@@ -1147,6 +1156,7 @@ def main():
         "generated_from": "index" if not args.tasks else "file",
         "limit": args.limit,
         "max_rounds": args.max_rounds,
+        "codegraph_query": args.codegraph_query,
         "arms": {
             "grep": summarize([t for t in per_task if t.get("grep")], "grep"),
             "codegraph": summarize([t for t in per_task if t.get("codegraph")], "codegraph"),
