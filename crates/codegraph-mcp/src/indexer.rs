@@ -1723,7 +1723,7 @@ impl ProjectIndexer {
             }
             self.flush_surreal_writer().await?;
             self.finish_bar(store_nodes_pb, "📈 Nodes stored")?;
-            self.log_surreal_node_count(total_nodes_extracted).await;
+            self.log_node_count(total_nodes_extracted).await;
 
             #[cfg(feature = "embeddings")]
             let total_chunks = chunk_plan.chunks.len() as u64;
@@ -1944,7 +1944,7 @@ impl ProjectIndexer {
             {
                 // Ensure all chunk embeddings are flushed to SurrealDB before continuing
                 self.flush_surreal_writer().await?;
-                self.log_surreal_chunk_count(total_chunks as usize).await;
+                self.log_chunk_count(total_chunks as usize).await;
             }
 
             // Node embedding: keep pooled embedding as average of its chunks
@@ -2323,7 +2323,7 @@ impl ProjectIndexer {
             );
             let finish_start = std::time::Instant::now();
             // ELIMINATED: No separate edge processing phase needed - edges extracted during parsing!
-            self.log_surreal_edge_count(stored_edges).await;
+            self.log_edge_count(stored_edges).await;
 
             // Task 3.3: Update file metadata for incremental indexing
             info!("💾 Updating file metadata for change tracking");
@@ -2495,6 +2495,7 @@ impl ProjectIndexer {
             }
             self.persist_project_metadata(&stats, stats.nodes, stats.edges, &input_fingerprint)
                 .await?;
+            self.write_index_version(&stats, &input_fingerprint);
             self.flush_surreal_writer().await?;
             if !self.policies.pending() {
                 crate::policy::pending_cache(&self.project_root).remove(&self.project_id)?;
@@ -3062,6 +3063,40 @@ impl ProjectIndexer {
         Ok(hashes)
     }
 
+    /// Publish the completed index fingerprint so other processes (the MCP
+    /// server) can invalidate caches that were populated from the old graph.
+    /// A write failure only warns: the index itself already succeeded.
+    fn write_index_version(&self, stats: &IndexStats, fingerprint: &str) {
+        let version = if fingerprint.is_empty() {
+            let unix_seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!(
+                "nodes:{}|edges:{}|chunks:{}|{}",
+                stats.nodes, stats.edges, stats.chunks, unix_seconds
+            )
+        } else {
+            fingerprint.to_string()
+        };
+
+        let dir = self.project_root.join(".codegraph");
+        let path = dir.join("index.version");
+        let result = (|| -> std::io::Result<()> {
+            fs::create_dir_all(&dir)?;
+            let mut file = fs::File::create(&path)?;
+            std::io::Write::write_all(&mut file, version.as_bytes())?;
+            file.sync_all()
+        })();
+
+        if let Err(error) = result {
+            warn!(
+                "Failed to write {}; MCP query caches will not be invalidated automatically: {error}",
+                path.display()
+            );
+        }
+    }
+
     async fn persist_project_metadata(
         &self,
         stats: &IndexStats,
@@ -3125,17 +3160,17 @@ impl ProjectIndexer {
         self.enqueue_nodes_chunk(chunk).await
     }
 
-    /// Name kept for history; it now reads through IndexStorage so it is backend-neutral.
-    async fn log_surreal_node_count(&self, expected: usize) {
+    /// Backend-neutral row count read through IndexStorage.
+    async fn log_node_count(&self, expected: usize) {
         match self.storage.node_count(&self.project_id).await {
             Ok(count) => {
                 info!(
-                    "🗄️ SurrealDB nodes persisted: {} (expected ≈ {})",
+                    "🗄️ Nodes in table: {} (this run wrote ≈ {})",
                     count, expected
                 );
             }
             Err(e) => {
-                warn!("⚠️ SurrealDB node count query failed: {}", e);
+                warn!("⚠️ Node count query failed: {}", e);
             }
         }
     }
@@ -3152,18 +3187,18 @@ impl ProjectIndexer {
             .clone()
     }
 
-    /// Name kept for history; it now reads through IndexStorage so it is backend-neutral.
+    /// Reads through `IndexStorage`, so it is backend-neutral.
     #[cfg(feature = "embeddings")]
-    async fn log_surreal_chunk_count(&self, expected: usize) {
+    async fn log_chunk_count(&self, expected: usize) {
         match self.storage.chunk_count(&self.project_id).await {
             Ok(count) => {
                 info!(
-                    "🧩 SurrealDB chunks persisted: {} (expected ≈ {})",
+                    "🧩 Chunks in table: {} (this run wrote ≈ {})",
                     count, expected
                 );
             }
             Err(e) => {
-                warn!("⚠️ SurrealDB chunk count query failed: {}", e);
+                warn!("⚠️ Chunk count query failed: {}", e);
             }
         }
     }
@@ -3193,22 +3228,22 @@ impl ProjectIndexer {
         Ok(rows.into_iter().next())
     }
 
-    /// Name kept for history; it now reads through IndexStorage so it is backend-neutral.
-    async fn log_surreal_edge_count(&self, expected: usize) {
+    /// Backend-neutral row count read through IndexStorage.
+    async fn log_edge_count(&self, expected: usize) {
         match self.storage.edge_count(&self.project_id).await {
             Ok(count) => {
                 info!(
-                    "🗄️ SurrealDB edges persisted: {} (expected ≈ {})",
+                    "🗄️ Edges in table: {} (this run wrote ≈ {})",
                     count, expected
                 );
                 if count < expected as i64 {
                     warn!(
-                        "⚠️ Edge count ({}) is lower than resolved edges ({}). Verify SurrealDB schema and filters.",
+                        "⚠️ Edge count ({}) is lower than resolved edges ({}). Check the backend schema and project filters.",
                         count, expected
                     );
                 }
             }
-            Err(e) => warn!("⚠️ SurrealDB edge count query failed: {}", e),
+            Err(e) => warn!("⚠️ Edge count query failed: {}", e),
         }
     }
 

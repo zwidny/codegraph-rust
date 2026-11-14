@@ -530,10 +530,29 @@ impl GraphToolExecutor {
         result
     }
 
-    /// Generate a cache key from project, tool name, and parameters
-    fn cache_key(project_id: &str, tool_name: &str, parameters: &JsonValue) -> String {
-        // Create deterministic key from project + function name + serialized params
-        format!("{}:{}:{}", project_id, tool_name, parameters.to_string())
+    /// Read the project's published index version. Missing or unreadable files
+    /// yield an empty string, which preserves the pre-versioning cache behaviour.
+    fn index_version(project_id: &str) -> String {
+        let path = std::path::Path::new(project_id)
+            .join(".codegraph")
+            .join("index.version");
+        std::fs::read_to_string(&path)
+            .map(|contents| contents.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Generate a cache key from project, index version, tool name, and parameters
+    fn cache_key(
+        project_id: &str,
+        index_version: &str,
+        tool_name: &str,
+        parameters: &JsonValue,
+    ) -> String {
+        // Include the index version so a completed re-index invalidates stale entries
+        format!(
+            "{}@{}:{}:{}",
+            project_id, index_version, tool_name, parameters
+        )
     }
 
     /// Execute a tool call from LLM
@@ -554,9 +573,17 @@ impl GraphToolExecutor {
 
             let project_id = self.graph.project_id();
 
+            // Read the index version once per call: a completed re-index bumps it,
+            // so entries cached against the previous graph are no longer reachable.
+            let index_version = if self.cache_enabled {
+                Self::index_version(project_id)
+            } else {
+                String::new()
+            };
+
             // Check cache if enabled
             if self.cache_enabled {
-                let cache_key = Self::cache_key(project_id, tool_name, &parameters);
+                let cache_key = Self::cache_key(project_id, &index_version, tool_name, &parameters);
 
                 // Try cache lookup
                 {
@@ -624,7 +651,7 @@ impl GraphToolExecutor {
 
             // Cache the result if enabled
             if self.cache_enabled {
-                let cache_key = Self::cache_key(project_id, tool_name, &parameters);
+                let cache_key = Self::cache_key(project_id, &index_version, tool_name, &parameters);
                 let mut cache = self.cache.lock();
                 let was_evicted = cache.len() >= cache.cap().get();
                 cache.put(cache_key, result.clone());
@@ -1449,14 +1476,46 @@ mod tests {
 
         let project = "proj-a";
 
-        let key1 = GraphToolExecutor::cache_key(project, "get_transitive_dependencies", &params1);
-        let key2 = GraphToolExecutor::cache_key(project, "get_transitive_dependencies", &params2);
-        let key3 = GraphToolExecutor::cache_key(project, "get_transitive_dependencies", &params3);
+        let keys = |version: &str, params: &JsonValue| {
+            GraphToolExecutor::cache_key(project, version, "get_transitive_dependencies", params)
+        };
+        let key1 = keys("v1", &params1);
+        let key2 = keys("v1", &params2);
+        let key3 = keys("v1", &params3);
 
         // Same params should generate same key
         assert_eq!(key1, key2);
         // Different params should generate different key
         assert_ne!(key1, key3);
+        // A new index version must invalidate every key, including identical params
+        assert_ne!(key1, keys("v2", &params1));
+    }
+
+    #[test]
+    fn test_cache_key_stable_for_same_version() {
+        let params = json!({"node_id": "nodes:123", "edge_type": "calls"});
+        let first =
+            GraphToolExecutor::cache_key("proj-a", "v1", "get_reverse_dependencies", &params);
+        let second =
+            GraphToolExecutor::cache_key("proj-a", "v1", "get_reverse_dependencies", &params);
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("proj-a@v1:"));
+    }
+
+    #[test]
+    fn test_cache_key_includes_index_version() {
+        let params = json!({"node_id": "nodes:123"});
+
+        let old = GraphToolExecutor::cache_key("proj-a", "old-version", "get_hub_nodes", &params);
+        let new = GraphToolExecutor::cache_key("proj-a", "new-version", "get_hub_nodes", &params);
+
+        assert_ne!(old, new);
+        assert_ne!(
+            GraphToolExecutor::cache_key("proj-a", "", "get_hub_nodes", &params),
+            new,
+            "missing version must not collide with a real version"
+        );
     }
 
     #[test]
@@ -1465,12 +1524,12 @@ mod tests {
             "node_id": "nodes:123"
         });
 
-        let key_a = GraphToolExecutor::cache_key("proj-a", "get_hub_nodes", &params);
-        let key_b = GraphToolExecutor::cache_key("proj-b", "get_hub_nodes", &params);
+        let key_a = GraphToolExecutor::cache_key("proj-a", "v1", "get_hub_nodes", &params);
+        let key_b = GraphToolExecutor::cache_key("proj-b", "v1", "get_hub_nodes", &params);
 
         assert_ne!(key_a, key_b);
         assert!(
-            key_a.starts_with("proj-a:"),
+            key_a.starts_with("proj-a@v1:"),
             "Project scope should prefix cache key"
         );
     }

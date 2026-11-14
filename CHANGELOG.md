@@ -22,6 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It asserted that indexing fails when `rust-analyzer` is missing, a behaviour that went away
   with the language-server path in 0.3.0; the remaining three cases pass.
 
+### Fixed - Tool caches are invalidated by a re-index
+
+- `codegraph index` now publishes the completed fingerprint to
+  `<project>/.codegraph/index.version`, and `GraphToolExecutor` folds that version into its
+  LRU cache key. A query cached before a re-index no longer keeps returning nodes the
+  re-index deleted; a missing or unreadable version file keeps the previous behaviour.
+  Verified end to end against Postgres: first call embeds, the same query hits the cache,
+  bumping the version forces a fresh lookup.
+- Index progress no longer claims "SurrealDB nodes persisted" (the default backend is
+  Postgres), and it stops presenting a table total as if it were this run's write count:
+  `Nodes in table: 14078 (this run wrote ≈ 13643)`. The `log_surreal_*_count` helpers are
+  now `log_*_count`.
+- `codegraph index` prints `SCIP: N symbols, M edges` instead of `LSP:`. The
+  `--stats-json` keys (`lsp_nodes_enriched`, `lsp_edges_resolved`) are unchanged.
+
 ## [0.4.0] - 2026-11-14
 
 Removes the agent and everything that only existed to serve it: the four server-side tools,

@@ -1498,7 +1498,7 @@ async fn handle_index(
             stats.build_context_nodes, stats.build_context_edges
         );
         println!(
-            "│ 🧠 LSP:         {:>6} symbols, {:>4} edges               │",
+            "│ 🧠 SCIP:        {:>6} symbols, {:>4} edges               │",
             stats.lsp_nodes_enriched, stats.lsp_edges_resolved
         );
         println!(
