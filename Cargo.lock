@@ -1121,7 +1121,6 @@ dependencies = [
  "chrono",
  "codegraph-core",
  "dashmap",
- "futures",
  "nix",
  "parking_lot",
  "regex",
@@ -1132,7 +1131,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.30.0",
- "toml",
  "tracing",
  "url",
  "uuid",
@@ -1161,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-mcp-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -5,74 +5,11 @@ All notable changes to the CodeGraph MCP Intelligence Platform will be documente
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-11-14
+## [0.4.0] - 2026-11-14
 
-Delta since `v0.2.0` (112 commits). Highlights only; each bullet names shipped behaviour, and
-the entries below this section stay under `[Unreleased]` because they were written without a
-release in mind.
-
-### Changed - PostgreSQL + pgvector is the default backend
-
-- `CODEGRAPH_BACKEND` selects the storage backend; **Postgres is the default**, SurrealDB is
-  opt-in. `deploy/docker-compose.postgres.yml` brings up a matching server.
-- A backend-neutral `IndexStorage` / `GraphQuery` pair replaces the direct SurrealQL calls, so
-  indexing, `query`, `plan` and the analyzers run unchanged on either backend.
-- Postgres gained the missing surface: nodes and edges with metadata, KNN + full-text + RRF
-  fusion, scoped reconciliation, circular-dependency detection and semantic search.
-- Write-path and index tuning: binary-format chunk vectors, `CODEGRAPH_VECTOR_INDEX_MODE=deferred`
-  honoured on Postgres, vector indexes dropped before a forced rebuild, HNSW
-  `maintenance_work_mem` with a fallback, `ef_construction` 150 -> 64.
-- NUL bytes are stripped from text before a write instead of aborting the batch.
-
-### Changed - SCIP is the only compiler-enrichment path
-
-- The language-server implementation and its configuration are gone; `--scip-auto` and
-  `scripts/scip-index.sh` generate indexes, and several indexes can be imported in one run.
-- Python SCIP is supported (`scip-python`, no `--cwd`, the empty-index trap is documented).
-- An unspecified SCIP position encoding is treated as UTF-16, stale positions name the document
-  and say "stale", and zero coverage is reported in stats as a warning.
-
-### Added - Retrieval quality
-
-- A real BM25 text channel on Postgres (IDF + length normalisation, OR-prefix query) replaces
-  the `ts_rank_cd` fallback, which is still available as `CODEGRAPH_TEXT_SCORE=ts_rank_cd`.
-- Node doc comments are part of the full-text index (`nodes.search_tsv`), so "concept" queries
-  reach the prose above a definition.
-- Weighted RRF fusion, default `vector=0.5, name=1.0, content=1.0` (`CODEGRAPH_RRF_WEIGHTS`).
-- `semantic_code_search` extracts identifiers from the query (backticked, snake_case,
-  camelCase, ACRONYM) and matches the name channel against each needle, so a sentence like
-  "Where is `foo_bar` defined?" no longer misses the symbol.
-- Chunk text carries a file/name context prefix by default (`CODEGRAPH_CHUNK_CONTEXT=0` opts
-  out), which stops near-identical chunks from collapsing onto one vector.
-
-### Changed - Smaller tool payloads
-
-- Graph tool responses are compact JSON instead of pretty-printed.
-- `semantic_code_search` takes `include_graph_context` (default **false**); one-hop
-  `incoming_edges` / `outgoing_edges` are only attached on request. The always-empty
-  `matched_symbols` field is gone. Measured on the same tasks the locate payload dropped from
-  25.8 KB to 10.8 KB.
-- Recoverable tool failures return success-shaped guidance instead of an MCP error, and an
-  opt-in JSONL log records every tool call for attribution.
-
-### Added - Measurement
-
-- `scripts/benchmarks/index-quality.py` (L1) and `scripts/benchmarks/retrieval-eval.py` (L2:
-  nDCG@10, Recall@k, MRR, P@10), both covered by unit tests in the `benchmark-scripts` CI job.
-- `scripts/benchmarks/mcp_value.py` now samples deterministically (`ORDER BY` everywhere) and
-  offers `--codegraph-query {question|phrase}`; the grep arm and the graph arm bill the same
-  "first few inspected candidates" budget.
-- README "Measured value" is re-measured on Postgres for both a Rust and a Python repository,
-  with per-row sample sizes, and says how real agents actually query (90% keyword phrases).
-
-### Fixed
-
-- Analyzer no longer slices past the end of a source file, and resolution no longer offers macro
-  invocation nodes as targets.
-- Synthetic pattern-match edges are no longer emitted.
-- `codegraph query` gained `--kind` and `--file`, and get_reverse_dependencies accepts ids.
-
-## [Unreleased]
+Removes the agent and everything that only existed to serve it: the four server-side tools,
+the `codegraph agent` CLI, the Rig crate, and the LLM/insights/prompt-tier configuration
+surface underneath them.
 
 ### Removed - Agentic tools and the agent CLI
 
@@ -89,6 +26,32 @@ release in mind.
   `find_complexity_hotspots`, `get_hub_nodes` and `plan_check`. For synthesized
   answers, compose these tools (or `codegraph query` / `codegraph plan`) yourself and
   read the returned source locations.
+
+### Removed - Configuration and code that only served the agent
+
+- `LLMConfig` and `CodeGraphConfig.llm` are gone, together with the environment parsing for
+  `CODEGRAPH_LLM_PROVIDER`, `LLM_PROVIDER`, `CODEGRAPH_LLM_MODEL`, `CODEGRAPH_AGENT_MODEL`,
+  `CODEGRAPH_MODEL`, `CODEGRAPH_TEMPERATURE`, `CODEGRAPH_REASONING_EFFORT`,
+  `MCP_CODE_AGENT_MAX_OUTPUT_TOKENS` and `CODEGRAPH_USE_COMPLETIONS_API`, plus
+  `ConfigManager::explicit_llm_settings`. A `[llm]` section in an existing TOML is now ignored
+  rather than rejected (the config structs are not `deny_unknown_fields`).
+  `CODEGRAPH_CONTEXT_WINDOW` survives: it only bounds MCP tool-result bytes.
+- Five dead modules left `codegraph-mcp-core` when the agent went: `agent_architecture`,
+  `analysis`, `config_manager`, `context_aware_limits` and `progress_notifier`
+  (`AgentArchitecture`, `AnalysisType`, `ContextTier`, `ProgressNotifier`, ...). Each was
+  verified unreferenced by removing its `pub mod`/`pub use` and compiling the workspace.
+- `codegraph-vector`'s `insights_generator` module (`InsightsGenerator`, `InsightsMode`,
+  `InsightsConfig`) and the `fast_insights_demo` example are gone, as are
+  `ReRankingConfig.enable_llm_insights`, `llm_top_k`, `get_llm_candidates()` and
+  `ReRankingMetrics.llm_processed`. Re-ranking itself is unchanged.
+- `DebugLogger::log_reasoning_step`, `log_agent_start`, `log_agent_finish` and the
+  `debug_log!` macro are gone. Tool-call logging (`log_tool_start` / `log_tool_finish` /
+  `log_tool_error`) and its JSONL format are unchanged.
+- `codegraph config show` no longer prints an LLM section. `.env.example`,
+  `config/example.toml`, `docs/AI_PROVIDERS.md`, `docs/DEBUG_LOGGING.md` and
+  `README_DEV_GUIDE.md` describe the current surface.
+- `docs/AGENT_PROMPT_TIERS.md` and `docs/TESTING.md` are deleted: prompt tiers no longer
+  exist, and the Python harness the testing guide described was removed with the agent.
 
 ### Fixed - Environment file layering
 
@@ -114,6 +77,12 @@ release in mind.
   edges are called out explicitly instead of returning a bare `[]`.
 - `GraphFunctions::get_node_edge_summary` backs those diagnostics with one
   project-scoped query; failures never turn an empty result into an error.
+
+## [Unreleased]
+
+Entries below were written before 0.3.0 and never archived into a release section, so
+their version attribution was never verified. Several describe the agent/Rig backend that
+0.4.0 removed; they are kept verbatim as history rather than rewritten.
 
 ### Changed - Storage documentation
 
@@ -711,6 +680,72 @@ release in mind.
 - Dropped the transactional/versioning/branch N-API bindings plus their documentation; the native TypeScript surface now focuses on semantic search, graph analysis, and cloud configuration so it matches the Surreal-only architecture.
 - Replaced the native addon example with a semantic-search walkthrough and removed CLI-centric integration snippets that referenced the deleted CodeGraph CLI.
 - Removed the unpublished `sdk/codegraph-cli-wrapper.ts` helper that shell-executed the old CLI, keeping the SDK focused on the MCP WebSocket client (run `npm install` before `npm run typecheck` if you want to lint the SDK locally).
+
+## [0.3.0] - 2026-11-14
+
+Delta since `v0.2.0` (112 commits). Highlights only; each bullet names shipped behaviour, and
+the entries below this section (written without a release in mind) shipped in 0.4.0.
+
+### Changed - PostgreSQL + pgvector is the default backend
+
+- `CODEGRAPH_BACKEND` selects the storage backend; **Postgres is the default**, SurrealDB is
+  opt-in. `deploy/docker-compose.postgres.yml` brings up a matching server.
+- A backend-neutral `IndexStorage` / `GraphQuery` pair replaces the direct SurrealQL calls, so
+  indexing, `query`, `plan` and the analyzers run unchanged on either backend.
+- Postgres gained the missing surface: nodes and edges with metadata, KNN + full-text + RRF
+  fusion, scoped reconciliation, circular-dependency detection and semantic search.
+- Write-path and index tuning: binary-format chunk vectors, `CODEGRAPH_VECTOR_INDEX_MODE=deferred`
+  honoured on Postgres, vector indexes dropped before a forced rebuild, HNSW
+  `maintenance_work_mem` with a fallback, `ef_construction` 150 -> 64.
+- NUL bytes are stripped from text before a write instead of aborting the batch.
+
+### Changed - SCIP is the only compiler-enrichment path
+
+- The language-server implementation and its configuration are gone; `--scip-auto` and
+  `scripts/scip-index.sh` generate indexes, and several indexes can be imported in one run.
+- Python SCIP is supported (`scip-python`, no `--cwd`, the empty-index trap is documented).
+- An unspecified SCIP position encoding is treated as UTF-16, stale positions name the document
+  and say "stale", and zero coverage is reported in stats as a warning.
+
+### Added - Retrieval quality
+
+- A real BM25 text channel on Postgres (IDF + length normalisation, OR-prefix query) replaces
+  the `ts_rank_cd` fallback, which is still available as `CODEGRAPH_TEXT_SCORE=ts_rank_cd`.
+- Node doc comments are part of the full-text index (`nodes.search_tsv`), so "concept" queries
+  reach the prose above a definition.
+- Weighted RRF fusion, default `vector=0.5, name=1.0, content=1.0` (`CODEGRAPH_RRF_WEIGHTS`).
+- `semantic_code_search` extracts identifiers from the query (backticked, snake_case,
+  camelCase, ACRONYM) and matches the name channel against each needle, so a sentence like
+  "Where is `foo_bar` defined?" no longer misses the symbol.
+- Chunk text carries a file/name context prefix by default (`CODEGRAPH_CHUNK_CONTEXT=0` opts
+  out), which stops near-identical chunks from collapsing onto one vector.
+
+### Changed - Smaller tool payloads
+
+- Graph tool responses are compact JSON instead of pretty-printed.
+- `semantic_code_search` takes `include_graph_context` (default **false**); one-hop
+  `incoming_edges` / `outgoing_edges` are only attached on request. The always-empty
+  `matched_symbols` field is gone. Measured on the same tasks the locate payload dropped from
+  25.8 KB to 10.8 KB.
+- Recoverable tool failures return success-shaped guidance instead of an MCP error, and an
+  opt-in JSONL log records every tool call for attribution.
+
+### Added - Measurement
+
+- `scripts/benchmarks/index-quality.py` (L1) and `scripts/benchmarks/retrieval-eval.py` (L2:
+  nDCG@10, Recall@k, MRR, P@10), both covered by unit tests in the `benchmark-scripts` CI job.
+- `scripts/benchmarks/mcp_value.py` now samples deterministically (`ORDER BY` everywhere) and
+  offers `--codegraph-query {question|phrase}`; the grep arm and the graph arm bill the same
+  "first few inspected candidates" budget.
+- README "Measured value" is re-measured on Postgres for both a Rust and a Python repository,
+  with per-row sample sizes, and says how real agents actually query (90% keyword phrases).
+
+### Fixed
+
+- Analyzer no longer slices past the end of a source file, and resolution no longer offers macro
+  invocation nodes as targets.
+- Synthetic pattern-match edges are no longer emitted.
+- `codegraph query` gained `--kind` and `--file`, and get_reverse_dependencies accepts ids.
 
 ## [1.1.0] - 2025-11-18 - AutoAgents Integration & SurrealDB 2.x Compatibility
 
