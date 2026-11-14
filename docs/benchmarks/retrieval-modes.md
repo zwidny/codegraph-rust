@@ -80,42 +80,40 @@ better list. Before (text weak) hybrid 0.40 < vector 0.53; after (text strong)
 hybrid 0.74 < bm25 0.84. That is the theoretical reason a **confidence gate or
 learned weights** are needed — equal-weight RRF is not adaptive.
 
-## Implemented, and what it does (and does not) fix
+## Shipped, measured at node level
 
-Two changes are in:
+`semantic_code_search` now fuses two channels over nodes:
 
-- **Doc indexed** (`cb178c2`): `nodes.search_tsv` = name + content + `metadata->>'doc'`,
-  generated column + GIN, used by `FULL_TEXT_NODES_SQL`. This makes the prose
-  searchable. It is what lifts a **real BM25** to 0.84 in the ablation above.
-- **Weighted RRF** (`72a2c11`): default `vector=0.5, name=1.0, content=1.0`
-  (`CODEGRAPH_RRF_WEIGHTS` overrides). Helps identifier queries, where the text
-  list is populated and strong.
+- **vector** — chunk kNN aggregated to `parent_node` (`SEARCH_VECTOR_SQL`).
+- **BM25** — `full_text_nodes` over `nodes.search_tsv` = name + content + doc,
+  IDF + tf saturation + length normalisation (k1=1.2, b=0.75), OR-prefix query.
+  `CODEGRAPH_TEXT_SCORE=ts_rank_cd` restores the old ranker.
+- **fusion** — weighted RRF, default `vector=0.5, name=1.0, content=1.0`
+  (`CODEGRAPH_RRF_WEIGHTS` overrides).
 
-**But the product still uses `ts_rank_cd`, not BM25, and the text query is
-AND-only** (`tsquery_prefix` joins every term with `&`). For a long natural-language
-description the AND query requires all terms to co-occur, so the content list is
-**empty**; `ts_rank_cd` also has no IDF (an OR variant measured 0.0025). Net: on
-descriptions the product's text channel contributes nothing, so
-`semantic_code_search` falls back to vector alone. Neither of the two changes
-makes NL hybrid better on its own.
+Node-level, this repo, 40 doc-comment queries:
 
-The remaining step is therefore **a real BM25 text channel with IDF and an
-OR/term-weight query mode** (SQL BM25 on PG16, or `pg_textsearch` on PG17+).
-Only then do the doc indexing and the RRF weights pay off for descriptions, and
-only then should the weights be re-tuned.
+| mode | nDCG@10 |
+|---|---|
+| vector | 0.370 |
+| BM25 | 0.441 |
+| hybrid 1:1 | 0.561 |
+| hybrid 0.5:1 (default) | 0.574 |
+| hybrid 0.25:1 | 0.596 |
+
+At node granularity hybrid beats **both** single channels, and text-heavy
+weights help further. The 0.84 earlier was chunk-level; node aggregation (many
+nodes share doc/content) is lower. The earlier "hybrid loses" cases were:
+text channel empty (ts_rank_cd + AND) and equal weights diluting the stronger
+list — both fixed (BM25 + OR-prefix; weighted RRF).
 
 ## Conclusion
 
-- For identifier queries the text channel is strong and **weighted RRF adds over
-  vector** (0.54 -> 0.68 nDCG).
-- On natural language, the original "vector beats BM25" was **confounded**: the
-  described text was not in the searchable field (33.7% term overlap). Indexing it
-  lifts a **real BM25** to 0.84 - but the product's `ts_rank_cd` + AND query does
-  not reach that, because it has no IDF and ANDs every term.
-- In both directions **uniform RRF regresses toward the weaker channel**; weighted
-  RRF (now shipped) fixes the identifier side. The description side needs the real
-  BM25 first.
-- Next: BM25 text channel (IDF + OR), then re-tune `CODEGRAPH_RRF_WEIGHTS`.
+- Identifier queries: the text channel is strong; weighted RRF adds over vector.
+- Natural language: with docs indexed and real BM25, node-level hybrid (0.574)
+  now beats vector (0.370) and BM25 (0.441) alone.
+- Re-tune `CODEGRAPH_RRF_WEIGHTS` per corpus; `0.25,1,1` reached 0.596 here,
+  `1,1,1` is the conservative fallback for doc-poor repos.
 
 ## Libraries evaluated for real BM25 in Postgres
 
@@ -126,14 +124,16 @@ only then should the weights be re-tuned.
 | Tantivy (Rust) | Apache-2.0 | yes | in-app engine; large architectural change |
 | SQL BM25 (this doc) | none | yes | validated here on PG16; slower, keeps the current image |
 
-Production still runs `ts_rank_cd`; adopting `pg_textsearch` (PG17 bump) or
-porting this SQL BM25 (with a maintained `df` table) are the two paths.
+The text channel now ships this SQL BM25 (with a maintained `df` table);
+`pg_textsearch` on PG17+ remains the option if a maintained engine is preferred
+over the in-repo SQL.
 
 ## Caveats
 
 - Doc comments are a proxy for natural-language intent, not human-labelled queries.
 - Identifier queries trivially favour exact-token matching.
-- The BM25 numbers use a one-off SQL harness, not the product's text channel.
+- The BM25 numbers are node-level (chunk-level was higher); the product now uses
+  this BM25 as its text channel.
 
 ## Reproduce
 
