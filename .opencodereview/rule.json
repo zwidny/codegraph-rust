@@ -1,0 +1,59 @@
+{
+  "rules": [
+    {
+      "path": "crates/codegraph-graph/src/postgres_storage.rs",
+      "merge_system_rule": true,
+      "rule": "This file owns the PostgreSQL schema and the BM25/RRF SQL. Enforce all of the following.\n\n## Schema changes must travel together\n- Any edit to `SCHEMA_DDL` (tables, columns, indexes) MUST be matched by the equivalent change in `schema/codegraph_v2.surql` and `schema/codegraph.surql`, and `cargo test -p codegraph-graph --test schema_indexes_test` MUST be updated and run. Flag a DDL edit with no matching schema/test change as blocking.\n- The `schema_ddl_is_idempotent` test asserts exact table and index counts. Adding an index or table without updating that count is blocking.\n- HNSW indexes are built after the write by `ensure_vector_indexes`, never inside `SCHEMA_DDL`. Do not move them inline.\n\n## Retrieval semantics are load-bearing\n- `pg_sanitize` strips NUL bytes because a single one aborts the whole write batch. Do not remove or bypass it on any text path.\n- BM25 scoring must keep scalar floating-point summation and the exact division order; a parallel reduction or normalized vector changes scores and breaks the frozen reference tests.\n- Preserve `CODEGRAPH_TEXT_SCORE` so `ts_rank_cd` remains selectable, and preserve the OR-prefix query shape that makes rare identifiers dominate common words.\n- New SQL MUST bind `project_id`. A query that can return rows from another project is blocking."
+    },
+    {
+      "path": "crates/codegraph-graph/src/postgres_graph.rs",
+      "merge_system_rule": true,
+      "rule": "This file holds semantic search and the auto-generated SQL constants.\n\n## Search invariants\n- Weighted RRF defaults MUST stay `vector=0.5, name=1.0, content=1.0` and MUST stay overridable through `CODEGRAPH_RRF_WEIGHTS`.\n- `extract_identifiers` MUST keep its contract: a bare `[A-Za-z_][A-Za-z0-9_]*` query is used whole; otherwise backticked segments plus snake_case/camelCase/ACRONYM tokens are collected, de-duplicated, capped at 8. A change to that contract needs new unit tests.\n- The name channel matches each needle exactly or by prefix; the text channel searches needles (not the raw sentence) when needles exist; the vector channel always embeds the raw query. Changing which channel receives which string is a behavioural change and needs a measurement note.\n- Every query MUST filter by `project_id`."
+    },
+    {
+      "path": "crates/codegraph-mcp-tools/src/graph_tool_executor.rs",
+      "merge_system_rule": true,
+      "rule": "This is the MCP tool surface and its result cache.\n\n## Cache\n- The LRU cache key MUST include the project's published index version (`.codegraph/index.version`). Dropping it reintroduces the bug where a re-index is invisible to a running server and deleted nodes keep being returned.\n- Read the version once per `execute` call, not per cache lookup, and only when caching is enabled.\n\n## Payload\n- Graph tool results go through `run_graph_tool`, which serializes compact JSON. Do not reintroduce `to_string_pretty`.\n- `semantic_code_search` attaches one-hop edges only when `include_graph_context` is true (default false). Do not drop the field or flip the default without updating `graph_tool_schemas.rs` and the README byte table.\n- Result trimming (`content_chars`, `trim_metadata`, byte budget) happens before caching; keep it that way so a cached result cannot exceed the budget.\n\n## Surface\n- Adding or removing a tool requires updating `graph_tool_schemas.rs` AND the expected tool list in `crates/codegraph-mcp/tests/e2e_mcp_tools.rs` (currently 9 tools).\n- Never add a tool that calls an LLM server-side; this server exposes deterministic graph queries only."
+    },
+    {
+      "path": "crates/codegraph-mcp/src/indexer.rs",
+      "merge_system_rule": true,
+      "rule": "This file owns indexing, reconciliation and the progress log.\n\n## Reconciliation\n- A completed index MUST publish its fingerprint to `<project_root>/.codegraph/index.version`; dropping that write silently disables cache invalidation in the MCP server.\n- Reconcile MUST remove nodes, edges, chunks and file metadata that no longer exist. A log line showing a table total far above this run's write count is a symptom of missing stale cleanup, not a display issue.\n\n## Logging\n- Progress messages must not name a storage backend unless the value comes from configuration. `SurrealDB nodes persisted` on a Postgres run was a real, misleading defect; the neutral form is `Nodes in table: N (this run wrote ≈ M)`.\n- Do not present a table total as if it were this run's count.\n\n## Analysis\n- Analyzer output must stay deterministic and project-scoped, and must carry provenance. Do not emit synthetic edges that no analyzer can justify."
+    },
+    {
+      "path": "crates/codegraph-mcp-server/src/official_server.rs",
+      "merge_system_rule": true,
+      "rule": "This is the MCP server: tool registration, the graph-tool bridge, and prompts.\n\n- The tool router exposes exactly the 9 deterministic graph tools plus the `codegraph:initial_instructions` prompt. Adding a tool requires updating `e2e_mcp_tools.rs` (expected list + negative assertions) and the tool count in `docs/USAGE_GUIDE.md`.\n- There is no server-side agent and no LLM call on any path. Reintroducing one contradicts the 0.4.0 design and needs an explicit decision, not a patch.\n- `run_graph_tool` returns success-shaped guidance for recoverable errors and a real error otherwise; compact JSON only.\n- The opt-in JSONL tool log must not log full tool results by default."
+    },
+    {
+      "path": "crates/codegraph-mcp-server/src/prompts/**",
+      "merge_system_rule": true,
+      "rule": "These Markdown files are compiled into the binary with `include_str!`, so a text edit is a code change.\n\n- After editing, the binary must be rebuilt and `cargo test -p codegraph-mcp-server --lib` must pass: `agent_hooks` asserts specific strings exist in `cli_instructions.md`.\n- Any command or flag mentioned here MUST exist in `codegraph <cmd> --help`. Verify rather than assume.\n- Do not mention removed features: there is no `codegraph agent` command and no `agentic_*` MCP tool. Referencing them sends agents into dead ends.\n- Distinguish `codegraph query` (exact/prefix symbol lookup) from MCP `semantic_code_search` (hybrid search); do not present one as the other."
+    },
+    {
+      "path": "crates/codegraph-mcp-server/src/agent_hooks.rs",
+      "merge_system_rule": true,
+      "rule": "Hook guidance is injected into a user's Claude/Codex session.\n\n- `hook_response` must emit guidance unconditionally for SessionStart/SubagentStart; it must not depend on a feature flag that no longer controls anything.\n- Guidance must only name commands that exist today. Bumping the stated project root via `--project` must stay quoted for the POSIX shell.\n- Never evaluate or echo the transcript: only guidance is allowed."
+    },
+    {
+      "path": "crates/codegraph-mcp-server/src/bin/codegraph.rs",
+      "merge_system_rule": true,
+      "rule": "This is the only shipped binary and its CLI contract.\n\n- Every printed statistic label must match what the number actually is. `LSP: N symbols` was wrong after the language-server path was removed and the numbers came from SCIP enrichment.\n- `--stats-json` keys are a public contract consumed by `scripts/benchmarks/index-quality.py`. Renaming a field requires changing that script in the same commit.\n- New subcommands must be added to the `Commands` enum, handled in `run_cli`, and must not break the exhaustive matches.\n- Do not add a subcommand that requires an LLM provider; nothing in this binary may need model credentials."
+    },
+    {
+      "path": "scripts/benchmarks/**",
+      "merge_system_rule": true,
+      "rule": "Benchmarks feed numbers that go into the README, so reproducibility is part of correctness.\n\n- Every sampling query MUST have a deterministic `ORDER BY`. Without it `json_agg` row order changes between runs and the same seed yields different tasks.\n- Both arms must bill the same thing: if the grep arm counts the first `budget_files` files, the graph arm must count the first `budget_files` rows, with the full payload recorded separately.\n- Never compare latencies across arms that used different binaries or different backends; state the binary version and backend in the report.\n- Changing a metric or sample size requires re-running the affected mode, not extrapolating from an older run."
+    },
+    {
+      "path": "schema/**",
+      "merge_system_rule": true,
+      "rule": "Two schemas ship and must stay consistent.\n\n- `codegraph_v2.surql` is the default; `codegraph.surql` is the legacy drop-in. A change to one requires the equivalent change to the other.\n- `cargo test -p codegraph-graph --test schema_indexes_test` must pass after any edit.\n- Function signatures (`fn::search_snippets`, `fn::knn_nodes`, `fn::expand`, `fn::trace_call_chain`, `fn::kmeans`) are called from Rust; changing a signature or return shape requires updating every caller in the same commit.\n- Keep `DIST COSINE_NORMALIZED` paired with normalized embeddings; do not mix in `DIST COSINE`."
+    },
+    {
+      "path": "crates/codegraph-vector/src/**",
+      "merge_system_rule": true,
+      "rule": "Embedding and chunking behaviour decides retrieval quality and cache correctness.\n\n- Chunk plans must respect the provider's real tokenizer budget; `CODEGRAPH_EMBEDDING_SKIP_CHUNKING=1` must reject oversized input rather than silently truncating.\n- Cache keys must include source text, extraction policy, model/task/revision/tokenizer identity. Any change to that policy invalidates chunk, prepared-vector and reconciliation caches in the same change.\n- The file/name chunk context prefix is on by default (`CODEGRAPH_CHUNK_CONTEXT=0` disables). It exists to stop near-identical chunks collapsing onto one vector; do not remove it without measuring duplicate-vector rate.\n- Provider initialization and chunk planning return `Result`; never swallow the error and fall back silently."
+    }
+  ]
+}
