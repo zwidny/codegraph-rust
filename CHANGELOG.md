@@ -5,6 +5,73 @@ All notable changes to the CodeGraph MCP Intelligence Platform will be documente
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-14
+
+Delta since `v0.2.0` (112 commits). Highlights only; each bullet names shipped behaviour, and
+the entries below this section stay under `[Unreleased]` because they were written without a
+release in mind.
+
+### Changed - PostgreSQL + pgvector is the default backend
+
+- `CODEGRAPH_BACKEND` selects the storage backend; **Postgres is the default**, SurrealDB is
+  opt-in. `deploy/docker-compose.postgres.yml` brings up a matching server.
+- A backend-neutral `IndexStorage` / `GraphQuery` pair replaces the direct SurrealQL calls, so
+  indexing, `query`, `plan` and the analyzers run unchanged on either backend.
+- Postgres gained the missing surface: nodes and edges with metadata, KNN + full-text + RRF
+  fusion, scoped reconciliation, circular-dependency detection and semantic search.
+- Write-path and index tuning: binary-format chunk vectors, `CODEGRAPH_VECTOR_INDEX_MODE=deferred`
+  honoured on Postgres, vector indexes dropped before a forced rebuild, HNSW
+  `maintenance_work_mem` with a fallback, `ef_construction` 150 -> 64.
+- NUL bytes are stripped from text before a write instead of aborting the batch.
+
+### Changed - SCIP is the only compiler-enrichment path
+
+- The language-server implementation and its configuration are gone; `--scip-auto` and
+  `scripts/scip-index.sh` generate indexes, and several indexes can be imported in one run.
+- Python SCIP is supported (`scip-python`, no `--cwd`, the empty-index trap is documented).
+- An unspecified SCIP position encoding is treated as UTF-16, stale positions name the document
+  and say "stale", and zero coverage is reported in stats as a warning.
+
+### Added - Retrieval quality
+
+- A real BM25 text channel on Postgres (IDF + length normalisation, OR-prefix query) replaces
+  the `ts_rank_cd` fallback, which is still available as `CODEGRAPH_TEXT_SCORE=ts_rank_cd`.
+- Node doc comments are part of the full-text index (`nodes.search_tsv`), so "concept" queries
+  reach the prose above a definition.
+- Weighted RRF fusion, default `vector=0.5, name=1.0, content=1.0` (`CODEGRAPH_RRF_WEIGHTS`).
+- `semantic_code_search` extracts identifiers from the query (backticked, snake_case,
+  camelCase, ACRONYM) and matches the name channel against each needle, so a sentence like
+  "Where is `foo_bar` defined?" no longer misses the symbol.
+- Chunk text carries a file/name context prefix by default (`CODEGRAPH_CHUNK_CONTEXT=0` opts
+  out), which stops near-identical chunks from collapsing onto one vector.
+
+### Changed - Smaller tool payloads
+
+- Graph tool responses are compact JSON instead of pretty-printed.
+- `semantic_code_search` takes `include_graph_context` (default **false**); one-hop
+  `incoming_edges` / `outgoing_edges` are only attached on request. The always-empty
+  `matched_symbols` field is gone. Measured on the same tasks the locate payload dropped from
+  25.8 KB to 10.8 KB.
+- Recoverable tool failures return success-shaped guidance instead of an MCP error, and an
+  opt-in JSONL log records every tool call for attribution.
+
+### Added - Measurement
+
+- `scripts/benchmarks/index-quality.py` (L1) and `scripts/benchmarks/retrieval-eval.py` (L2:
+  nDCG@10, Recall@k, MRR, P@10), both covered by unit tests in the `benchmark-scripts` CI job.
+- `scripts/benchmarks/mcp_value.py` now samples deterministically (`ORDER BY` everywhere) and
+  offers `--codegraph-query {question|phrase}`; the grep arm and the graph arm bill the same
+  "first few inspected candidates" budget.
+- README "Measured value" is re-measured on Postgres for both a Rust and a Python repository,
+  with per-row sample sizes, and says how real agents actually query (90% keyword phrases).
+
+### Fixed
+
+- Analyzer no longer slices past the end of a source file, and resolution no longer offers macro
+  invocation nodes as targets.
+- Synthetic pattern-match edges are no longer emitted.
+- `codegraph query` gained `--kind` and `--file`, and get_reverse_dependencies accepts ids.
+
 ## [Unreleased]
 
 ### Fixed - Environment file layering
@@ -39,6 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container) as the recommended setup. The embedded SurrealKV store is documented as a
   compatibility fallback: substantially slower, single writer per project, no per-client
   concurrency. The fallback itself is unchanged and still applies when the URL is unset.
+  *Superseded by 0.3.0, where Postgres + pgvector is the default backend.*
 
 ### Changed - Project agent guidance
 
