@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now `log_*_count`.
 - `codegraph index` prints `SCIP: N symbols, M edges` instead of `LSP:`. The
   `--stats-json` keys (`lsp_nodes_enriched`, `lsp_edges_resolved`) are unchanged.
+- The cache version is only read when `project_id` is an absolute path. A custom
+  identifier (`--project-id` / `CODEGRAPH_PROJECT_ID`) has no directory on disk, and
+  joining it would resolve against the working directory — which could read another
+  project's version file or silently keep a stale cache. It now returns an empty
+  version, preserving the pre-versioning behaviour.
 
 ## [0.4.0] - 2026-11-14
 

@@ -532,7 +532,25 @@ impl GraphToolExecutor {
 
     /// Read the project's published index version. Missing or unreadable files
     /// yield an empty string, which preserves the pre-versioning cache behaviour.
+    ///
+    /// `project_id` is usually the absolute path of the project root. A custom
+    /// identifier (`--project-id` / `CODEGRAPH_PROJECT_ID`) has no matching
+    /// directory on disk, so it returns an empty string — that disables version
+    /// awareness instead of guessing a relative path.
+    ///
+    /// A relative `project_id` is rejected up front: `Path::join` would resolve
+    /// it against the current working directory and could read *another*
+    /// project's version file, tying this cache to someone else's index.
+    ///
+    /// This uses synchronous IO on purpose. The file is a few dozen bytes and is
+    /// read at most once per `execute`, so `tokio::fs` would only add
+    /// `spawn_blocking` scheduling overhead. The missing `.await` is deliberate.
     fn index_version(project_id: &str) -> String {
+        // Relative ids may resolve to a different project; treat them as
+        // version-agnostic rather than reading an arbitrary directory.
+        if !std::path::Path::new(project_id).is_absolute() {
+            return String::new();
+        }
         let path = std::path::Path::new(project_id)
             .join(".codegraph")
             .join("index.version");
@@ -1532,6 +1550,37 @@ mod tests {
             key_a.starts_with("proj-a@v1:"),
             "Project scope should prefix cache key"
         );
+    }
+
+    #[test]
+    fn index_version_is_empty_for_relative_project_id() {
+        // A bare identifier does not point at this project's directory, so it
+        // must never be read — even if a `.codegraph/index.version` happens to
+        // exist under the current working directory.
+        assert_eq!(GraphToolExecutor::index_version("my-graph"), "");
+    }
+
+    #[test]
+    fn index_version_is_empty_when_file_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let project = dir.path().to_str().expect("utf-8 path");
+
+        assert_eq!(
+            GraphToolExecutor::index_version(project),
+            "",
+            "a project root without a published version is version-agnostic"
+        );
+    }
+
+    #[test]
+    fn index_version_reads_and_trims_published_version() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let codegraph_dir = dir.path().join(".codegraph");
+        std::fs::create_dir_all(&codegraph_dir).expect("create .codegraph");
+        std::fs::write(codegraph_dir.join("index.version"), "  abc123\n").expect("write version");
+
+        let project = dir.path().to_str().expect("utf-8 path");
+        assert_eq!(GraphToolExecutor::index_version(project), "abc123");
     }
 
     #[test]
