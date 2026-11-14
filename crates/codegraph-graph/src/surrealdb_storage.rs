@@ -3143,6 +3143,12 @@ impl crate::storage::IndexStorage for SurrealDbStorage {
         Ok(crate::vector_indexes::ensure_ready(&self.db(), dimension, &tables).await?)
     }
 
+    async fn reset_vector_indexes(&self) -> anyhow::Result<()> {
+        // SurrealDB's deferred vector-index handling already avoids per-insert
+        // maintenance; there is nothing to drop here.
+        Ok(())
+    }
+
     /// Port of the SurrealQL `codegraph query` used to run inline. `ORDER BY name`
     /// was added here (the original had no ordering, so equal-prefix results came
     /// back in an unspecified order) to match the Postgres backend.

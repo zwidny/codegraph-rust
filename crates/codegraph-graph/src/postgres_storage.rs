@@ -2528,6 +2528,22 @@ impl crate::storage::IndexStorage for PgStore {
         Ok(true)
     }
 
+    async fn reset_vector_indexes(&self) -> anyhow::Result<()> {
+        if vector_indexes_disabled() {
+            return Ok(());
+        }
+        let client = self.pool.get().await.map_err(db_err)?;
+        client
+            .batch_execute(
+                "DROP INDEX IF EXISTS chunks_hnsw; \
+                 DROP INDEX IF EXISTS nodes_hnsw; \
+                 DROP INDEX IF EXISTS sym_hnsw;",
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Exact-or-prefix name match ordered by name. A NULL `file_path` decodes as
     /// an empty string, mirroring [`Self::node_identities`]. A `NULL` `kind` binds
     /// as SQL `NULL`, so `$3::text IS NULL` disables the kind predicate; a non-NULL
@@ -5087,6 +5103,97 @@ mod tests {
             assert!(
                 !has_index(&store, index).await,
                 "{index} must not be created when CODEGRAPH_VECTOR_INDEX_MODE=off"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn reset_vector_indexes_drops_and_ensure_recreates() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let _guard = VectorIndexModeGuard::new(None);
+
+        drop_vector_indexes(&store).await;
+        store.ensure_schema().await.expect("ensure_schema");
+
+        use crate::storage::IndexStorage;
+        let ready = store
+            .ensure_vector_indexes(1024, &["chunks".to_string()])
+            .await
+            .expect("ensure_vector_indexes");
+        assert!(ready, "1024 dimensions must build the requested indexes");
+        assert!(
+            has_index(&store, "chunks_hnsw").await,
+            "chunks_hnsw is built when `chunks` is requested"
+        );
+        assert!(
+            has_index(&store, "nodes_hnsw").await,
+            "nodes_hnsw is always built"
+        );
+
+        store
+            .reset_vector_indexes()
+            .await
+            .expect("reset_vector_indexes");
+        for index in ["chunks_hnsw", "nodes_hnsw", "sym_hnsw"] {
+            assert!(
+                !has_index(&store, index).await,
+                "{index} must be dropped by reset_vector_indexes"
+            );
+        }
+
+        let ready = store
+            .ensure_vector_indexes(1024, &["chunks".to_string()])
+            .await
+            .expect("ensure_vector_indexes recreates the indexes");
+        assert!(ready, "a full rebuild must report the indexes ready again");
+        assert!(
+            has_index(&store, "chunks_hnsw").await,
+            "chunks_hnsw must be recreated after the rebuild"
+        );
+        assert!(
+            has_index(&store, "nodes_hnsw").await,
+            "nodes_hnsw must be recreated after the rebuild"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn reset_vector_indexes_is_noop_when_off() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+
+        drop_vector_indexes(&store).await;
+        store.ensure_schema().await.expect("ensure_schema");
+        {
+            // Build the indexes with the default (enabled) mode, then switch to
+            // `off` before resetting. The guard is dropped so the mutex is free
+            // for the off-mode guard.
+            let _enabled = VectorIndexModeGuard::new(None);
+            use crate::storage::IndexStorage;
+            store
+                .ensure_vector_indexes(1024, &["chunks".to_string()])
+                .await
+                .expect("ensure_vector_indexes");
+        }
+        assert!(
+            has_index(&store, "chunks_hnsw").await,
+            "precondition: chunks_hnsw exists before the off-mode reset"
+        );
+
+        let _off = VectorIndexModeGuard::new(Some("off"));
+        use crate::storage::IndexStorage;
+        store
+            .reset_vector_indexes()
+            .await
+            .expect("reset_vector_indexes");
+        for index in ["chunks_hnsw", "nodes_hnsw"] {
+            assert!(
+                has_index(&store, index).await,
+                "{index} must survive reset_vector_indexes when the mode is off"
             );
         }
     }

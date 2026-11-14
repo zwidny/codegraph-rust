@@ -1610,6 +1610,13 @@ impl ProjectIndexer {
                 );
             }
 
+            // A full rebuild starts from an empty graph; dropping the vector indexes
+            // first keeps HNSW out of every INSERT. `ensure_vector_indexes` rebuilds
+            // them after the reconcile. Incremental runs skip this on purpose.
+            if self.config.force_reindex {
+                self.storage.reset_vector_indexes().await?;
+            }
+
             // STAGE 4: Persist nodes before embedding so SurrealDB reflects progress
             // Parsing, analyzer validation and chunk preparation must succeed before replacing
             // the last usable graph. A failed parse must never erase the previous index.

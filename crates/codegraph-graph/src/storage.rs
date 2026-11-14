@@ -711,6 +711,13 @@ pub trait IndexStorage: Send + Sync {
     /// Returns whether the indexes are ready.
     async fn ensure_vector_indexes(&self, dimension: usize, tables: &[String]) -> Result<bool>;
 
+    /// Drop the vector indexes before a full rebuild so per-row inserts do not
+    /// maintain them; `ensure_vector_indexes` recreates them after the writes.
+    ///
+    /// Incremental runs must not call this: dropping and rebuilding a 38k-row
+    /// index costs ~25 s, far more than maintaining it for a handful of rows.
+    async fn reset_vector_indexes(&self) -> Result<()>;
+
     /// Exact-or-prefix match on node name, restricted to a node kind when `kind` is
     /// given. `kind` is matched case-insensitively as a substring of the stored
     /// `node_type` (which is `format!("{:?}", NodeType)`), so `"macro"` selects
