@@ -2503,20 +2503,25 @@ impl crate::storage::IndexStorage for PgStore {
             .into());
         }
 
+        // ef_construction 64 rather than 150: measured on 38,080 EasyTier chunks, 150
+        // cost 21.7 s to build against 11.7 s and changed recall@10 by less than the
+        // run-to-run spread (0.949-0.974 vs 0.953-0.978 over three builds each). Lower
+        // m (8) with ef 32 builds in 5.6 s and still lands in the same band, but 12/64
+        // keeps pgvector's default graph quality.
         let mut statements = vec![
             "CREATE INDEX IF NOT EXISTS nodes_hnsw ON nodes USING hnsw \
-             (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);",
+             (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=64);",
         ];
         if tables.iter().any(|table| table == "chunks") {
             statements.push(
                 "CREATE INDEX IF NOT EXISTS chunks_hnsw ON chunks USING hnsw \
-                 (embedding vector_cosine_ops) WITH (m=12, ef_construction=150);",
+                 (embedding vector_cosine_ops) WITH (m=12, ef_construction=64);",
             );
         }
         if tables.iter().any(|table| table == "symbol_embeddings") {
             statements.push(
                 "CREATE INDEX IF NOT EXISTS sym_hnsw ON symbol_embeddings USING hnsw \
-                 (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);",
+                 (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=64);",
             );
         }
 
