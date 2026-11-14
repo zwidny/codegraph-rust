@@ -478,15 +478,35 @@ impl CodeGraphMCPServer {
     }
 
     async fn run_graph_tool(&self, name: &str, params: Value) -> Result<CallToolResult, McpError> {
-        let executor = self.graph_tool_executor().await?;
-        let result = executor.execute(name, params).await.map_err(|e| McpError {
-            code: rmcp::model::ErrorCode(-32603),
-            message: format!("{} failed: {}", name, e).into(),
-            data: None,
-        })?;
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
-        )]))
+        let executor = match self.graph_tool_executor().await {
+            Ok(executor) => executor,
+            Err(error) => {
+                let message = error.message.to_string();
+                if is_recoverable_tool_error(&message) {
+                    // Success-shaped guidance, never isError: an agent that sees errors
+                    // early stops calling the tool entirely.
+                    return Ok(CallToolResult::success(vec![Content::text(message)]));
+                }
+                return Err(error);
+            }
+        };
+        match executor.execute(name, params).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
+            )])),
+            Err(error) => {
+                let message = format!("{} failed: {}", name, error);
+                if is_recoverable_tool_error(&message) {
+                    Ok(CallToolResult::success(vec![Content::text(message)]))
+                } else {
+                    Err(McpError {
+                        code: rmcp::model::ErrorCode(-32603),
+                        message: message.into(),
+                        data: None,
+                    })
+                }
+            }
+        }
     }
 
     #[tool(
@@ -580,11 +600,14 @@ impl CodeGraphMCPServer {
         &self,
         params: Parameters<PlanCheckRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let report = crate::plan_cli::analyze_value(params.0.plan).map_err(|error| McpError {
-            code: rmcp::model::ErrorCode(-32602),
-            message: format!("plan_check failed: {error}").into(),
-            data: None,
-        })?;
+        let report = match crate::plan_cli::analyze_value(params.0.plan) {
+            Ok(report) => report,
+            Err(error) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "plan_check could not parse the plan: {error}. Fix the `nodes`/`edges`/`constraints` object and call plan_check again."
+                ))]));
+            }
+        };
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string()),
         )]))
@@ -1429,4 +1452,54 @@ async fn build_graph_tool_executor() -> Result<Arc<GraphToolExecutor>, McpError>
         Arc::new(config.clone()),
         embedding_generator,
     )))
+}
+
+/// Conditions the caller can recover from. They must come back as a normal
+/// (success-shaped) text result; returning `isError` teaches the agent to stop
+/// calling the tool. `isError` stays for real malfunctions (storage down, a
+/// backend that is not built in, internal errors).
+fn is_recoverable_tool_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("not found")
+        || m.contains("not indexed")
+        || m.contains("schema is missing")
+        || m.contains("no node with id")
+        || m.contains("no such node")
+        || m.contains("invalid node id")
+}
+
+#[cfg(test)]
+mod recoverable_error_tests {
+    use super::*;
+
+    #[test]
+    fn recoverable_conditions_are_classified_as_recoverable() {
+        let cases = [
+            "Node not found: no node with id `x` in this project",
+            "project not indexed: the Postgres schema is missing at CODEGRAPH_PG_URL",
+            "no such node",
+            "invalid node id",
+        ];
+        for message in cases {
+            assert!(
+                is_recoverable_tool_error(message),
+                "expected recoverable: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_malfunctions_are_not_classified_as_recoverable() {
+        let cases = [
+            "Failed to open Postgres storage: connection refused",
+            "requires a build with --features postgres",
+            "internal error",
+        ];
+        for message in cases {
+            assert!(
+                !is_recoverable_tool_error(message),
+                "expected non-recoverable: {message}"
+            );
+        }
+    }
 }
