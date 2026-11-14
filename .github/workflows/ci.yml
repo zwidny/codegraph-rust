@@ -165,3 +165,18 @@ jobs:
           !target/release/deps/
           !target/release/build/
         if-no-files-found: warn
+
+  benchmark-scripts:
+    name: Benchmark script tests (python)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Run benchmark unit tests
+      run: python3 -m unittest discover -s scripts/benchmarks -p 'test_*.py'
