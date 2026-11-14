@@ -19,6 +19,9 @@ pub struct ChunkerConfig {
     pub overlap_tokens: usize,
     pub smart_split: bool,
     pub skip_chunking: bool,
+    /// Prefix each chunk's input with `"<file_name> <node_name>\n"` so identical
+    /// source spans in different files/nodes do not produce identical vectors.
+    pub context_prefix: bool,
     pub cache_dir: Option<std::path::PathBuf>,
     pub use_text_splitter: bool,
     pub token_counter: Option<(String, TokenCounter)>,
@@ -35,6 +38,8 @@ impl ChunkerConfig {
             overlap_tokens: DEFAULT_OVERLAP_TOKENS,
             smart_split: true,
             skip_chunking: std::env::var("CODEGRAPH_EMBEDDING_SKIP_CHUNKING")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            context_prefix: std::env::var("CODEGRAPH_CHUNK_CONTEXT")
                 .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             cache_dir: None,
             token_counter: None,
@@ -271,6 +276,16 @@ pub fn build_chunk_plan_with_source_lookup(
                     } else {
                         sanitize(node, config.sanitize_mode)
                     };
+                let base_text = if config.context_prefix {
+                    let file_name = std::path::Path::new(&node.location.file_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| node.location.file_path.clone());
+                    format!("{file_name} {}\n{base_text}", node.name)
+                } else {
+                    base_text
+                };
 
                 let sanitized = match config.sanitize_mode {
                     SanitizeMode::AsciiFastPath if base_text.is_ascii() => base_text,
@@ -910,5 +925,41 @@ mod pipeline_tests {
         );
         assert!(plan.stats.cache_hits > 0);
         assert!(plan.chunks.iter().any(|chunk| chunk.text.contains('🚀')));
+    }
+    #[test]
+    fn context_prefix_disambiguates_identical_spans() {
+        use codegraph_core::{Location, NodeType};
+        let make = |file: &str| {
+            CodeNode::new(
+                "unit",
+                Some(NodeType::Function),
+                Some(Language::Python),
+                Location {
+                    file_path: file.into(),
+                    line: 1,
+                    column: 0,
+                    end_line: None,
+                    end_column: None,
+                },
+            )
+            .with_content("use super::*;".to_owned())
+        };
+        let nodes = [make("a/x.py"), make("b/y.py")];
+
+        let mut prefixed = byte_budget(4096);
+        prefixed.context_prefix = true;
+        let plan = build_chunk_plan(&nodes, tokenizer(), prefixed).unwrap();
+        assert_eq!(plan.chunks.len(), 2);
+        assert_ne!(plan.chunks[0].text, plan.chunks[1].text);
+        assert!(plan.chunks[0].text.starts_with("x.py unit\n"));
+        assert!(plan.chunks[1].text.starts_with("y.py unit\n"));
+        assert!(plan.chunks[0].text.contains("use super::*;"));
+
+        let mut plain = byte_budget(4096);
+        plain.context_prefix = false;
+        let plan = build_chunk_plan(&nodes, tokenizer(), plain).unwrap();
+        assert_eq!(plan.chunks.len(), 2);
+        assert_eq!(plan.chunks[0].text, plan.chunks[1].text);
+        assert_eq!(plan.chunks[0].text, "use super::*;");
     }
 }
