@@ -129,6 +129,30 @@ is a single hop or the change is a mechanical rename in one module.
 4. `codegraph plan --project <root> store plan.json --plan-id <id>` keeps the plan and
    its constraints for later sessions; `codegraph plan show <id>` reads it back.
 
+Minimal `plan` object — only `id` is required per node, edge `type` defaults to `depends`,
+and each constraint is tagged by `kind`:
+
+```json
+{
+  "nodes": [
+    {"id": "cli.parse", "layer": "cli"},
+    {"id": "core.reconcile", "layer": "core"},
+    {"id": "vector.embed", "layer": "vector"}
+  ],
+  "edges": [
+    {"from": "cli.parse", "to": "core.reconcile", "type": "calls"},
+    {"from": "core.reconcile", "to": "vector.embed", "type": "calls"}
+  ],
+  "constraints": [
+    {"kind": "acyclic", "edge_kind": "calls"},
+    {"kind": "layering", "order": ["cli", "core", "vector"]}
+  ]
+}
+```
+
+Even for an open-ended investigation, this much is enough: list the parts you think exist
+and how you think they connect, then let the checks tell you what is missing.
+
 ## SCIP on a partial re-index
 
 `codegraph index <scan_root>` updates only that scope. Compiler-grade enrichment comes from

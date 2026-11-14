@@ -63,6 +63,27 @@ Use it when investigating a multi-module behaviour, designing an approach, addin
 module, crossing layers, chaining 3+ hops, or changing the public interfaces of 3+ files;
 skip it only for a one-line lookup or a mechanical rename.
 
+A plan file is the entities you believe exist plus how they connect; only `id` is required
+per node, edge `type` defaults to `depends`, and constraints are tagged by `kind`:
+
+```json
+{
+  "nodes": [
+    {"id": "cli.parse", "layer": "cli"},
+    {"id": "core.reconcile", "layer": "core"},
+    {"id": "vector.embed", "layer": "vector"}
+  ],
+  "edges": [
+    {"from": "cli.parse", "to": "core.reconcile", "type": "calls"},
+    {"from": "core.reconcile", "to": "vector.embed", "type": "calls"}
+  ],
+  "constraints": [
+    {"kind": "acyclic", "edge_kind": "calls"},
+    {"kind": "layering", "order": ["cli", "core", "vector"]}
+  ]
+}
+```
+
 A partial re-index updates only the scanned scope. Compiler-grade enrichment comes from the
 SCIP index you pass in `CODEGRAPH_SCIP_INDEX`; files the index does not cover stay AST-only.
 Pin the project so the index and the scan agree:

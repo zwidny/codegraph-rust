@@ -376,6 +376,28 @@ built-in agents. Reload usage details with `codegraph agent instructions`.
 `no_path`/`max_fan_*`）。MCP `plan_check` 离线；对照已有代码用 CLI
 `codegraph plan --project <已索引项目根> verify plan.json`。详见 `docs/PLAN_CHECK.md`。
 
+最小可用形状（节点只有 `id` 必填；边 `type` 默认 `depends`；约束用 `kind` 区分）：
+
+```json
+{
+  "nodes": [
+    {"id": "cli.parse", "layer": "cli"},
+    {"id": "core.reconcile", "layer": "core"},
+    {"id": "vector.embed", "layer": "vector"}
+  ],
+  "edges": [
+    {"from": "cli.parse", "to": "core.reconcile", "type": "calls"},
+    {"from": "core.reconcile", "to": "vector.embed", "type": "calls"}
+  ],
+  "constraints": [
+    {"kind": "acyclic", "edge_kind": "calls"},
+    {"kind": "layering", "order": ["cli", "core", "vector"]}
+  ]
+}
+```
+
+调研式思考写到这个程度就够：把你认为存在的部件和它们怎么连列出来，让校验告诉你漏了什么。
+
 ### 部分索引与 SCIP
 
 `codegraph index <scan_root>` 只更新该范围。compiler 级富化来自你传入的
