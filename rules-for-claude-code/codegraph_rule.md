@@ -1,5 +1,13 @@
 # CodeGraph Agentic Tools
 
+> **Superseded in v0.3.0.** The four agent tools described below were removed together with
+> the agent CLI. The MCP server now exposes 9 direct tools — `semantic_code_search`,
+> `get_reverse_dependencies`, `get_transitive_dependencies`, `trace_call_chain`,
+> `calculate_coupling_metrics`, `detect_circular_dependencies`, `find_complexity_hotspots`,
+> `get_hub_nodes`, `plan_check` — and `codegraph query` / `codegraph plan` cover the CLI.
+> This file is kept as historical guidance; replace each `agentic_*` call with the direct
+> tools from `docs/USAGE_GUIDE.md`.
+
 > **ALWAYS use CodeGraph tools instead of manual file reading/grepping.** CodeGraph provides semantic understanding, not just text search.
 
 ## Session Initialization

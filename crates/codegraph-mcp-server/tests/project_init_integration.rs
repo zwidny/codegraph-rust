@@ -83,9 +83,6 @@ fn all_hook_choices_install_only_selected_harnesses_and_merge_both_guides() {
                 assert!(!text.contains("exact-string verification"));
                 // An unclosed fence would make visible_lines bail on the next init.
                 assert_eq!(text.matches("```").count() % 2, 0);
-                for tool in ["context", "impact", "architecture", "quality"] {
-                    assert!(text.contains(&format!("codegraph agent {tool}")));
-                }
                 text
             })
             .into();

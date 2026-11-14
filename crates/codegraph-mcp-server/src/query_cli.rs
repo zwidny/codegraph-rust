@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 /// Printed when a lookup matches nothing, so a script can tell "no such symbol"
 /// apart from an indexed project with zero rows.
-const EMPTY_MATCH_HINT: &str = "no exact or prefix match; try the full name, or use `codegraph agent context` for semantic search";
+const EMPTY_MATCH_HINT: &str = "no exact or prefix match; try the full name, or use the MCP `semantic_code_search` tool for semantic search";
 
 /// Row ceiling for the `--file` name lookup.
 ///

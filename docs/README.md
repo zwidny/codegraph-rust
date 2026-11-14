@@ -9,9 +9,9 @@ Welcome to the comprehensive documentation for the CodeGraph project.
 - [Usage guide (for AI assistants)](USAGE_GUIDE.md)
 - [Incremental indexing (single file / subdirectory)](INCREMENTAL_INDEXING.md)
 - [Indexing pipeline: stages, timings and controls](INDEXING_PIPELINE.md)
-- [Agentic CLI commands and Claude Code/Codex hooks](AGENTIC_CLI.md)
-- [AI provider configuration (embeddings + LLMs)](AI_PROVIDERS.md)
-- [Agentic prompt tiers (4-tier system)](AGENT_PROMPT_TIERS.md)
+- [CLI and direct graph queries](USAGE_GUIDE.md#cli-access-for-code-agents)
+- [AI provider configuration (embeddings)](AI_PROVIDERS.md)
+- [Historical agent prompt tiers (removed in v0.3.0)](AGENT_PROMPT_TIERS.md)
 - [Supported languages](SUPPORTED_LANGUAGES.md)
 
 ## Architecture Visualization
@@ -36,7 +36,6 @@ Explore the interactive [Architecture Diagram](architecture-visualization.html) 
 - [codegraph-mcp-daemon](crates/codegraph-mcp-daemon/README.md): Background service and file watching.
 - [codegraph-mcp-tools](crates/codegraph-mcp-tools/README.md): Specific tool implementations.
 - [codegraph-mcp-core](crates/codegraph-mcp-core/README.md): Shared MCP traits.
-- [codegraph-mcp-rig](crates/codegraph-mcp-rig/README.md): Agent backend for the agentic tools, built on the Rig framework.
 
 ## Specifications
 Detailed specs can be found in the [specifications](specifications/) directory.

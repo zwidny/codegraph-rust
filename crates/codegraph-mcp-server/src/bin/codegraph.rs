@@ -10,7 +10,7 @@ use codegraph_mcp_core::debug_logger::DebugLogger;
 #[cfg(feature = "daemon")]
 use codegraph_mcp_daemon::{DaemonManager, PidFile, WatchConfig, WatchDaemon};
 use codegraph_mcp_server::CodeGraphMCPServer;
-use codegraph_mcp_server::{agent_cli, agent_hooks, plan_cli, project_init, query_cli};
+use codegraph_mcp_server::{agent_hooks, plan_cli, project_init, query_cli};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rmcp::ServiceExt;
@@ -33,8 +33,8 @@ const DEFAULT_LOCAL_EMBEDDINGS_PER_WORKER_PER_MINUTE: f64 = 3600.0;
     name = "codegraph",
     version,
     author,
-    about = "CodeGraph CLI - agentic tools, MCP server management, and project indexing",
-    long_about = "Run CodeGraph's four agentic tools directly, configure harness hooks, manage MCP servers, and index projects.\n\
+    about = "CodeGraph CLI - MCP server management and project indexing",
+    long_about = "Configure harness hooks, manage MCP servers, and index projects.\n\
                   \n\
                   Agents/LLMs: run `codegraph <command> --help` before invoking a command. Each subcommand\n\
                   documents real-world pitfalls (indexing tiers, required tools, scoping large repos) that\n\
@@ -80,12 +80,6 @@ enum Commands {
         index_tier: Option<IndexTier>,
         #[arg(long, default_value_t = 4, help = "Parallel parser workers")]
         workers: usize,
-    },
-
-    #[command(about = "Run client-facing agentic tools without an MCP transport")]
-    Agent {
-        #[command(subcommand)]
-        action: agent_cli::AgentCommand,
     },
 
     #[command(about = "Fast direct graph query, no LLM (symbol, callers, callees)")]
@@ -577,12 +571,6 @@ enum ConfigAction {
         #[arg(long, help = "Database to use (overrides env)")]
         database: Option<String>,
     },
-
-    #[command(about = "Show orchestrator-agent configuration metadata")]
-    AgentStatus {
-        #[arg(long, help = "Show as JSON")]
-        json: bool,
-    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -620,10 +608,6 @@ fn main() -> Result<()> {
         if args.action.is_offline() {
             return plan_cli::run_offline(&args.action);
         }
-    }
-    if let Commands::Agent { ref action } = cli.command {
-        // SAFETY: No async runtime or application threads have been started yet.
-        return unsafe { agent_cli::run(action, cli.verbose, cli.config.as_deref()) };
     }
     if let Commands::Hooks { ref action } = cli.command {
         return agent_hooks::run(action);
@@ -700,10 +684,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
     let config = config_mgr.config();
 
     match cli.command {
-        Commands::Init { .. }
-        | Commands::Agent { .. }
-        | Commands::Hooks { .. }
-        | Commands::Query { .. } => {
+        Commands::Init { .. } | Commands::Hooks { .. } | Commands::Query { .. } => {
             unreachable!("handled before configuration")
         }
         Commands::Plan { args } => {
@@ -1589,13 +1570,6 @@ async fn handle_index(
         );
     }
 
-    println!();
-    println!(
-        "{}",
-        "🚀 Ready for CodeGraph Agentic MCP Intelligence!"
-            .green()
-            .bold()
-    );
     println!("Next: Start MCP server with 'codegraph start http' or 'codegraph start stdio'");
 
     if stats.errors > 0 {
@@ -2090,15 +2064,12 @@ CODEGRAPH_EMBEDDING_PROVIDER=auto
 # CODEGRAPH_EMBEDDING_DIMENSION=2048
 
 # ============================================================================
-# LLM PROVIDER (for the agentic tools)
+# LLM PROVIDER (compatibility only; no CodeGraph feature calls a model)
 # ============================================================================
-# LLM Provider: "ollama", "lmstudio", "anthropic", "openai"
+# The graph tools, the CLI queries and indexing all run without a model. These
+# keys are still parsed so an existing .env keeps loading without errors.
 # CODEGRAPH_LLM_PROVIDER=lmstudio
-
-# LLM Model
 # CODEGRAPH_LLM_MODEL=qwen2.5-coder:14b
-
-# Enable LLM insights (context-only mode if disabled)
 # CODEGRAPH_LLM_ENABLED=false
 
 # ============================================================================
@@ -2230,246 +2201,6 @@ CODEGRAPH_EMBEDDING_PROVIDER=auto
         } => {
             handle_db_check(namespace, database).await?;
         }
-        ConfigAction::AgentStatus { json } => {
-            handle_agent_status(json).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_agent_status(json: bool) -> Result<()> {
-    use codegraph_core::config_manager::ConfigManager;
-    use codegraph_mcp_core::context_aware_limits::ContextTier;
-
-    // Load configuration
-    let config_mgr = ConfigManager::load().context("Failed to load configuration")?;
-    let config = config_mgr.config();
-
-    // Report what the agent will actually use: environment, then [llm] keys, then defaults.
-    let context_window = ConfigManager::agent_context_window();
-    let tier = ContextTier::from_context_window(context_window);
-    #[cfg(feature = "ai-enhanced")]
-    let (agent_provider, agent_model) = {
-        use codegraph_mcp_rig::adapter::{RigProvider, get_model_name};
-        let provider = match RigProvider::from_env() {
-            Ok(RigProvider::OpenAI) => "openai".to_string(),
-            Ok(RigProvider::Anthropic) => "anthropic".to_string(),
-            Ok(RigProvider::Ollama) => "ollama".to_string(),
-            Ok(RigProvider::XAI) => "xai".to_string(),
-            Ok(RigProvider::LMStudio) => "lmstudio".to_string(),
-            Ok(RigProvider::OpenAICompatible { base_url }) => {
-                format!("openai-compatible ({base_url})")
-            }
-            Err(_) => "not configured".to_string(),
-        };
-        (provider, get_model_name())
-    };
-    #[cfg(not(feature = "ai-enhanced"))]
-    let (agent_provider, agent_model) = (
-        config.llm.provider.clone(),
-        config
-            .llm
-            .model
-            .clone()
-            .unwrap_or_else(|| "auto-detected".to_string()),
-    );
-
-    // Determine prompt verbosity based on tier
-    let prompt_verbosity = match tier {
-        ContextTier::Small => "TERSE",
-        ContextTier::Medium => "BALANCED",
-        ContextTier::Large => "DETAILED",
-        ContextTier::Massive => "EXPLORATORY",
-    };
-
-    // Get tier-specific parameters
-    let (max_steps, base_limit, default_max_tokens) = match tier {
-        ContextTier::Small => (3, 10, 2048),
-        ContextTier::Medium => (5, 25, 4096),
-        ContextTier::Large => (6, 50, 8192),
-        ContextTier::Massive => (8, 100, 16384),
-    };
-
-    // Get max output tokens (config override or tier default)
-    let max_output_tokens = config
-        .llm
-        .mcp_code_agent_max_output_tokens
-        .unwrap_or(default_max_tokens);
-
-    // Active MCP tools
-    let mcp_tools = vec![
-        ("enhanced_search", "Search code with AI insights (2-5s)"),
-        (
-            "pattern_detection",
-            "Analyze coding patterns and conventions (1-3s)",
-        ),
-        ("vector_search", "Fast vector search (0.5s)"),
-        (
-            "graph_neighbors",
-            "Find dependencies for a code element (0.3s)",
-        ),
-        (
-            "graph_traverse",
-            "Follow dependency chains through code (0.5-2s)",
-        ),
-        (
-            "codebase_qa",
-            "Ask questions about code and get AI answers (5-30s)",
-        ),
-        (
-            "semantic_intelligence",
-            "Deep architectural analysis (30-120s)",
-        ),
-    ];
-
-    // Analysis types and their prompts
-    let analysis_types = vec![
-        "code_search",
-        "dependency_analysis",
-        "call_chain_analysis",
-        "architecture_analysis",
-        "api_surface_analysis",
-        "context_builder",
-        "semantic_question",
-    ];
-
-    if json {
-        // JSON output
-        let output = serde_json::json!({
-            "llm": {
-                "provider": agent_provider,
-                "model": agent_model,
-                "enabled": config.llm.enabled,
-            },
-            "context": {
-                "tier": format!("{:?}", tier),
-                "window_size": context_window,
-                "prompt_verbosity": prompt_verbosity,
-            },
-            "orchestrator": {
-                "max_steps": max_steps,
-                "base_search_limit": base_limit,
-                "cache_enabled": true,
-                "cache_size": 100,
-                "max_output_tokens": max_output_tokens,
-                "max_output_tokens_source": if config.llm.mcp_code_agent_max_output_tokens.is_some() {
-                    "custom"
-                } else {
-                    "tier_default"
-                },
-            },
-            "mcp_tools": mcp_tools.iter().map(|(name, desc)| {
-                serde_json::json!({
-                    "name": name,
-                    "description": desc,
-                    "prompt_type": prompt_verbosity,
-                })
-            }).collect::<Vec<_>>(),
-            "analysis_types": analysis_types.iter().map(|name| {
-                serde_json::json!({
-                    "name": name,
-                    "prompt_type": prompt_verbosity,
-                })
-            }).collect::<Vec<_>>(),
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        // Human-readable output
-        println!(
-            "{}",
-            "╔══════════════════════════════════════════════════════════════════════╗"
-                .blue()
-                .bold()
-        );
-        println!(
-            "{}",
-            "║          CodeGraph Orchestrator-Agent Configuration                  ║"
-                .blue()
-                .bold()
-        );
-        println!(
-            "{}",
-            "╚══════════════════════════════════════════════════════════════════════╝"
-                .blue()
-                .bold()
-        );
-        println!();
-
-        // LLM Configuration
-        println!("{}", "🤖 LLM Configuration".green().bold());
-        println!("   Provider: {}", agent_provider.yellow());
-        println!("   Model: {}", agent_model.yellow());
-        println!(
-            "   Status: {}",
-            if config.llm.enabled {
-                "Enabled".green()
-            } else {
-                "Context-only mode".yellow()
-            }
-        );
-        println!();
-
-        // Context Configuration
-        println!("{}", "📊 Context Configuration".green().bold());
-        println!(
-            "   Tier: {} ({} tokens)",
-            format!("{:?}", tier).yellow(),
-            context_window.to_string().cyan()
-        );
-        println!("   Prompt Verbosity: {}", prompt_verbosity.cyan());
-        println!(
-            "   Base Search Limit: {} results",
-            base_limit.to_string().cyan()
-        );
-        println!();
-
-        // Orchestrator Configuration
-        println!("{}", "⚙️  Orchestrator Settings".green().bold());
-        println!(
-            "   Max Steps per Workflow: {}",
-            max_steps.to_string().cyan()
-        );
-        println!(
-            "   Cache: {} (size: {} entries)",
-            "Enabled".green(),
-            "100".cyan()
-        );
-        let max_tokens_display = if config.llm.mcp_code_agent_max_output_tokens.is_some() {
-            format!("{} (custom)", max_output_tokens.to_string().cyan())
-        } else {
-            format!("{} (tier default)", max_output_tokens.to_string().cyan())
-        };
-        println!("   Max Output Tokens: {}", max_tokens_display);
-        println!();
-
-        // MCP Tools
-        println!("{}", "🛠️  Available MCP Tools".green().bold());
-        for (name, desc) in &mcp_tools {
-            println!("   • {} [{}]", name.yellow(), prompt_verbosity.cyan());
-            println!("     {}", desc.dimmed());
-        }
-        println!();
-
-        // Analysis Types
-        println!("{}", "🔍 Analysis Types & Prompt Variants".green().bold());
-        for analysis_type in &analysis_types {
-            println!(
-                "   • {} → {}",
-                analysis_type.yellow(),
-                prompt_verbosity.cyan()
-            );
-        }
-        println!();
-
-        // Tier Details
-        println!("{}", "📈 Context Tier Details".green().bold());
-        println!("   Small (< 50K):        5 steps,  10 results, TERSE prompts");
-        println!("   Medium (50K-150K):   10 steps,  25 results, BALANCED prompts");
-        println!("   Large (150K-500K):   15 steps,  50 results, DETAILED prompts");
-        println!("   Massive (> 500K):    20 steps, 100 results, EXPLORATORY prompts");
-        println!();
-        println!("   Current tier: {}", format!("{:?}", tier).green().bold());
     }
 
     Ok(())

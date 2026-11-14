@@ -2,6 +2,9 @@
 
 This document explains how CodeGraph’s built-in agent chooses prompt “tiers” (verbosity/strategy) based on your configured LLM context window, and why this makes small local models viable.
 
+> **Historical:** v0.3.0 removed the rig agent and the agent CLI. This document is kept as
+> design context; the shipped MCP server exposes only the 9 direct graph tools.
+
 ## What “tier” means in CodeGraph
 
 When you call an agentic MCP tool (e.g. `agentic_code_search`), CodeGraph runs a server-side agent that:
@@ -57,7 +60,7 @@ number also bounds tree depth and search expansions, with three candidates per
 expansion plus evaluator calls. It does not bound total model calls across the
 tree. Candidates share the graph-tool registration, run-level result-size budget
 and tool-use tracking with ReAct, while keeping their observations in separate
-branch histories. See [agent architectures](AGENTIC_CLI.md#agent-architectures).
+branch histories. (The agent CLI that exposed these architectures was removed in v0.3.0.)
 
 ### Retrieval limits (and MCP-safe output)
 

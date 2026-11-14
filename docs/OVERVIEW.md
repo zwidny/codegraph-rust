@@ -43,7 +43,8 @@ Indexing is tiered so you can choose between speed/storage and graph richness. T
 | `balanced` | SCIP definitions + docs/enrichment + module linking | Richer navigation and documentation with moderate analyzer cost |
 | `full` | All analyzers + SCIP references + dataflow + architecture | Maximum graph richness and analyzer coverage |
 
-Agent answer accuracy is evaluated separately; see the [CLI accuracy results](../README.md#agent-cli-accuracy-by-indexing-tier).
+Historical agent-CLI accuracy reports are kept in [docs/evaluations](evaluations/); the
+agent CLI itself was removed in v0.3.0.
 
 Tier behavior details:
 - `fast`: disables build context, enrichment, module linking, dataflow, docs/contracts, and architecture; filters out `Uses`/`References` edges. A supplied SCIP index is still imported.
@@ -198,117 +199,48 @@ reason = "explain the boundary"
 
 Indexing will emit `violates_boundary` edges when a `depends_on` relationship matches a deny rule.
 
-### 2. Agentic Tools, Not Just Search
+### 2. Direct Graph Tools, Not Just Search
 
-CodeGraph doesn't return a list of files and wish you luck. It ships **4 consolidated agentic tools** that do the thinking:
+CodeGraph doesn't return a list of files and wish you luck. It ships **9 direct graph
+tools** that answer one concrete question each, in milliseconds and without an LLM:
 
 | Tool | What It Actually Does |
 |------|----------------------|
-| `agentic_context` | Gathers the context you need—searches code, builds comprehensive context, answers semantic questions |
-| `agentic_impact` | Maps change impact—dependency chains, call flows, what breaks if you touch something |
-| `agentic_architecture` | The big picture—system structure, API surfaces, architectural patterns |
-| `agentic_quality` | Risk assessment—complexity hotspots, coupling metrics, refactoring priorities |
+| `semantic_code_search` | Find a symbol or concept; returns the `node_id` the other tools need |
+| `get_reverse_dependencies` | Who calls or depends on a node |
+| `get_transitive_dependencies` | The dependency closure from a node |
+| `trace_call_chain` | The call path starting at a node |
+| `calculate_coupling_metrics` | Afferent/efferent coupling and instability for a node |
+| `detect_circular_dependencies` | Dependency cycles for an edge type |
+| `find_complexity_hotspots` | Complexity/risk ranking |
+| `get_hub_nodes` | High-degree hub ranking |
+| `plan_check` | Validate a draft nodes/edges/constraints graph offline |
 
-Each tool accepts an optional `focus` parameter for precision when needed:
+The client composes these itself. A change-impact question becomes:
+`semantic_code_search` → `get_reverse_dependencies` → `get_transitive_dependencies` →
+read the returned files. An architecture question becomes `get_hub_nodes` +
+`detect_circular_dependencies` + `find_complexity_hotspots`. Results carry `file:line`
+locations and bounded snippets, so the client can verify against current source.
 
-| Tool | Focus Values | Default Behavior |
-|------|-------------|-----------------|
-| `agentic_context` | `"search"`, `"builder"`, `"question"` | Auto-selects based on query |
-| `agentic_impact` | `"dependencies"`, `"call_chain"` | Analyzes both |
-| `agentic_architecture` | `"structure"`, `"api_surface"` | Provides both |
-| `agentic_quality` | `"complexity"`, `"coupling"`, `"hotspots"` | Comprehensive assessment |
+### 3. Context Protection
 
-Each tool runs a **reasoning agent** that plans, searches, analyzes graph relationships, and synthesizes an answer. Not a search result—an *answer*.
-
-> **[View Agent Context Gathering Flow](architecture/agent-context-gathering-flow.html)** - Interactive diagram showing how agents use graph tools to gather context.
-
-![AgenticArchitectures](assets/agentic_architectures.jpeg)
-#### Agent Architectures
-
-CodeGraph's agents are built on the **Rig** framework. The agent that runs is selected at runtime with `CODEGRAPH_AGENT_ARCHITECTURE` (in `.env` or the environment):
-
-- **`react`** (default; `rig` is accepted as an alias): a tool-calling loop over the graph tools.
-- **`lats`**: tree search over candidates that call the same graph tools as ReAct. Each branch retains its own observations; the evaluator scores it against that evidence, and the selected branch supplies the answer. Runs with no successful graph observation fail.
-- **`reflexion`**: ReAct wrapped in a retry that feeds the previous error back to the agent.
-
-Whichever agent is selected, a failed run is retried automatically with the error as context.
-
-```bash
-# Default: ReAct
-./codegraph start stdio
-
-# Tree search with graph-tool grounding
-CODEGRAPH_AGENT_ARCHITECTURE=lats ./codegraph start stdio
-```
-
-All agents serve the same 4 consolidated agentic tools and use tier-aware prompting.
-LATS explores three candidates per expansion and makes evaluator calls, so it can
-cost more and take longer than ReAct. Its tier budget bounds search expansions,
-depth and each candidate's tool loop; candidates share the run's result-size budget.
-The CLI's whole-workflow deadline still applies. See [architecture and limits](AGENTIC_CLI.md#agent-architectures).
-
-### 3. Tier-Aware Intelligence
-
-Here's something clever: CodeGraph automatically adjusts its behavior based on the LLM's context window that you configured for the codegraph agent.
-
-Running a small local model? Get focused, efficient queries.
-
-Using a model with 200K context? Get comprehensive, exploratory analysis.
-
-Using gpt-6, Opus-5.5 or Grok-4.7 with 1-2M context? Get detailed analysis with intelligent result management.
-
-The Agent only uses the amount of steps that it requires to produce the answer so tool execution times vary based on the query and amount of data indexed in the database.
-
-During development the agent used 3-6 steps on average to produce answers for test scenarios.
-
-The Agent is stateless it only has conversational memory for the span of tool execution it does not accumulate context/memory over multiple chained tool calls this is already handled by your client of choice, it accumulates that context so codegraph needs to just provide answers.
-
-| Your Model | CodeGraph's Behavior |
-|------------|---------------------|
-| < 50K tokens | Terse prompts, max 3 steps |
-| 50K-150K | Balanced analysis, max 5 steps |
-| 150K-500K | Detailed exploration, max 6 steps |
-| > 500K (gpt-6, etc.) | Comprehensive analysis, max 8 steps |
-
-**Hard cap:** Maximum 8 steps regardless of tier. This prevents runaway costs and context overflow while still allowing thorough analysis.
-
-**Same tool, automatically optimized for your setup.**
-
-### 4. Context Overflow Protection
-
-Every tool result the agent receives is resent to the model on each later round, so
-CodeGraph bounds what a run can put in the model's context at three levels:
-
-**Content snippets.** Long `content` in a result row (a whole document, an `impl` block)
-is cut to a leading snippet, 2,000 characters by default, and marked
-`content_truncated` with its original length. The row keeps its file path and line range,
-so the client can read the rest.
-
-**Per-result limit.** One tool result is limited to `context_window × 2` bytes, capped at
-200 KB however large the window is. Oversized array results keep their leading items and
-carry `_truncated` metadata.
-
-**Per-run budget.** All tool results in one agent run share a budget of about a third of
-the context window (at 4 bytes per token), between 48 KB and 600 KB. A result that would
-exceed the remainder is trimmed to fit and carries a `_budget` note; once the budget is
-used up, further calls return a note telling the agent to answer from the evidence it
-has.
+Long `content` in a tool result (a whole document, an `impl` block) is cut to a leading
+snippet, 2,000 characters by default, and marked `content_truncated` with its original
+length. The row keeps its file path and line range, so the client can read the rest.
+One tool result is limited to `context_window × 2` bytes, capped at 200 KB however large
+the window is; oversized array results keep their leading items and carry `_truncated`
+metadata.
 
 **Configure via environment:**
 ```bash
 # Set this to match your agent LLM's real context window
 CODEGRAPH_CONTEXT_WINDOW=128000            # default: 128K
 
-# Optional overrides
-CODEGRAPH_TOOL_CONTENT_CHARS=2000          # snippet length per row; 0 disables shortening
-CODEGRAPH_AGENT_RESULT_BUDGET_BYTES=400000 # per-run tool-result budget
+# Optional snippet-length override
+CODEGRAPH_TOOL_CONTENT_CHARS=2000          # per row; 0 disables shortening
 ```
 
-**Why this matters:** on a full-tier index of this repository, one semantic search could
-return 228 KB before these limits, and a dozen searches in one run put megabytes into
-every model request until the model call stalled.
-
-### 5. Hybrid Search That Actually Works
+### 4. Hybrid Search That Actually Works
 
 We don't pick sides in the "embeddings vs keywords" debate. CodeGraph combines:
 
@@ -328,37 +260,38 @@ When you connect CodeGraph to Claude Code, Cursor, or any MCP-compatible agent:
 
 **Before:** Your AI reads files one by one, grepping around, burning tokens on context-gathering.
 
-**After:** Your AI calls `agentic_impact({"query": "UserService"})` and instantly knows what breaks if you refactor it.
+**After:** Your AI calls `semantic_code_search("UserService")` for the `node_id`, then `get_reverse_dependencies(node_id, "calls")` and instantly sees what breaks if you refactor it.
 
 This isn't incremental improvement. It's the difference between an AI that *searches* your code and one that *understands* it.
 
 ### Why this is powerful for code agents
 
-CodeGraph shifts the *cognitive load* (search + relevance + dependency reasoning) into CodeGraph’s agentic tools, so your code agent can spend its context budget on *making the change*, not *discovering what to change*.
+CodeGraph shifts the *cognitive load* (search + relevance + dependency reasoning) into targeted graph queries, so your code agent can spend its context budget on *making the change*, not *discovering what to change*.
 
-#### What an agentic tool returns (example)
+#### What a tool result looks like (example)
 
-`agentic_impact` returns structured output (file paths, line numbers, and bounded snippets/highlights) plus analysis:
+`get_reverse_dependencies` returns structured rows with file paths, line numbers and bounded snippets:
 
 ```json
 {
-  "analysis_type": "dependency_analysis",
-  "query": "RigAgentBuilder",
-  "structured_output": {
-    "analysis": "…what depends on RigAgentBuilder and why…",
-    "highlights": [
-      { "file_path": "crates/codegraph-mcp-rig/src/agent/builder.rs", "line_number": 48, "snippet": "pub struct RigAgentBuilder { … }" }
-    ],
-    "next_steps": ["…"]
-  },
-  "steps_taken": "5",
-  "tool_use_count": 5
+  "node_id": "nodes:`0f0f013b-...`",
+  "edge_type": "calls",
+  "results": [
+    {
+      "node_id": "nodes:`a1b2c3d4-...`",
+      "name": "IndexStorage",
+      "file_path": "crates/codegraph-graph/src/storage.rs",
+      "line_number": 48,
+      "content": "pub struct ...",
+      "content_truncated": false
+    }
+  ]
 }
 ```
 
 #### What a code agent would otherwise have to do
 
-Without CodeGraph’s agentic tools, a code agent typically needs multiple “single-purpose” calls to reach the same confidence:
+Without CodeGraph, a code agent typically needs multiple “single-purpose” calls to reach the same confidence:
 - search for the symbol (often multiple strategies: text + semantic + ripgrep-style search)
 - open and read multiple files (definition + usages + callers + related modules)
 - reconstruct dependency/call graphs mentally from partial evidence

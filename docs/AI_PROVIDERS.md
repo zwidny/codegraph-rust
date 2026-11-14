@@ -1,11 +1,10 @@
 # CodeGraph AI providers: embeddings + LLMs
 
-This document explains how to configure CodeGraph’s embedding providers (for indexing/search) and LLM providers (for the built-in agentic tools).
+This document explains how to configure CodeGraph’s embedding providers (for indexing/search). LLM settings are parsed for compatibility but are not used by the shipped graph tools.
 
 It is based on the runtime configuration loader in `crates/codegraph-core/src/config_manager.rs` and provider implementations in:
 
 - `crates/codegraph-vector/src/*` (embeddings)
-- `crates/codegraph-mcp-rig/src/adapter/llm_adapter.rs` (the agent's LLM provider, model and endpoints)
 
 ## Configuration sources and precedence
 
@@ -26,7 +25,6 @@ If you use `.env`, it’s loaded automatically at startup (you do not need `dire
 1. The project has been indexed. A shared SurrealDB server is the default target and needs the schema applied (see `docs/INSTALLATION_GUIDE.md`); an opt-in embedded store (`surrealkv://`) creates its schema automatically.
 2. You have a `./.codegraph.toml` or `~/.codegraph/config.toml` with at least:
    - `[embedding] provider = ...`
-   - an LLM for the agentic tools: `[llm] provider` and `model` in the config file, or `CODEGRAPH_LLM_PROVIDER` and `CODEGRAPH_LLM_MODEL` in the environment, plus the provider's API key in the environment
 3. Secrets are present via `.env` or your shell environment (recommended).
 
 ## `.env` examples
@@ -227,74 +225,12 @@ Chunking and batching can be tuned via environment variables:
 
 If you change embedding dimensions/models, ensure your SurrealDB schema supports the chosen dimension fields.
 
-## LLM providers (built-in agentic tools)
+## LLM settings (not used by the shipped tools)
 
-The agentic tools run a built-in agent (the Rig backend in `crates/codegraph-mcp-rig`). The built-in agent resolves each LLM setting in three steps: the environment variable (a project `.env` counts), then the key in the config file's `[llm]` section, then a default.
-
-| Setting | Environment variable | `[llm]` key | Default |
-| --- | --- | --- | --- |
-| Provider | `CODEGRAPH_LLM_PROVIDER` | `provider` | inferred from whichever API key is set |
-| Model | `CODEGRAPH_LLM_MODEL`, then `CODEGRAPH_AGENT_MODEL`, then `CODEGRAPH_MODEL` | `model` | the provider's built-in default |
-| Context window | `CODEGRAPH_CONTEXT_WINDOW` | `context_window` | 128000 |
-| Ollama endpoint | `OLLAMA_API_BASE_URL`, `OLLAMA_API_URL`, `OLLAMA_HOST` | `ollama_url` | `http://localhost:11434` |
-| LM Studio endpoint | `LMSTUDIO_URL`, `CODEGRAPH_LMSTUDIO_URL` | `lmstudio_url` (`/v1` is appended) | `http://localhost:1234/v1` |
-| OpenAI-compatible endpoint | `CODEGRAPH_OPENAI_COMPATIBLE_URL` | `openai_compatible_url` | `http://localhost:1234/v1` |
-| API keys | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY` | not read | none |
-
-Set the model explicitly. Without one the agent requests its provider's built-in default (`gpt-4o` for OpenAI, `claude-sonnet-4-20250514` for Anthropic, `llama3.2` for Ollama, `grok-3-latest` for xAI).
-
-`[llm] enabled = false` makes the agent ignore the whole section. `codegraph config init` writes a config file with every default spelled out and `enabled = false`, so a generated file does not select a provider until you set `enabled = true` or remove the line. Other `[llm]` keys (`temperature`, `max_tokens`, `timeout_secs`, `reasoning_effort`, `xai_base_url`, the `*_api_key` fields) are accepted by the loader but do not reach the agent.
-
-Check the result with `codegraph config agent-status`.
-
-Valid providers (availability depends on build features): `ollama`, `lmstudio`, `anthropic`, `openai`, `xai`, `openai-compatible`.
-
-### Ollama
-
-```toml
-[llm]
-provider = "ollama"
-model = "qwen2.5-coder:14b"
-context_window = 32768
-# ollama_url = "http://localhost:11434"
-```
-
-### LM Studio
-
-```toml
-[llm]
-provider = "lmstudio"
-model = "your-local-model-id"
-# lmstudio_url = "http://localhost:1234"
-```
-
-### Anthropic, OpenAI, xAI
-
-```toml
-[llm]
-provider = "anthropic"            # or "openai" / "xai"
-model = "claude-sonnet-4"
-context_window = 200000
-```
-
-with the key in the environment: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `XAI_API_KEY`.
-
-### OpenAI-compatible
-
-For OpenAI-shaped APIs (self-hosted gateways, proxies):
-
-```toml
-[llm]
-provider = "openai-compatible"
-model = "served-model-name"
-openai_compatible_url = "http://localhost:8000/v1"
-```
-
-The key, if the endpoint needs one, comes from `OPENAI_COMPATIBLE_API_KEY` or `OPENAI_API_KEY`.
-
-### Context window and tier selection
-
-The context window decides the prompt tier, the tool-round budget and the size limit for tool results. Set it to your model's real limit. See `docs/AGENT_PROMPT_TIERS.md`.
+The `[llm]` section and `CODEGRAPH_LLM_*` variables are still parsed for configuration
+compatibility, but the shipped MCP server and CLI do not call an LLM: the 9 graph tools
+and `codegraph query` / `codegraph plan` query the graph directly. A former built-in agent
+consumed these settings; it was removed in v0.3.0.
 
 ## Graph schema selection (optional)
 

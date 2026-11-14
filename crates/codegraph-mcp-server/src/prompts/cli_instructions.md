@@ -1,59 +1,45 @@
-# CodeGraph agentic CLI
+# CodeGraph CLI
 
 CodeGraph is a CLI tool available through Bash as the `codegraph` command. Run the
 commands below using your Bash or shell execution tool. Check that CodeGraph is
 on PATH with `command -v codegraph`.
 
-Use CodeGraph's built-in reasoning agents for code discovery, change impact,
-architecture, and quality questions. They gather evidence with internal graph tools
-and return synthesized answers with source locations. Call these public commands:
+There is **no `agent` subcommand** and no built-in LLM workflow. CodeGraph
+answers code questions by querying the graph directly; when you need a synthesized
+answer, compose the queries below yourself and read the returned `file:line`
+locations. Existing CodeGraph database configuration applies; no running MCP server
+is needed.
 
-| Need | Command | Optional `--focus` |
-| --- | --- | --- |
-| Find code or gather context | `codegraph agent context "question or task"` | `search`, `builder` (default), `question` |
-| Assess a proposed change | `codegraph agent impact "what would change?"` | `dependencies` (default), `call_chain` |
-| Explain structure/interfaces | `codegraph agent architecture "area to understand"` | `structure` (default), `api_surface` |
-| Identify quality risks | `codegraph agent quality "area to assess"` | `complexity`, `coupling`, `hotspots` (all use the quality workflow) |
+## Find a symbol
 
-Examples:
 ```sh
-codegraph agent context "Where is request authentication implemented?" --focus search
-codegraph agent impact "What breaks if token validation changes?" --focus call_chain
-codegraph agent architecture "Describe the public authentication interfaces" --focus api_surface
-codegraph agent quality "Find coupling and hotspots in authentication" --focus coupling
+codegraph query <symbol>                  # exact match first, then prefix matches
+codegraph query <symbol> --callers        # who calls it (incoming `calls` edges)
+codegraph query <symbol> --callees        # what it calls (outgoing `calls` edges)
+codegraph query <symbol> --kind function  # only match this node kind
+codegraph query <symbol> --file src/auth  # only the definition in this file/suffix
 ```
 
 Run from the indexed project root, or pass `--project /path/to/project`. For a custom
-indexed identifier, pass `--project-id ID` or retain `CODEGRAPH_PROJECT_ID`. Existing
-CodeGraph provider/database configuration applies; no running MCP server is needed.
-The binary must be built with `ai-enhanced` (or `full`), and the project must already
-be indexed in SurrealDB. Calls use the configured model and can incur provider costs.
+indexed identifier pass `--project-id ID` (or set `CODEGRAPH_PROJECT_ID`). Use
+`--limit N` to widen or narrow each result section (default 20, clamped to 1..=1000).
+`--kind` matches case-insensitively against `function`, `method`, `struct`, `enum`,
+`trait`, `module`, `import`, `impl`, `variable`, `macro`, `feature`, and similar.
+`--file` accepts an exact path or a path suffix and also scopes `--callers`/`--callees`
+to that exact node.
 
-Stdout is one JSON response with `answer`, `findings`, workflow metadata, and
-`structured_output` when available, matching MCP. Read source locations and risk
-notes from this evidence. `--format text` prints just the answer; use JSON when
-checking warnings and partial results. Logs go to stderr. Runtime failures emit
-`{"error": {...}}` and exit 1; argument errors exit 2. The default command deadline
-is 600 seconds; override with `--timeout-secs N`. Use `--query-file FILE` instead of
-a positional query for long questions, or `--query-file -` to read stdin.
+Output is JSON with the matched definitions plus the requested caller/callee lists.
+Read the reported file and line, then open that source range before editing. The
+graph can lag uncommitted work, so verify against current source.
 
-When CodeGraph is available, start code discovery with a specific agentic question
-including relevant symbols, paths, or the intended change before broad grep/rg searches.
-Check impact before editing. Follow returned file:line locations with targeted reads.
-Verify the answer against current code: an index can lag behind uncommitted work,
-and a successful response can contain a timeout/partial-result warning. If the
-index or service is unavailable, results lack evidence, or a location is already
-known, use ordinary repository tools. Do not install, configure, download models or
-reindex merely because this guidance was injected. Internal graph analysis tools
-are for CodeGraph's built-in agents; use only the four agentic commands above.
+## Plan before you edit
 
-Externalise the design and gate it before editing, and also **while you investigate or
-design** — `plan check` is offline (no DB, no LLM), so it is cheap to iterate on:
+`plan check` is offline (no database, no LLM), so it is cheap to iterate on:
 
 ```sh
-codegraph plan --project . check plan.json     # offline: nodes/edges/constraints
-codegraph plan --project . verify plan.json    # compare with the indexed code graph
-codegraph plan --project . store plan.json --plan-id <id>   # keep it; `show <id>` reloads
+codegraph plan check plan.json                  # offline: nodes/edges/constraints
+codegraph plan verify plan.json                 # compare with the indexed code graph
+codegraph plan store plan.json --plan-id <id>   # keep it; `plan show <id>` reloads
 ```
 
 `plan check` catches undeclared references, layering violations and cycles before the
@@ -61,7 +47,8 @@ code exists. `plan verify` reports `unplanned_code_edges` (dependencies the code
 has that the plan forgot) and `existing_planned_nodes` (symbols you may be re-creating).
 Use it when investigating a multi-module behaviour, designing an approach, adding a
 module, crossing layers, chaining 3+ hops, or changing the public interfaces of 3+ files;
-skip it only for a one-line lookup or a mechanical rename.
+skip it only for a one-line lookup or a mechanical rename. All plan subcommands accept
+`--project <root>`; `--format json` gives machine-readable check/verify output.
 
 A plan file is the entities you believe exist plus how they connect; only `id` is required
 per node, edge `type` defaults to `depends`, and constraints are tagged by `kind`:
@@ -84,34 +71,43 @@ per node, edge `type` defaults to `depends`, and constraints are tagged by `kind
 }
 ```
 
-A partial re-index updates only the scanned scope. Compiler-grade enrichment comes from the
-SCIP index you pass in `CODEGRAPH_SCIP_INDEX`; files the index does not cover stay AST-only.
-Pin the project so the index and the scan agree:
+## Index and check status
 
 ```sh
-CODEGRAPH_SCIP_INDEX=/abs/rust.scip codegraph index crates/codegraph-core \
-  --project-root . --index-tier balanced
+codegraph index .                    # incremental; detects changed files and reuses the cache
+codegraph index . --scip-auto        # also generate and import a SCIP index when a tool is available
+codegraph status                     # MCP server status
+codegraph status --detailed          # provider, database and index state
 ```
 
-`--project-root` (or `CODEGRAPH_PROJECT_ID`) must match the indexed project; the scan
-path stays relative to it.
+**Prefer SCIP over AST-only.** `codegraph index` without a compiler index produces an
+AST-only graph with no definition or reference edges. Generate the index first with
+`scripts/scip-index.sh` (it picks the indexer per language, writes `.codegraph/scip/`
+and prints the value for `CODEGRAPH_SCIP_INDEX`), or let `--scip-auto` do it. A language
+without a SCIP index still parses; there is no language-server fallback. On a large
+repository, run one full pass with a SCIP index and use partial re-indexes for later
+edits: `codegraph index <subdir>` updates only that scope, and `--project-root` pins the
+owning project.
 
 The index tier filters edges, it does not gate enrichment: `fast` drops `Uses`/`References`,
-`balanced` drops `References`, and `full` keeps everything. A supplied SCIP index is imported
-on every tier.
+`balanced` drops `References`, and `full` keeps everything. A supplied SCIP index is
+imported on every tier.
 
-**Prefer SCIP over AST-only.** Generate a compiler index first and pass it via
-`CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`,
-`scip-python index`; comma-separated entries, `path@subdir` when the index was built inside
-a subdirectory). On a 10k-file tree this cut analysis from 21 minutes to 2.4 s plus a 3.9 s
-import, and it contributes definition edges even on `balanced`. `scripts/scip-index.sh`
-generates the ones it knows and prints the value.
+## Compose an analysis yourself
 
-Any language with a SCIP indexer can be enriched, not only those four: CodeGraph parses
-Python natively, so a Python SCIP index contributes its edges too. Generate it with
-`scip-python index --project-name <name> --output <path>` from the project root and do
-**not** add `--cwd` (it produces a ~72-byte empty index); check `wc -c` before importing,
-since a 72-byte file holds zero documents and the import aborts. A language without an index
-gets no compiler enrichment but is still parsed; there is no language-server fallback.
+There is no single "architecture" or "impact" command. Chain the queries and read the
+evidence:
 
-Reload this guidance with `codegraph agent instructions` after context loss.
+- **Understand behavior:** `codegraph query <symbol>` to locate it, read the file, then
+  `codegraph query <symbol> --callers` (and `--callees`) to see how it is wired.
+- **Change impact:** `codegraph query <symbol>` for the definition, then
+  `codegraph query <symbol> --callers` for direct callers, and repeat on those callers
+  for a transitive view.
+- **Architecture / structure:** `codegraph query <module> --kind module` to find the
+  module, then follow `--callers`/`--callees` for its connections; use `plan verify` to
+  check a model of the layout against the graph.
+- **Quality risks:** combine callers/callees with the file locations returned by
+  `codegraph query`, and write a plan over the risky area before changing it.
+
+This guidance is re-emitted by the project-local `SessionStart` / `SubagentStart`
+hooks that `codegraph hooks install` adds.

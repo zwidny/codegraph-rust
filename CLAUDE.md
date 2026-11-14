@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-CodeGraph indexes a codebase into a SurrealDB knowledge graph (AST nodes, edges, chunk embeddings) and serves it to AI clients over MCP as four agentic tools (`agentic_context`, `agentic_impact`, `agentic_architecture`, `agentic_quality`). It is a Rust workspace of 12 crates under `crates/`; the single shipped binary is `codegraph`, built from `crates/codegraph-mcp-server/src/bin/codegraph.rs`.
+CodeGraph indexes a codebase into a SurrealDB knowledge graph (AST nodes, edges, chunk embeddings) and serves it to AI clients over MCP as nine direct graph tools (`semantic_code_search`, `get_reverse_dependencies`, `get_transitive_dependencies`, `trace_call_chain`, `calculate_coupling_metrics`, `detect_circular_dependencies`, `find_complexity_hotspots`, `get_hub_nodes`, `plan_check`). It is a Rust workspace of 11 crates under `crates/`; the single shipped binary is `codegraph`, built from `crates/codegraph-mcp-server/src/bin/codegraph.rs`.
 
 ## Commands
 
@@ -14,7 +14,7 @@ CodeGraph indexes a codebase into a SurrealDB knowledge graph (AST nodes, edges,
 # Fast hygiene pass
 cargo check --workspace
 
-# Build the binary (default features = ["daemon"] only: no agentic tools, no embeddings)
+# Build the binary (default features = ["daemon"] only: no embeddings)
 cargo build --release -p codegraph-mcp-server --bin codegraph --features full
 # What the install scripts do (install-codegraph*.sh):
 cargo install --path crates/codegraph-mcp-server --bin codegraph --all-features --force
@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # what CI
 
 - Makefile targets referring to `codegraph-api`, `high_perf_test/`, or `scripts/` point at things that no longer exist.
 - `docs/TESTING.md` uses feature names (`onnx`, `ollama`, `cloud-jina`, ...) and a `test_mcp_tools.py` that don't match the current tree.
-- `[workspace.metadata.cargo-features]` in the root `Cargo.toml` is documentation only; cargo does not consume it. The real feature flags are on `codegraph-mcp-server` (`ai-enhanced`, `server-http`, `daemon`, `embeddings-*`, `rig-*`, `legacy-agentic-tools`, `full`).
+- `[workspace.metadata.cargo-features]` in the root `Cargo.toml` is documentation only; cargo does not consume it. The real feature flags are on `codegraph-mcp-server` (`ai-enhanced`, `server-http`, `daemon`, `embeddings-*`, `full`). `ai-enhanced` only forwards to `codegraph-mcp/ai-enhanced`; it does not gate MCP tool registration.
 - `docs/README.md` mentions a `codegraph-cache` crate that has been removed.
 
 ### Tests that need external services
@@ -47,7 +47,7 @@ There are no `#[ignore]` tests; DB-dependent tests are gated by env vars and sil
 
 - `crates/codegraph-mcp/tests/graph_tools_smoke.rs` runs only when `CODEGRAPH_SURREALDB_URL` is set (plus optional `CODEGRAPH_SURREALDB_NAMESPACE|DATABASE|USERNAME|PASSWORD`, `CODEGRAPH_EMBEDDING_MODEL`, `CODEGRAPH_EMBEDDING_DIMENSION`), against an already-indexed database.
 - `crates/codegraph-graph/tests/semantic_search_nodes_via_chunks_test.rs` runs only with `CODEGRAPH_RUN_SEMANTIC_SEARCH_NODES_VIA_CHUNKS_TEST=1` (uses in-memory SurrealDB).
-- `test_http_mcp.py` exercises a running HTTP server (`codegraph start http --port 3000`, needs `server-http`).
+- `crates/codegraph-mcp-server/tests/http_server_integration.rs` exercises the HTTP transport in-process (needs `server-http`).
 
 ### Running locally
 
@@ -61,9 +61,9 @@ codegraph start stdio --watch           # MCP server over stdio, with re-index-o
 
 Storage should use a **shared SurrealDB server** (`CODEGRAPH_SURREALDB_URL`, container or self-hosted; apply `schema/codegraph_v2.surql` yourself, the schema is not applied automatically in server mode). Server mode has no per-client file lock: read-only MCP clients and `codegraph index` can run concurrently, and several clients can share one database. Without the URL, `codegraph` falls back to an embedded SurrealKV store at `<project>/.codegraph/db` (`SurrealDbConfig::for_project` in `crates/codegraph-graph/src/surrealdb_storage.rs`), which gets `schema/codegraph_v2.surql` applied on first open; that fallback is **compatibility-only and substantially slower**, and its engine locks the directory, so only one process per project. This repository's `.env` uses the shared mode (`ws://127.0.0.1:8010`, Docker `surrealdb/surrealdb` with SurrealKV), so do not assume the single-writer restriction applies here and do not recommend the embedded store.
 
-Config resolution (`crates/codegraph-core/src/config_manager.rs`): `./.codegraph.toml`, then `~/.codegraph/config.toml`, overridden by `CODEGRAPH_*` env vars. Environment files are layered: `./.env` loads first and `~/.codegraph.env` loads second as a fallback (dotenv never overwrites an already-set variable), so a project `.env` only needs the keys that differ from the machine-wide defaults. Previously the project `.env` suppressed `~/.codegraph.env` entirely; keep that fallback intact. See `.env.example` and `config/example.toml`. The agent's LLM settings (`crates/codegraph-mcp-rig/src/adapter/llm_adapter.rs`) resolve per setting as env var, then the key actually written in `[llm]` (`ConfigManager::explicit_llm_settings`; ignored when `enabled = false`), then a default; API keys are env-only. The loader ignores unknown TOML keys silently, and `[rerank]`, `[performance]`, `[logging]` are parsed but only shown in status output.
+Config resolution (`crates/codegraph-core/src/config_manager.rs`): `./.codegraph.toml`, then `~/.codegraph/config.toml`, overridden by `CODEGRAPH_*` env vars. Environment files are layered: `./.env` loads first and `~/.codegraph.env` loads second as a fallback (dotenv never overwrites an already-set variable), so a project `.env` only needs the keys that differ from the machine-wide defaults. Previously the project `.env` suppressed `~/.codegraph.env` entirely; keep that fallback intact. See `.env.example` and `config/example.toml`. The `[llm]` section is parsed for compatibility but the shipped graph tools do not call an LLM. The loader ignores unknown TOML keys silently, and `[rerank]`, `[performance]`, `[logging]` are parsed but only shown in status output.
 
-Project init runs before application configuration or the async runtime. `project_init.rs` offers Claude/Codex/both/none, reuses existing CodeGraph hooks, validates both guide files and selected settings, then merges owned instruction blocks. `agent_hooks.rs` preserves unrelated project settings and reuses Codex inline TOML hooks without rewriting TOML. `--no-index` stops after setup; otherwise init loads the selected project's `.env` and configuration and uses the normal index command. Explicit `--config` paths stay relative to the invoking directory. This is separate from global `codegraph config init`; no user-level hooks are created. Test with `cargo test -p codegraph-mcp-server --lib` and `cargo test -p codegraph-mcp-server --test project_init_integration --test agent_cli_integration`.
+Project init runs before application configuration or the async runtime. `project_init.rs` offers Claude/Codex/both/none, reuses existing CodeGraph hooks, validates both guide files and selected settings, then merges owned instruction blocks. `agent_hooks.rs` preserves unrelated project settings and reuses Codex inline TOML hooks without rewriting TOML. `--no-index` stops after setup; otherwise init loads the selected project's `.env` and configuration and uses the normal index command. Explicit `--config` paths stay relative to the invoking directory. This is separate from global `codegraph config init`; no user-level hooks are created. Test with `cargo test -p codegraph-mcp-server --lib` and `cargo test -p codegraph-mcp-server --test project_init_integration`.
 
 ## Architecture
 
@@ -74,7 +74,7 @@ Dependencies point downward; do not add upward imports (they create cycles):
 - `codegraph-core`: types, config, `CodeNode`. Everything depends on it.
 - `codegraph-parser` (tree-sitter) and `codegraph-graph` (SurrealDB storage) depend only on core. `codegraph-vector` (embedding providers, reranking) sits on graph.
 - `codegraph-mcp-core`: shared MCP types (`ContextTier`, `AgentArchitecture`), on core only. `codegraph-mcp-tools` (inner graph tools) adds graph + vector.
-- On top of mcp-tools / graph: `codegraph-mcp-rig` (the agent backend, built on the Rig framework) and `codegraph-mcp` (indexer + analyzers). Neither depends on the other.
+- On top of mcp-tools / graph: `codegraph-mcp` (indexer + analyzers).
 - `codegraph-mcp-daemon` (file watching) depends on `codegraph-mcp`.
 - `codegraph-mcp-server` (CLI, stdio/HTTP transports, MCP tool entrypoints) is the only crate that depends on everything.
 - `codegraph-concurrent` and `codegraph-zerocopy` are standalone utility crates.
@@ -133,27 +133,25 @@ Performance and correctness controls are documented in `docs/indexing-performanc
 
 Targeted offline checks include reconciliation/watch tests, `cargo test -p codegraph-mcp --features embeddings --test deferred_policy_test`, `cargo test -p codegraph-graph --features surrealdb --test ingestion_write_test`, parser/vector unit tests and the Python benchmark regressions. Strict workspace Clippy currently fails on existing core/zerocopy diagnostics; do not describe non-strict targeted linting as a strict workspace pass. Debug synthetic measurements do not establish production speedups or live-model quality.
 
-### Flow 2: agentic MCP tools
+### Flow 2: MCP graph tools
 
-`crates/codegraph-mcp-server/src/official_server.rs` exposes the four consolidated tools via a single rmcp `#[tool_router]` (the SDK does not support multiple router blocks, so the deprecated legacy tools are feature-gated by `legacy-agentic-tools` within the same router). Each tool calls `execute_agentic_workflow`, which:
+`crates/codegraph-mcp-server/src/official_server.rs` exposes nine direct tools via a
+single rmcp `#[tool_router]` (the SDK does not support multiple router blocks). Each tool
+validates its parameters, runs the corresponding graph function and returns raw rows:
 
-1. Picks a prompt/step tier from the configured LLM context window (`CODEGRAPH_CONTEXT_WINDOW` → `ContextTier` in `codegraph-mcp-core/src/context_aware_limits.rs`); the same value bounds per-tool result size and accumulated context.
-2. Runs the Rig backend (`codegraph-mcp-rig`), whose builder (`agent/builder.rs`) picks the agent from `CODEGRAPH_AGENT_ARCHITECTURE`: `react` (default, alias `rig`), `lats` (tree search with graph-tool candidate loops and branch-local evidence), or `reflexion`. A failed run is retried through Reflexion.
-3. The agent loops over the inner graph tools in `codegraph-mcp-tools` (`GraphToolSchemas` / `GraphToolExecutor`: transitive deps, reverse deps, cycles, call chains, coupling, hub nodes, semantic search, complexity hotspots).
-4. Those call `fn::*` SurrealQL functions defined in `schema/codegraph.surql`, wrapped by `crates/codegraph-graph/src/graph_functions.rs`.
+1. `semantic_code_search` performs hybrid retrieval and returns `node_id` values.
+2. The node tools (`get_reverse_dependencies`, `get_transitive_dependencies`,
+   `trace_call_chain`, `calculate_coupling_metrics`, `detect_circular_dependencies`,
+   `find_complexity_hotspots`, `get_hub_nodes`) call the same inner graph functions in
+   `codegraph-mcp-tools` (`GraphToolSchemas` / `GraphToolExecutor`).
+3. `plan_check` validates a draft nodes/edges/constraints graph offline; it needs no
+   database.
+4. Those call `fn::*` SurrealQL functions defined in `schema/codegraph.surql`, wrapped by
+   `crates/codegraph-graph/src/graph_functions.rs`.
 
-The agent's system prompt is built in `codegraph-mcp-rig/src/prompts/tier_prompts.rs`, and tool semantics live in the tool descriptions in `codegraph-mcp-rig/src/tools/graph_tools.rs`.
-
-ReAct and LATS register the same eight tools through `GraphToolFactory::agent_builder`.
-LATS retains complete branch transcripts, passes actual observations to its critic,
-and selects a grounded final answer or synthesizes from a grounded leaf. Candidate
-prose, failed calls and exhausted-budget notes cannot establish grounding. Tool
-counts/traces cover all explored branches. Three candidates run per expansion;
-the tier's turn budget bounds expansions/depth and each candidate tool loop, while
-the result-size budget is shared. Offline LATS tests use loopback model mocks and
-temporary graphs; they do not establish live answer accuracy.
-
-The four `codegraph agent` commands in `agent_cli.rs` use a 600-second whole-workflow deadline by default; `--timeout-secs` overrides it. Shared CLI/HTTP evaluation cases in `agentic_test_cases.py` also use 600 seconds, with a longer HTTP stream-read allowance. Historical accuracy reports retain their original budgets. Distinguish model-response stalls from graph-call failures when diagnosing timeouts.
+There is no server-side agent, prompt tier or model call in this path. The former Rig
+backend and its tier prompts were removed in v0.3.0; historical design notes remain in
+`docs/AGENT_PROMPT_TIERS.md` and `docs/architecture/agent-memory-design.md`.
 
 ### Schema
 
@@ -175,25 +173,24 @@ commands below using your Bash or shell execution tool. Check that CodeGraph is
 on PATH with `command -v codegraph`.
 
 When CodeGraph is available and the project is indexed, start code exploration
-with its CLI agent commands. Ask a specific question about the task, relevant
-symbols or paths instead of starting with broad grep/rg searches:
+with a direct graph query instead of a broad grep/rg search:
 
-- `codegraph agent context "Find the implementation and callers for <task>" --focus search`
-  locates code; use `--focus builder` to gather implementation context or `question`
-  to explain behavior.
-- `codegraph agent impact "What depends on <symbol> and what would <change> affect?"`
-  checks dependencies before editing; `--focus call_chain` follows call flows.
-- `codegraph agent architecture "Describe <area> and its interfaces"`
-  maps structure; `--focus api_surface` inspects public interfaces.
-- `codegraph agent quality "Assess coupling, complexity and risks in <area>"`
-  supports refactoring decisions and targeted follow-up checks.
+- `codegraph query <symbol>` locates a definition; add `--callers` (who calls it),
+  `--callees` (what it calls), `--kind function|struct|...` or `--file <path>` to
+  narrow the results.
+- `codegraph plan check <file>` validates a draft node/edge graph offline;
+  `codegraph plan verify <file>` compares it with the indexed code graph.
+- `codegraph index .` re-indexes incrementally (`--scip-auto` also generates and
+  imports a SCIP index); `codegraph status` reports server/provider/database state.
+
+There is **no `agent` subcommand**. For a synthesized answer, compose these
+queries yourself and read the returned source locations.
 
 Run from the indexed project root, or append `--project /path/to/project`; retain
 the indexed `--project-id` if one was configured. Prefer the default JSON output:
-inspect source locations, findings and partial-result warnings, then read the
-specific files/lines before editing. Reuse useful findings and narrow follow-up
-questions rather than repeating broad queries. After changes, verify against
-current source and run relevant tests; the index may lag uncommitted work.
+inspect source locations, then read the specific files/lines before editing. After
+changes, verify against current source and run relevant tests; the index may lag
+uncommitted work.
 
 If CodeGraph is unavailable, the project is not indexed, a command fails or returns
 insufficient evidence, fall back to targeted source reads and rg/grep.
@@ -219,7 +216,5 @@ Decide by what you hold, not by how fast grep feels:
   location, name the CodeGraph call that preceded them.
 
 Do not install CodeGraph, download models or reindex solely to satisfy these
-instructions. Agent queries use the configured model and may incur provider costs.
-Use the four public agent commands; internal graph tools belong to CodeGraph's
-built-in agents. Reload usage details with `codegraph agent instructions`.
+instructions.
 <!-- codegraph:end -->

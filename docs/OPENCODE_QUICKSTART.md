@@ -1,7 +1,7 @@
 # CodeGraph × OpenCode 快速接入指南
 
 面向「新电脑 / 新项目」的端到端流程：装好 CodeGraph，索引一个项目，并让 OpenCode
-通过 MCP 用上 13 个图工具。
+通过 MCP 用上 9 个图工具。
 
 > 本文只讲接入与验证。性能调优见 [README_DEV_GUIDE](../README_DEV_GUIDE.md)，
 > 完整参数见 [INSTALLATION_GUIDE](INSTALLATION_GUIDE.md)。
@@ -56,7 +56,7 @@ command -v codegraph
 
 发布产物用 `cargo build --release --features full`（fat LTO），由 `.github/workflows/release.yml` 执行。
 
-`--features full` 才有 agent、embedding 与 HTTP 能力。
+`--features full` 才有完整的 embedding 与 HTTP 能力。
 
 compiler 级富化是可选的 SCIP 索引，不再依赖语言服务器。用 `scripts/scip-index.sh`
 生成并导出，未提供索引的语言保持 AST-only：
@@ -157,16 +157,16 @@ opencode mcp list        # 期望 codegraph  connected
 #    本地 .codegraph/db 只在显式 surrealkv:// 的 embedded 模式下才存在
 echo "${CODEGRAPH_SURREALDB_URL:-ws://127.0.0.1:8000 (default)}"
 
-# 2) 直连查询（无 LLM，秒级）；与 index/agent 读同一套存储，不会私自退回本地 .codegraph/db
+# 2) 直连查询（无 LLM，秒级）；与 index 读同一套存储，不会私自退回本地 .codegraph/db
 codegraph query <真实符号> --callers
 
-# 3) agent 查询（20–60 秒，需 LLM 配置）
-codegraph agent context "Where is configuration loaded?" --focus search
+# 3) 计划校验（离线，无 DB / 无 LLM）
+codegraph plan check plan.json
 
 # 4) OpenCode 的 MCP 连接
 opencode mcp list        # 期望 codegraph  connected
 #    然后在 OpenCode 里让 agent 调一次 semantic_code_search，能返回 node_id 即通
-#    可用工具应为 13 个：8 个直连图工具 + 4 个 agentic_* + plan_check（校验草稿逻辑图）
+#    可用工具应为 9 个：8 个直连图工具 + plan_check（校验草稿逻辑图）
 ```
 
 `semantic_code_search` 返回的 `node_id` 要原样使用（`nodes:<uuid>`，含反引号与前缀）。

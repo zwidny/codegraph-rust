@@ -3,7 +3,7 @@
 #
 # Usage:
 #   uv sync              # Install dependencies with uv
-#   uv run python3 test_agentic_tools.py
+#   uv run python3 -c "import mcp"
 #
 # Or traditional pip:
 #   pip install -r requirements-test.txt

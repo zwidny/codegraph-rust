@@ -77,7 +77,7 @@ pub fn run(command: &HookCommand) -> Result<()> {
                 .is_ok()
                 && input.len() as u64 <= MAX_HOOK_INPUT_BYTES
             {
-                hook_response(&input, cfg!(feature = "ai-enhanced"))
+                hook_response(&input)
             } else {
                 json!({})
             };
@@ -88,10 +88,7 @@ pub fn run(command: &HookCommand) -> Result<()> {
 }
 
 /// Produce only guidance; never evaluate prompts, tool arguments, or transcript paths.
-pub fn hook_response(input: &str, agentic_available: bool) -> Value {
-    if !agentic_available {
-        return json!({});
-    }
+pub fn hook_response(input: &str) -> Value {
     let Ok(input) = serde_json::from_str::<HookInput>(input) else {
         return json!({});
     };
@@ -107,7 +104,7 @@ pub fn hook_response(input: &str, agentic_available: bool) -> Value {
             // Quote for the POSIX shell used by the installed hook command.
             let quoted_root = format!("'{}'", root.to_string_lossy().replace('\'', "'\\''"));
             instructions.push_str(&format!(
-                "\nSession project root: {}. When calling from a subdirectory, append `--project {quoted_root}` to each agentic command.\n",
+                "\nSession project root: {}. When calling from a subdirectory, append `--project {quoted_root}` to each codegraph command.\n",
                 root.display()
             ));
         }
@@ -361,24 +358,20 @@ mod tests {
     #[test]
     fn guidance_is_restored_for_sessions_and_subagents_without_blocking() {
         for event in ["SessionStart", "SubagentStart"] {
-            let output = hook_response(&json!({"hook_event_name": event}).to_string(), true);
+            let output = hook_response(&json!({"hook_event_name": event}).to_string());
             assert_eq!(output["hookSpecificOutput"]["hookEventName"], event);
             let context = output["hookSpecificOutput"]["additionalContext"]
                 .as_str()
                 .unwrap();
-            for command in ["context", "impact", "architecture", "quality"] {
-                assert!(context.contains(&format!("codegraph agent {command}")));
-            }
+            assert!(context.contains("codegraph query"));
+            assert!(context.contains("codegraph plan check"));
+            assert!(!context.contains("agent context"));
             assert!(output.get("decision").is_none());
             assert!(output.get("continue").is_none());
         }
         for input in ["not json", "{}", r#"{"hook_event_name":"PreToolUse"}"#] {
-            assert_eq!(hook_response(input, true), json!({}));
+            assert_eq!(hook_response(input), json!({}));
         }
-        assert_eq!(
-            hook_response(r#"{"hook_event_name":"SessionStart"}"#, false),
-            json!({})
-        );
     }
 
     #[test]
@@ -436,7 +429,6 @@ mod tests {
         let output = hook_response(
             &json!({"hook_event_name": "SessionStart", "cwd": project.path().join("nested")})
                 .to_string(),
-            true,
         );
         let root = project.path().canonicalize().unwrap();
         assert!(

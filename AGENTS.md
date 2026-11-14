@@ -10,13 +10,13 @@
 
 | 问题类型 | 首个调用 |
 |---|---|
-| 这项目 / 仓库是干什么的 | `agentic_architecture` 或 `agentic_context` |
+| 这项目 / 仓库是干什么的 | `get_hub_nodes` + `semantic_code_search` 读入口 |
 | 入口在哪 / `main` 在哪 | `semantic_code_search` |
-| 架构如何 / 有哪些模块 / 怎么分层 | `get_hub_nodes` + `agentic_architecture` |
+| 架构如何 / 有哪些模块 / 怎么分层 | `get_hub_nodes` + `detect_circular_dependencies` |
 | 某功能 / 概念在哪实现 | `semantic_code_search` |
 | 谁调用 X / 改 X 影响什么 | `get_reverse_dependencies` |
 | 从 X 出发的调用链 | `trace_call_chain` |
-| 复杂度 / 耦合 / 风险 | `find_complexity_hotspots` / `agentic_quality` |
+| 复杂度 / 耦合 / 风险 | `find_complexity_hotspots` + `calculate_coupling_metrics` |
 
 **违规示例**（出现即视为违反本节）：
 
@@ -58,7 +58,7 @@
 **每轮自检**：本轮有没有 `read` / `grep` / `ls` / `glob` 命中源码位置？
 如果有，本轮的 codegraph 调用是哪一次？答不上来即为违规。
 
-### 工具选择（13 个）
+### 工具选择（9 个）
 
 **直连图工具（0.3–1.3 秒，无 LLM）** —— 优先用这一层：
 
@@ -79,14 +79,13 @@
 1. `node_id` 必须原样使用 `semantic_code_search` 返回的 ``nodes:`uuid` ``——保留反引号和前缀，不要自己拼
 2. `edge_type` 只能是：`calls` `defines` `uses` `imports` `extends` `implements` `contains` `references`
 
-**`agentic_*`（55 秒–2.5 分钟）** —— 只在需要「跨证据综合解释」时用，不要拿它做单符号查找：
-`agentic_context` · `agentic_impact` · `agentic_architecture` · `agentic_quality`
+**没有服务器端 agent / LLM 综合分析工具** —— 需要综合结论时，自己组合上面的直连工具并读回 `file:line`。
 
 **CLI 等价物（MCP 不可用时）**：
 
 ```bash
 codegraph query <symbol> --callers              # 对应直连工具，3–5s
-codegraph agent context "..." --focus search    # 对应 agentic，22s+
+codegraph plan check plan.json                  # 离线校验草稿逻辑图
 codegraph index . -r --index-tier balanced --languages rust
 ```
 
@@ -162,7 +161,7 @@ docker ps --filter name=codegraph-db --format '{{.Status}}'   # 服务态
 
 ## Project Structure & Module Organization
 
-CodeGraph is a Rust 2024 workspace (Rust 1.95 or newer) that indexes code into a SurrealDB knowledge graph and exposes MCP and CLI agent tools. Source lives in `crates/codegraph-*/src/`: `core` holds shared types/configuration and artifact caching, `parser` captures sources and extracts syntax, `mcp` reconciles indexing and runs analyzers, `graph` handles storage, and `vector` provides embeddings/search. The CLI is `crates/codegraph-mcp-server/src/bin/codegraph.rs`; the agent backend lives in `codegraph-mcp-rig`.
+CodeGraph is a Rust 2024 workspace (Rust 1.95 or newer) that indexes code into a SurrealDB knowledge graph and exposes it over MCP as 9 direct graph tools plus the CLI. Source lives in `crates/codegraph-*/src/`: `core` holds shared types/configuration and artifact caching, `parser` captures sources and extracts syntax, `mcp` reconciles indexing and runs analyzers, `graph` handles storage, and `vector` provides embeddings/search. The CLI is `crates/codegraph-mcp-server/src/bin/codegraph.rs`.
 
 Unit tests sit alongside modules; integration tests use each crate's `tests/`. Schemas live in `schema/`, configuration examples in `config/`, documentation in `docs/`, and images in `docs/assets/`.
 
@@ -199,7 +198,7 @@ Underlying commands, for reference only (all of the above already wrap them):
 - `cargo build --release --features full`: published-artifact profile only (fat LTO); `.github/workflows/release.yml` uses it.
 - `./target/debug/codegraph start stdio`: run the built MCP server after configuring providers. A shared server is the default target (`ws://127.0.0.1:8000`) and needs `schema/codegraph_v2.surql` applied; only an explicit `surrealkv://` URL opens an embedded per-project store, which applies the bundled v2 schema automatically. Respect `CARGO_TARGET_DIR` when locating binaries.
 - `cargo test -p codegraph-mcp`: test the indexing crate; use `cargo test --workspace` for all crates.
-- `cargo test -p codegraph-mcp-server --lib` and `cargo test -p codegraph-mcp-server --test project_init_integration --test agent_cli_integration`: verify project setup, hook preservation and CLI contracts without live providers.
+- `cargo test -p codegraph-mcp-server --lib` and `cargo test -p codegraph-mcp-server --test project_init_integration`: verify project setup, hook preservation and CLI contracts without live providers.
 - `cargo fmt --all -- --check`: verify formatting; omit `-- --check` to format. `make fmt-check` / `make fmt` wrap these.
 
 ## Coding Style & Naming Conventions
@@ -274,20 +273,11 @@ Follow the history's Conventional Commit pattern, e.g. `fix(lsp): prevent premat
 
 Use `.env.example` and `config/example.toml` as references. Keep credentials in ignored local configuration; never commit API keys or database passwords.
 
-`codegraph init [project]` selects project-local Claude/Codex hooks before merging both agent instruction files and indexing. `--hooks claude|codex|both|none` supports scripts; `--no-index` performs provider-independent setup. Keep user-level settings untouched, preserve unrelated hooks/instructions, and retain idempotent managed blocks. See [init and CLI usage](docs/AGENTIC_CLI.md).
+`codegraph init [project]` selects project-local Claude/Codex hooks before merging both agent instruction files and indexing. `--hooks claude|codex|both|none` supports scripts; `--no-index` performs provider-independent setup. Keep user-level settings untouched, preserve unrelated hooks/instructions, and retain idempotent managed blocks. See [init and CLI usage](docs/USAGE_GUIDE.md#cli-access-for-code-agents).
 
-The four CLI agent commands have a 600-second whole-workflow deadline, including setup, graph calls and model responses; preserve explicit `--timeout-secs` overrides. CLI/HTTP evaluation cases share that budget, and the HTTP stream-read limit must accommodate it. Keep historical accuracy entries tied to their recorded deadlines; offline fixtures do not establish live answer accuracy.
-
-ReAct and LATS share the eight-tool registration in
-`codegraph-mcp-rig/src/tools/factory.rs`. LATS candidates execute native tool loops,
-retain branch-local transcripts and supply actual observations to the critic.
-Never treat candidate prose, failed tools or exhausted-budget notes as graph
-grounding, or return a root-level intermediate step in place of the selected
-answer. Preserve shared result budgets, project-scoped caching, tool counts and
-traces across candidates. The tier's turn budget bounds search expansions/depth
-and each candidate loop, rather than the whole tree's model-call count. Verify
-with `cargo test -p codegraph-mcp-rig --all-features --lib` and the full-feature
-`agent_cli_integration` mock tests before making runtime accuracy claims.
+There is no server-side agent or agent CLI any more. The former whole-workflow
+deadlines and CLI/HTTP evaluation cases were removed with the agent in v0.3.0;
+historical accuracy records stay in `docs/evaluations/`.
 
 > **以下 `codegraph:begin/end` 块由 `codegraph init` 自动维护**，只讲 CLI 用法。
 > 它与上文「探索协议」重复，**冲突时以本节上方的探索协议为准**（那里是 MCP 工具，更快）。
@@ -301,25 +291,24 @@ commands below using your Bash or shell execution tool. Check that CodeGraph is
 on PATH with `command -v codegraph`.
 
 When CodeGraph is available and the project is indexed, start code exploration
-with its CLI agent commands. Ask a specific question about the task, relevant
-symbols or paths instead of starting with broad grep/rg searches:
+with a direct graph query instead of a broad grep/rg search:
 
-- `codegraph agent context "Find the implementation and callers for <task>" --focus search`
-  locates code; use `--focus builder` to gather implementation context or `question`
-  to explain behavior.
-- `codegraph agent impact "What depends on <symbol> and what would <change> affect?"`
-  checks dependencies before editing; `--focus call_chain` follows call flows.
-- `codegraph agent architecture "Describe <area> and its interfaces"`
-  maps structure; `--focus api_surface` inspects public interfaces.
-- `codegraph agent quality "Assess coupling, complexity and risks in <area>"`
-  supports refactoring decisions and targeted follow-up checks.
+- `codegraph query <symbol>` locates a definition; add `--callers` (who calls it),
+  `--callees` (what it calls), `--kind function|struct|...` or `--file <path>` to
+  narrow the results.
+- `codegraph plan check <file>` validates a draft node/edge graph offline;
+  `codegraph plan verify <file>` compares it with the indexed code graph.
+- `codegraph index .` re-indexes incrementally (`--scip-auto` also generates and
+  imports a SCIP index); `codegraph status` reports server/provider/database state.
+
+There is **no `agent` subcommand**. For a synthesized answer, compose these
+queries yourself and read the returned source locations.
 
 Run from the indexed project root, or append `--project /path/to/project`; retain
 the indexed `--project-id` if one was configured. Prefer the default JSON output:
-inspect source locations, findings and partial-result warnings, then read the
-specific files/lines before editing. Reuse useful findings and narrow follow-up
-questions rather than repeating broad queries. After changes, verify against
-current source and run relevant tests; the index may lag uncommitted work.
+inspect source locations, then read the specific files/lines before editing. After
+changes, verify against current source and run relevant tests; the index may lag
+uncommitted work.
 
 If CodeGraph is unavailable, the project is not indexed, a command fails or returns
 insufficient evidence, fall back to targeted source reads and rg/grep.
@@ -345,9 +334,7 @@ Decide by what you hold, not by how fast grep feels:
   location, name the CodeGraph call that preceded them.
 
 Do not install CodeGraph, download models or reindex solely to satisfy these
-instructions. Agent queries use the configured model and may incur provider costs.
-Use the four public agent commands; internal graph tools belong to CodeGraph's
-built-in agents. Reload usage details with `codegraph agent instructions`.
+instructions.
 <!-- codegraph:end -->
 
 ### 何时用 `plan_check` / `plan`（思考、调研、设计、写代码前）

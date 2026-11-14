@@ -1,5 +1,7 @@
 # Agent memory: design
 
+> v0.3.0 removed the rig agent and the agent CLI commands; this document is kept as historical design context.
+
 Status: proposal, not implemented. This records the design agreed in October 2026 so it can
 be iterated on. Decisions are marked as such; open questions are listed at the end.
 
@@ -29,7 +31,7 @@ Consequences:
   with the project's configured embedding model.
 - No session correlation is attempted. A memory is what the agent chose to say, at the time it
   said it.
-- The agentic tools (`agentic_context` and friends) do not return memories. The using agent's
+- The removed agent tools (including the former context tool) do not return memories. The using agent's
   context already contains what it has been doing; it asks for memories when it wants them.
 
 ## Non-goals (decided)

@@ -236,6 +236,6 @@ compare the plan with existing code use the CLI
 4. Once the project is indexed, run
    `codegraph plan --project <root> verify <file>` and resolve
    `unplanned_code_edges` / `existing_planned_nodes` before writing code.
-5. Map draft nodes to real anchors with `codegraph query` / `codegraph agent`.
+5. Map draft nodes to real anchors with `codegraph query`.
 6. Implement, re-index, then verify the real graph (`--callers`, `trace_call_chain`)
    before `codegraph plan drop <id>`.

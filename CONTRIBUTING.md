@@ -37,12 +37,13 @@ cargo fmt
 - Runtime config loader (TOML + `.env` + env overrides): `crates/codegraph-core/src/config_manager.rs`
 - Provider-specific config structs: `crates/codegraph-core/src/config_manager.rs` and `crates/codegraph-core/src/rerank_config.rs`
 
-### Built-in agent (agentic MCP tools)
+### MCP graph tools
 
 - MCP server and tool entrypoints: `crates/codegraph-mcp-server/src/official_server.rs`
-- Agent system prompt (per tier and analysis type): `crates/codegraph-mcp-rig/src/prompts/tier_prompts.rs`
-- Graph tool descriptions the agent reads: `crates/codegraph-mcp-rig/src/tools/graph_tools.rs`
-- Agent LLM provider, model and endpoint resolution: `crates/codegraph-mcp-rig/src/adapter/llm_adapter.rs`
+- Inner graph tools and their schemas: `crates/codegraph-mcp-tools/src/`
+- Plan validation: `crates/codegraph-mcp-server/src/plan_cli.rs` and the `plan_check` tool
+- The former Rig agent backend was removed in v0.3.0; there is no server-side prompt or
+  LLM provider path any more.
 
 ## Adding a new language
 

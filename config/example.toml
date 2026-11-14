@@ -34,11 +34,12 @@ top_n = 10                             # results retained after reranking
 # model = "dengcao/Qwen3-Reranker-8B:Q3_K_M"
 # api_base = "http://localhost:11434"
 
-# LLM for the agentic tools. Each key is used unless the matching environment variable
-# is set: CODEGRAPH_LLM_PROVIDER, CODEGRAPH_LLM_MODEL, CODEGRAPH_CONTEXT_WINDOW.
+# LLM settings are parsed for compatibility only: no CodeGraph feature calls a model.
+# Each key is read unless the matching environment variable is set:
+# CODEGRAPH_LLM_PROVIDER, CODEGRAPH_LLM_MODEL, CODEGRAPH_CONTEXT_WINDOW.
 # API keys are read from the environment only (ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY).
 [llm]
-enabled = true                         # false makes the agent ignore this whole section
+enabled = true                         # parsed only; nothing in CodeGraph consults this
 provider = "ollama"                    # ollama | lmstudio | anthropic | openai | xai | openai-compatible
 model = "qwen2.5-coder:14b"
 context_window = 32768                 # your model's real token limit; selects the prompt tier

@@ -287,9 +287,9 @@ codegraph index . -r --exclude vendor --exclude target
 
 | 入口 | 延迟 | 适用 |
 |---|---|---|
-| **MCP 直连图工具（8 个）** | **0.3–1.3s** | 日常：找代码、调用者、依赖、热点 |
+| **MCP 直连图工具（9 个）** | **0.3–1.3s** | 日常：找代码、调用者、依赖、热点、计划校验 |
 | `codegraph query`（CLI） | 3–5s | 脚本、无 MCP 时 |
-| `codegraph agent *` / MCP `agentic_*` | **55s–2.5min** | 需要跨证据综合解释的问题 |
+| `codegraph plan check`（CLI） | <1s | 离线校验草稿逻辑图 |
 
 ### 5.2 `codegraph query`（CLI 直连）
 
@@ -302,7 +302,7 @@ codegraph query reconcile_catalog --callers --limit 50
 
 ### 5.3 MCP 直连图工具（推荐）
 
-8 个工具见 §6.2。典型编排：
+9 个工具见 §6.2。典型编排：
 
 ```
 semantic_code_search("概念")                    → node_id + file:line
@@ -314,29 +314,22 @@ trace_call_chain(node_id,3)                     → 调用链
 `node_id` 必须原样使用 `semantic_code_search` 返回的 ``nodes:`uuid` ``（含反引号与前缀）。
 `edge_type` 取值：`calls` `defines` `uses` `imports` `extends` `implements` `contains` `references`。
 
-### 5.4 agent 命令（慢，但能综合）
+### 5.4 自己组合工具（无 agent / 无 LLM）
+
+v0.3.0 移除了服务器端 agent 与对应 CLI 命令。需要“架构/影响面”这类综合结论时，
+自己串联直连工具并读回 `file:line`：
 
 ```bash
-codegraph agent context "Where is build_chunk_plan implemented?" --focus search
-codegraph agent impact  "What breaks if config precedence changes?" --focus call_chain
-codegraph agent architecture "Describe the indexer interfaces"    --focus api_surface
-codegraph agent quality "Coupling risks in the parser"            --focus coupling
-```
-
-实测成本：
-
-```
---focus search       ≈ 9 步   22 秒（CLI）/ 55 秒（MCP，进程常驻但仍走 LLM）
---focus dependencies ≈ 35 步  38 秒
---focus question     可能触发 MaxTurnsError(8 轮上限)，REFLEXION 重试 ×3
+codegraph query build_chunk_plan --callers        # 直接调用者
+codegraph query build_chunk_plan --callees        # 它调用谁
+codegraph plan check plan.json                    # 离线校验草稿图
+codegraph plan verify plan.json                   # 与已索引图对比
 ```
 
 ### 5.5 输出约定
 
-默认 JSON：`analysis_type` / `answer` / `findings` / `steps_taken` / `tool_use_count`。
-
-`OK` 只表示拿到了答案，**不代表准确**——必须打开 `findings` 里的位置核对源码。
-行号通常有 1–2 行偏差。
+默认 JSON：符号、位置、边类型、`content` 片段。工具结果只是证据，**不代表准确**——
+必须打开返回的 `file:line` 核对源码。行号通常有 1–2 行偏差。
 
 ---
 
@@ -377,7 +370,7 @@ opencode mcp list            # 期望 codegraph  connected
 
 > 注意：`opencode mcp add --global` 写入的是 `mcp.servers`（正确结构），但写到全局会触发多实例问题。用项目级文件手写最稳。
 
-### 6.2 13 个工具
+### 6.2 9 个工具
 
 **8 个直连图工具（无 LLM，0.3–1.3s）**
 
@@ -392,16 +385,13 @@ opencode mcp list            # 期望 codegraph  connected
 | `find_complexity_hotspots` | — | 复杂度热点 |
 | `get_hub_nodes` | — | 高中心度节点 |
 
-**1 个计划校验工具（无 LLM、无 DB）**
+**（无 LLM、无 DB）的计划校验**
 
 | 工具 | 必填参数 | 用途 |
 |---|---|---|
 | `plan_check` | `plan`（含 `nodes`/`edges`/`constraints` 的对象） | 校验尚未落地的草稿逻辑图：环、覆盖、分层、悬空引用、扇入/扇出 |
 
-**4 个 agentic 工具（LLM 工作流，55s–2.5min）**
-
-`agentic_context` / `agentic_impact` / `agentic_architecture` / `agentic_quality`
-—— 只在需要「跨证据综合解释」时使用。
+没有服务器端 agent / LLM 综合分析工具；需要综合结论时自己组合上面的直连工具。
 
 ### 6.3 内置使用说明（instructions）
 
@@ -410,7 +400,7 @@ MCP 在 `initialize` 时下发 `initial_instructions.md`（约 8.7KB），包含
 - 直连工具表 + 参数
 - **`node_id` 从哪来**（必须原样用 ``nodes:`uuid` ``）
 - `edge_type` 的 8 个合法值
-- 4 个推荐 workflow（改前影响面、调试、架构巡览、何时用 agentic）
+- 4 个推荐 workflow（理解行为、改动影响、架构巡览、质量风险）
 - 何时回退到文件读取
 
 更新该文件后需重新编译并重启 opencode（MCP 每次 initialize 读取）。

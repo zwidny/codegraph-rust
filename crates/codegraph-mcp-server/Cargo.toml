@@ -11,20 +11,8 @@ path = "src/lib.rs"
 
 [features]
 default = ["daemon", "postgres"]
-ai-enhanced = [
-    "codegraph-mcp-rig",
-    "codegraph-mcp/ai-enhanced",
-    "all-rig-providers"
-]
-# Enable legacy 8 agentic tools (deprecated, use consolidated tools instead)
-legacy-agentic-tools = []
+ai-enhanced = ["codegraph-mcp/ai-enhanced"]
 server-http = ["dep:axum", "dep:hyper", "dep:tower", "dep:http-body-util", "dep:tokio-util"]
-# Rig agent provider features
-rig-openai = ["codegraph-mcp-rig/openai"]
-rig-anthropic = ["codegraph-mcp-rig/anthropic"]
-rig-ollama = ["codegraph-mcp-rig/ollama"]
-rig-xai = ["codegraph-mcp-rig/xai"]
-all-rig-providers = ["rig-openai", "rig-anthropic", "rig-ollama", "rig-xai"]
 embeddings = ["codegraph-mcp-tools/embeddings", "codegraph-mcp/embeddings"]
 embeddings-ollama = ["embeddings", "codegraph-mcp/embeddings-ollama"]
 embeddings-openai = ["embeddings", "codegraph-mcp/embeddings-openai"]
@@ -45,7 +33,6 @@ postgres = ["codegraph-mcp/postgres"]
 surrealdb = [
     "codegraph-mcp/surrealdb",
     "codegraph-mcp-tools/surrealdb",
-    "codegraph-mcp-rig/surrealdb",
     "codegraph-vector/surrealdb",
     "codegraph-graph/surrealdb",
     "dep:surrealdb",
@@ -61,7 +48,6 @@ full = [
 [dependencies]
 codegraph-mcp-core = { path = "../codegraph-mcp-core" }
 codegraph-mcp-tools = { path = "../codegraph-mcp-tools" }
-codegraph-mcp-rig = { path = "../codegraph-mcp-rig", optional = true }
 codegraph-mcp-daemon = { path = "../codegraph-mcp-daemon", optional = true }
 codegraph-core = { path = "../codegraph-core" }
 codegraph-graph = { path = "../codegraph-graph" }

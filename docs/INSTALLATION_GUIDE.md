@@ -11,7 +11,7 @@ This guide covers installing CodeGraph and setting up a project. The short versi
 5. [Indexing Your Codebase](#indexing-your-codebase)
 6. [Running the MCP Server](#running-the-mcp-server)
 7. [Daemon Mode](#daemon-mode)
-8. [Using Agentic Tools](#using-agentic-tools)
+8. [Using the Graph Tools](#using-the-graph-tools)
 9. [Optional: Using a SurrealDB Server](#optional-using-a-surrealdb-server)
 10. [Troubleshooting](#troubleshooting)
 
@@ -22,10 +22,11 @@ This guide covers installing CodeGraph and setting up a project. The short versi
 - `start` / `stop` / `status` — manage the MCP server transports (stdio/http)
 - `init` — choose project-local Claude/Codex hooks, merge agent instructions, then index
 - `index` — index a project (supports `--force`, language filters, watch mode)
-- `agent` — run context/impact/architecture/quality tools or print CLI instructions
+- `query` — fast direct graph query (symbol, callers, callees)
+- `plan` — validate a draft plan offline, verify it against the graph, or store it
 - `hooks` — install project-local guidance hooks or emit lifecycle context
 - `estimate` — estimate indexing time/cost without persisting
-- `config` — init/show/set/get/validate configuration; agent-status/db-check live here
+- `config` — init/show/set/get/validate configuration; db-check lives here
 - `db-check` — opens the project's store (creating it with the bundled schema if new) and reports the target
 - `daemon` — (feature-gated) file-watch daemon control
 
@@ -34,7 +35,7 @@ Legacy helper commands (`code`, `test`, `perf`, `stats`, `clean`) are no longer 
 For first-time project setup, run `codegraph init /path/to/project`. It offers Claude,
 Codex, both or none before updating project `AGENTS.md`/`CLAUDE.md` and indexing.
 Scripts should pass `--hooks claude|codex|both|none`; `--no-index` performs setup only.
-See [project initialization](AGENTIC_CLI.md#project-initialization) for preservation,
+See [project initialization](USAGE_GUIDE.md#cli-access-for-code-agents) for preservation,
 existing-hook detection and provider prerequisites.
 
 For HTTP deployments, MCP 3 validates the request's `Host` header. Loopback hosts
@@ -47,7 +48,7 @@ allowlist, for example `CODEGRAPH_HTTP_ALLOWED_HOSTS=localhost,codegraph.example
 ## Prerequisites
 
 - **Rust 1.95 or newer** - The workspace uses Rust edition 2024. Install from [rustup.rs](https://rustup.rs).
-- **A model provider** for embeddings and for the agentic tools: [Ollama](https://ollama.com) or LM Studio locally, or an API key for Anthropic, OpenAI, xAI or Jina. See `docs/AI_PROVIDERS.md`.
+- **A model provider** for embeddings: [Ollama](https://ollama.com) or LM Studio locally, or an API key for OpenAI or Jina. See `docs/AI_PROVIDERS.md`. The graph tools do not require an LLM.
 - **macOS** for the installer scripts (Linux users can run the `cargo install` command directly). The scripts use Homebrew.
 
 A shared SurrealDB 3.x server is the supported deployment: run one with Docker or a container
@@ -80,10 +81,8 @@ This script:
 
 The full-features build includes:
 - All embedding providers (Ollama, LM Studio, Jina AI, OpenAI, ONNX)
-- All LLM providers (Anthropic, OpenAI, xAI Grok, Ollama, LM Studio)
 - Daemon mode (file watching & auto re-indexing)
 - HTTP server with SSE streaming
-- Rig agent framework with all providers
 
 ### Manual Build (Alternative)
 
@@ -117,7 +116,7 @@ codegraph init /path/to/project --hooks both --index-tier balanced --workers 4
 codegraph init /path/to/project --hooks none --no-index   # hooks/instructions only; no providers, no database
 ```
 
-After init, connect your client (see [Running the MCP Server](#running-the-mcp-server)) or use the CLI directly (`codegraph agent context "..."`). Details on hook detection, file preservation and validation are in [project initialization](AGENTIC_CLI.md#project-initialization).
+After init, connect your client (see [Running the MCP Server](#running-the-mcp-server)) or query the graph from the shell with `codegraph query <symbol>`. Details on hook detection, file preservation and validation are in [the usage guide](USAGE_GUIDE.md#cli-access-for-code-agents).
 
 What init does not do: it does not create global configuration (`codegraph config init` does), choose or install models, or touch user-level harness settings.
 
@@ -147,7 +146,7 @@ ollama_url = "http://localhost:11434"
 # lmstudio_url = "http://localhost:1234"
 
 [llm]
-enabled = true                         # false makes the agent ignore this section
+enabled = false                        # retained for config compatibility; the graph tools do not call an LLM
 provider = "ollama"                    # ollama | anthropic | openai | xai | lmstudio | openai-compatible
 model = "qwen2.5-coder:14b"
 context_window = 32768                 # your model's real limit; selects the prompt tier
@@ -170,7 +169,9 @@ level = "info"
 
 Storage has no config-file section: `codegraph` connects to a shared server at `ws://127.0.0.1:8000` by default, or to `CODEGRAPH_SURREALDB_URL` (plus the `CODEGRAPH_SURREALDB_*` variables) when set. The embedded per-project store is opt-in through a `surrealkv://` URL; it is a compatibility fallback that is substantially slower and single-writer.
 
-The built-in agent resolves each LLM setting in three steps: the environment variable (a project `.env` counts), then the key in the config file's `[llm]` section, then a default. `enabled = false` in `[llm]` makes the agent ignore the section, and API keys are read from the environment only. `codegraph config agent-status` shows the provider, model and tier in effect; [AI_PROVIDERS.md](AI_PROVIDERS.md) lists every variable and key.
+The `[llm]` section is parsed for configuration compatibility, but the shipped MCP and
+CLI graph tools do not call an LLM. [AI_PROVIDERS.md](AI_PROVIDERS.md) lists every variable
+and key.
 
 ### Environment variables and `.env`
 
@@ -185,12 +186,6 @@ The variables most setups need:
 CODEGRAPH_EMBEDDING_PROVIDER=ollama
 CODEGRAPH_EMBEDDING_MODEL=qwen3-embedding:0.6b
 CODEGRAPH_EMBEDDING_DIMENSION=1024
-
-# LLM for the agentic tools (these override [llm] in the config file)
-CODEGRAPH_LLM_PROVIDER=anthropic      # ollama | lmstudio | anthropic | openai | xai | openai-compatible
-CODEGRAPH_LLM_MODEL=claude-sonnet-4
-CODEGRAPH_CONTEXT_WINDOW=200000       # your model's real limit; selects the prompt tier
-# CODEGRAPH_OPENAI_COMPATIBLE_URL=http://localhost:8000/v1   # for provider openai-compatible
 
 # API keys (cloud providers)
 ANTHROPIC_API_KEY=sk-ant-...
@@ -266,7 +261,8 @@ The index command ends with a summary of files, nodes and edges. To check the st
 ```bash
 cd /path/to/project
 codegraph db-check                                             # prints the store it opened
-codegraph agent context "Where is the main entry point?" --focus search
+codegraph query <symbol>                                       # confirm the graph answers
+codegraph status --detailed                                    # server/provider/index state
 ```
 
 With the default shared server (the built-in `ws://127.0.0.1:8000` or your `CODEGRAPH_SURREALDB_URL`), reads and indexing run concurrently, so this restriction does not apply. The **embedded** fallback takes an exclusive file lock, so only one process can hold it at a time: if a `codegraph start` server for the same project has already answered a tool call, stop it before running `codegraph index`, otherwise the index command reports that the database is open in another process.
@@ -404,26 +400,28 @@ codegraph daemon stop /path/to/project
 
 ---
 
-## Using Agentic Tools
+## Using the Graph Tools
 
-CodeGraph provides 8 agentic MCP tools that use multi-step reasoning to analyze your codebase:
+CodeGraph exposes 9 direct graph tools. They answer one concrete question each, return
+`file:line` evidence in milliseconds, and never call an LLM.
 
 ### Available Tools
 
-| Tool | Purpose | When to Use |
-|------|---------|-------------|
-| `agentic_code_search` | Semantic code search with AI insights | Finding code patterns, exploring unfamiliar codebases |
-| `agentic_dependency_analysis` | Analyze dependencies and impact | Before refactoring, understanding coupling |
-| `agentic_call_chain_analysis` | Trace execution paths | Debugging, understanding data flow |
-| `agentic_architecture_analysis` | Assess system architecture | Architecture reviews, onboarding |
-| `agentic_api_surface_analysis` | Analyze public interfaces | API design reviews, breaking change detection |
-| `agentic_context_builder` | Gather comprehensive context | Before implementing new features |
-| `agentic_semantic_question` | Answer complex codebase questions | Deep understanding questions |
-| `agentic_complexity_analysis` | Identifies high-risk code hotspots for refactoring | architectural flaws and complexities |
+| Tool | Purpose |
+|------|---------|
+| `semantic_code_search` | Find a symbol/concept; returns the `node_id` the other tools need |
+| `get_reverse_dependencies` | Who calls or depends on a node |
+| `get_transitive_dependencies` | Transitive dependency closure |
+| `trace_call_chain` | Call path starting at a node |
+| `calculate_coupling_metrics` | Coupling and instability for a node/module |
+| `detect_circular_dependencies` | Dependency cycles |
+| `find_complexity_hotspots` | Complexity/risk ranking |
+| `get_hub_nodes` | High-degree hub ranking |
+| `plan_check` | Validate a draft nodes/edges/constraints graph offline |
 
 ### Example Queries
 
-In Claude Code, simply ask questions - the agentic tools will be used automatically:
+In Claude Code, simply ask questions — the assistant composes the tools itself:
 
 **Code Search:**
 ```
@@ -434,6 +432,7 @@ In Claude Code, simply ask questions - the agentic tools will be used automatica
 ```
 "What would be affected if I change the UserService class?"
 ```
+(`semantic_code_search` → `get_reverse_dependencies` → `get_transitive_dependencies`)
 
 **Call Chain Analysis:**
 ```
@@ -444,61 +443,22 @@ In Claude Code, simply ask questions - the agentic tools will be used automatica
 ```
 "Give me an overview of this project's architecture and main components"
 ```
+(`get_hub_nodes` + `detect_circular_dependencies` + `find_complexity_hotspots`)
 
 **API Surface:**
 ```
 "What public APIs does the auth module expose?"
 ```
+(`calculate_coupling_metrics`, plus `semantic_code_search` for the public items)
 
-**Context Building:**
+**Change Planning:**
 ```
-"I need to add rate limiting to the API. Gather all relevant context."
+"I need to add rate limiting to the API. Validate the plan before I start."
 ```
+(`plan_check`, then `codegraph plan verify`)
 
-### Agent Architecture Selection
-
-CodeGraph's agents run on the Rig framework. Select one with `CODEGRAPH_AGENT_ARCHITECTURE`:
-
-**ReAct (Default)** - Tool-calling loop over the graph tools:
-```bash
-export CODEGRAPH_AGENT_ARCHITECTURE=react
-```
-
-**LATS** - Tree search with candidates grounded through the same graph tools as ReAct:
-```bash
-export CODEGRAPH_AGENT_ARCHITECTURE=lats
-```
-
-**Reflexion** - ReAct with a retry that feeds the previous error back to the agent:
-```bash
-export CODEGRAPH_AGENT_ARCHITECTURE=reflexion
-```
-
-### Tier-Aware Prompting
-
-The agent adjusts to the context window you configured for its LLM (`CODEGRAPH_CONTEXT_WINDOW`):
-
-| Tier | Context Window | Tool-round budget |
-|------|----------------|-------------------|
-| Small | up to 50K | 3 |
-| Medium | 50K-150K | 5 |
-| Large | 150K-500K | 6 |
-| Massive | > 500K | 8 |
-
-The tier also sets how far the agent investigates and how detailed its answer is. See `docs/AGENT_PROMPT_TIERS.md`.
-
-### Debugging Agent Behavior
-
-Enable debug logging to see agent reasoning:
-
-```bash
-export CODEGRAPH_DEBUG=1
-```
-
-View debug logs:
-```bash
-python tools/view_debug_logs.py --follow
-```
+Earlier releases shipped a server-side reasoning agent and matching CLI commands that
+synthesized these answers. They were removed in v0.3.0; compose the direct tools instead.
 
 ---
 
@@ -516,7 +476,7 @@ CODEGRAPH_SURREALDB_PASSWORD=root
 
 In server mode the schema is not applied automatically and all projects share the database (rows are scoped by project id).
 
-Every command resolves storage the same way: `index`, `query`, `agent`, `status`, and
+Every command resolves storage the same way: `index`, `query`, `plan`, `status`, and
 `codegraph start` all connect to `CODEGRAPH_SURREALDB_URL` when it is set, otherwise to the
 default shared server. They never fall back to a local `.codegraph/db` on their own — the
 embedded store is used only when `CODEGRAPH_SURREALDB_URL` is itself a `surrealkv://` path.

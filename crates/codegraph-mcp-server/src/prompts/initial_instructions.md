@@ -7,10 +7,9 @@ regardless of which client or model drives it. They are not optional guidance.
 
 **Trigger.** If the question touches this repository's source — structure, location,
 relationship, call flow, or "what does X do" — the **first** tool call must be a
-CodeGraph tool (direct graph tools first; `agentic_*` only for synthesis). This holds
-for the whole task, not just the first turn: exploration, verification, debugging,
-locating code before an edit. "I just want to confirm", "I roughly know where it is"
-and "grep feels faster" are **not** exemptions.
+CodeGraph tool. This holds for the whole task, not just the first turn: exploration,
+verification, debugging, locating code before an edit. "I just want to confirm",
+"I roughly know where it is" and "grep feels faster" are **not** exemptions.
 
 **One criterion: symbols go to CodeGraph, text goes to grep.**
 
@@ -21,7 +20,7 @@ and "grep feels faster" are **not** exemptions.
 
 Answering "what is this project / where is the entry point / how is it structured"
 with `ls`, `glob`, `cat Cargo.toml` or a hand-written grep is a violation — use
-`get_hub_nodes`, `agentic_architecture` or `semantic_code_search` instead.
+`get_hub_nodes` or `semantic_code_search` instead.
 
 Knowing the name already is the reason to use CodeGraph, not the reason to grep.
 
@@ -46,12 +45,11 @@ means the policy was violated.
 
 ## Direct graph tools (no LLM, 0.3–3s) — start here
 
-Eight tools query the code graph directly. They are **20–100× faster** than the
-`agentic_*` tools (which run a full LLM workflow, 55s–2.5min) and they return
-raw structured data you can compose yourself. **Prefer these for concrete
-questions; reach for `agentic_*` only when you need a synthesized explanation.**
+Nine tools query the code graph directly. They return raw structured data that you
+compose yourself; there is no server-side agent and no LLM call. Prefer these for
+every concrete question.
 
-A ninth direct tool, `plan_check`, validates a **draft** graph (nodes/edges/constraints)
+One of these, `plan_check`, validates a **draft** graph (nodes/edges/constraints)
 offline. Reach for it whenever you are **thinking a problem through** — investigating a
 behaviour, designing an approach, or reasoning about how pieces connect — not only right
 before writing code. It externalises the logic so cycles, uncovered paths, layering
@@ -174,8 +172,9 @@ CODEGRAPH_SCIP_INDEX=/abs/rust.scip codegraph index crates/codegraph-core \
 - **Prefer SCIP over AST-only.** Generate a compiler index first and pass it via
   `CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`,
   `scip-python index`; comma-separated, `path@subdir` for an index built inside a
-  subdirectory). Measured on a 10k-file tree: analysis 21 min -> 2.4 s + 3.9 s import.
-  `scripts/scip-index.sh` generates the ones it knows and prints the value.
+  subdirectory), or let `codegraph index --scip-auto` produce it. Measured on a 10k-file
+  tree: analysis 21 min -> 2.4 s + 3.9 s import. `scripts/scip-index.sh` generates the
+  ones it knows and prints the value.
 - **Any language with a SCIP indexer can be enriched, not only the four above.** CodeGraph
   parses Python natively, so a Python SCIP index contributes definition/reference edges like
   any other. Generate it with `scip-python index --project-name <name> --output <path>`
@@ -186,18 +185,49 @@ CODEGRAPH_SCIP_INDEX=/abs/rust.scip codegraph index crates/codegraph-core \
 
 ---
 
-## Recommended workflows
+## Recommended workflows (compose the direct tools)
 
-### 1. Change safety check (before editing)
+There is no synthesized agent answer to fall back on. Chain the direct tools, then read
+the files they point at.
+
+### 1. Understand behavior / find code
 
 ```
 1. semantic_code_search("the symbol or concept")     → node_id, file:line
-2. get_reverse_dependencies(node_id, "calls", 1)     → who breaks if I change it
-3. Read the files listed above                       → confirm current code
-4. Edit
+2. Read the files listed above                       → confirm current code
+3. get_reverse_dependencies(node_id, "calls", 1)     → who uses it, when that matters
 ```
 
-### 2. Understand a flow (debugging)
+### 2. Change safety check (before editing)
+
+```
+1. semantic_code_search("the symbol or concept")          → node_id
+2. get_reverse_dependencies(node_id, "calls", 1)          → direct callers that could break
+3. get_transitive_dependencies(node_id, "calls", 2)       → the wider blast radius
+4. Read the files listed above                            → confirm current code
+5. Edit
+```
+
+### 3. Architecture / structure survey
+
+```
+1. get_hub_nodes(30)                                 → central modules
+2. detect_circular_dependencies("imports")           → layering problems
+3. find_complexity_hotspots(10, 20)                  → risky areas
+4. semantic_code_search(...) on each area to read the source
+5. plan_check({nodes, edges, constraints})           → validate the structure you inferred
+```
+
+### 4. Quality risk assessment
+
+```
+1. find_complexity_hotspots(10, 20)                  → ranked candidates
+2. calculate_coupling_metrics(node_id) on the leaders → Ca/Ce and instability
+3. get_reverse_dependencies(node_id, "calls", 1)      → how much really depends on it
+4. Read the hot files, then plan_check the refactor before starting
+```
+
+### 5. Debugging a flow
 
 ```
 1. semantic_code_search("symptom or module")         → entry node_id
@@ -206,89 +236,23 @@ CODEGRAPH_SCIP_INDEX=/abs/rust.scip codegraph index crates/codegraph-core \
 4. Read the specific files identified
 ```
 
-### 3. Architecture survey
-
-```
-1. get_hub_nodes(30)                                 → central modules
-2. detect_circular_dependencies("imports")           → layering problems
-3. find_complexity_hotspots(10, 20)                  → risky areas
-4. Only now, if you need a narrative: agentic_architecture({"query": "..."})
-```
-
-### 4. When to use `agentic_*` instead
-
-Use the agentic tools when the question needs **synthesis across evidence** and
-you would otherwise chain 4+ graph calls yourself:
-
-- "How does provider selection work end to end?"
-- "What are the architectural risks in the indexing pipeline?"
-- "Gather everything I need to implement feature X"
-
-Cost: 55s–2.5min per call. Never use them for a single symbol lookup — that is
-what the direct tools are for.
-
 ---
 
-## Tool Selection (agentic, slower)
-
-## When to Use CodeGraph Tools
-
-Use CodeGraph tools as your **first choice** for understanding code. They return synthesized, relevant information instead of raw file contents, saving context for actual work.
-
-### Tool Selection
-
-| Question | Tool | What You Get |
-|----------|------|--------------|
-| "What do I need to proceed?" | `agentic_context` | Client-readable context bundle: summary, analysis, highlights (with file:line + snippets), related locations, risks, next steps, confidence |
-| "If I change X, what breaks?" | `agentic_impact` | Client-readable impact bundle: summary, analysis, impact highlights, affected locations, risks, next steps, confidence |
-| "How is this area structured?" | `agentic_architecture` | Client-readable architecture bundle: summary, analysis, structural highlights, related locations, risks, next steps, confidence |
-| "Where are the risks?" | `agentic_quality` | Client-readable quality bundle: summary, analysis, hotspot highlights, risk notes, related locations, next steps, confidence |
-
-### Example Queries
-
-```json
-{"query": "gather context for adding rate limiting"}
-{"query": "if I change the indexing pipeline, what breaks?"}
-{"query": "how is the MCP server structured?"}
-{"query": "hotspots and coupling risks in the parser"}
-```
-
----
-
-## Focus Parameter for Precision
-
-Each tool accepts an optional `focus` parameter to narrow analysis to a specific mode:
-
-| Tool | Focus Values | Default Behavior |
-|------|-------------|-----------------|
-| `agentic_context` | `"search"`, `"builder"`, `"question"` | Auto-selects based on query |
-| `agentic_impact` | `"dependencies"`, `"call_chain"` | Analyzes both dependency chains and call flows |
-| `agentic_architecture` | `"structure"`, `"api_surface"` | Provides both structural and interface analysis |
-| `agentic_quality` | `"complexity"`, `"coupling"`, `"hotspots"` | Comprehensive risk assessment |
-
-Example with focus:
-```json
-{"query": "trace login flow", "focus": "call_chain"}
-{"query": "what public interfaces exist", "focus": "api_surface"}
-```
-
----
-
-## When to Fall Back to File Reading
+## When to fall back to file reading
 
 CodeGraph tools work best for **understanding and exploration**. Use regular file tools when:
 
-### 1. You Need Exact File Contents for Editing
+### 1. You need exact file contents for editing
 
 After CodeGraph tells you which file to modify, read that specific file to make edits:
 
 ```
-1. agentic_context({"query": "where is the login handler?"})
+1. semantic_code_search({"query": "where is the login handler?"})
    → Returns: src/auth/handler.rs:45-67
 2. Read src/auth/handler.rs to make your edit
 ```
 
-### 2. CodeGraph Results Are Insufficient
+### 2. CodeGraph results are insufficient
 
 If a CodeGraph tool returns:
 - "No relevant code found"
@@ -297,14 +261,14 @@ If a CodeGraph tool returns:
 
 Then fall back to targeted file reading based on what you know.
 
-### 3. You Need Very Recent Changes
+### 3. You need very recent changes
 
 If the codebase was modified after the last changes, CodeGraph may not reflect those changes instantly. Use file tools for:
 - Files you just created
 - Code you modified during your last phase
 - Uncommitted changes
 
-### 4. Simple, Known Locations
+### 4. Simple, known locations
 
 For quick lookups where you already know the exact file:
 - Reading a config file you know exists
@@ -313,69 +277,26 @@ For quick lookups where you already know the exact file:
 
 ---
 
-## How to Use CodeGraph Results
+## How to use CodeGraph results
 
-### Results Include Locations
+### Results include locations
 
 Every result includes file paths and line numbers. Use these to:
 - Navigate to the code
 - Read specific files for editing
 - Verify the analysis matches current code
 
-### Results Are Synthesized
-
-Results explain relationships and patterns, not just raw code. Use this to:
-- Understand how components connect
-- Plan changes with full context
-- Identify all affected areas before refactoring
-
-### Verify Before Major Changes
+### Verify before major changes
 
 For significant modifications:
-1. Use CodeGraph to understand scope
+1. Use the graph tools to understand scope
 2. Read the actual files to confirm
-3. Make your changes
-4. Use `agentic_impact` to check impact
+3. `plan_check` the intended change
+4. Make your changes
 
 ---
 
-## Recommended Workflows
-
-### Implementing a Feature
-
-```
-1. agentic_architecture({"query": "how is [similar feature] structured?"})
-2. agentic_context({"query": "context for implementing [feature]"})
-3. Read specific files identified → make changes
-```
-
-### Debugging
-
-```
-1. agentic_context({"query": "[error message or symptom]"})
-2. agentic_impact({"query": "what depends on [suspected area]?"})
-3. Read identified files → fix issue
-```
-
-### Understanding a Codebase
-
-```
-1. agentic_architecture({"query": "overall structure"})
-2. agentic_context({"query": "main interfaces and entry points"})
-```
-
-### Refactoring
-
-```
-1. agentic_impact({"query": "what depends on [target]?"})
-2. agentic_quality({"query": "risk hotspots around [target]"})
-3. Plan changes based on full impact understanding
-4. Read and modify files systematically
-```
-
----
-
-## Quick Reference
+## Quick reference
 
 **Start with CodeGraph when:**
 - Exploring unfamiliar code
@@ -396,7 +317,7 @@ For significant modifications:
 
 ---
 
-## Project-Only Indexing Policy
+## Project-only indexing policy
 
 CodeGraph is project-scoped: it indexes the repository workspace, not third-party dependency source trees (e.g. downloaded crates, `node_modules/`, `site-packages/`).
 

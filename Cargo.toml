@@ -12,7 +12,6 @@ members = [
 
     "crates/codegraph-mcp-core",
     "crates/codegraph-mcp-tools",
-    "crates/codegraph-mcp-rig",
     "crates/codegraph-mcp-server",
     "crates/codegraph-mcp-daemon",
 ]

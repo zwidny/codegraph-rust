@@ -1,57 +1,34 @@
-# CodeGraph MCP – Agentic Tool Server
+# CodeGraph MCP – indexer and analyzers
 
-CodeGraph MCP is the SurrealDB-backed Model Context Protocol server that powers the
-`agentic_*` tool suite used by reasoning-first assistants. Together with the Rig agent
-backend (`codegraph-mcp-rig`) it wraps Surreal graph functions, and semantic search
-pipeline into a single binary so LLM agents can issue rich analysis requests over
-MCP (STDIO or HTTP) without having to understand the underlying codebase structure.
+`codegraph-mcp` builds the SurrealDB knowledge graph that the MCP server serves: it
+collects files, parses them with tree-sitter, runs the analyzer stages, resolves edges
+and writes nodes, chunks and embeddings. The MCP server crate (`codegraph-mcp-server`)
+then exposes the graph as **9 direct tools**:
 
-## Highlights
+| Tool | Purpose |
+|---|---|
+| `semantic_code_search` | Find a symbol/concept; returns the `node_id` the other tools need |
+| `get_reverse_dependencies` | Who calls or depends on a node |
+| `get_transitive_dependencies` | Transitive dependency closure |
+| `trace_call_chain` | Call path starting at a node |
+| `calculate_coupling_metrics` | Coupling and instability for a node/module |
+| `detect_circular_dependencies` | Dependency cycles |
+| `find_complexity_hotspots` | Complexity/risk ranking |
+| `get_hub_nodes` | High-degree hub ranking |
+| `plan_check` | Validate a draft nodes/edges/constraints graph offline |
 
-- **Rig agent orchestration** – every tool request spins up a ReAct-style plan
-  (tier-aware prompts, max-step guards, intermediate reasoning logs) so LLMs
-  explore the graph incrementally instead of returning shallow answers.
-- **Seven advanced MCP tools** – multi-hop graph queries, semantic synthesis, and
-  architecture diagnostics wrapped behind stable MCP endpoints.
-- **SurrealDB for graph + embeddings** – all structure resides in SurrealDB
-  (nodes, edges, embeddings, context caches). No RocksDB/FAISS dependencies remain.
-- **Flexible transports** – STDIO for local agents (Claude, GPTs) and
-  an optional HTTP transport for remote evaluation (`test_http_mcp.py`).
-- **Structured outputs** – every response follows our JSON schemas so downstream
-  agents can capture file paths, node IDs, and prompt traces deterministically.
-
-## Agentic Tool Suite
-
-| Tool name                   | Purpose                                                                                           |
-|-----------------------------|---------------------------------------------------------------------------------------------------|
-| `agentic_code_search`       | Multi-step semantic/code search with agent planning.                                               |
-| `agentic_dependency_analysis` | Explores transitive `Imports`/`Calls` edges for a symbol, ranks hotspots, flags potential risks. |
-| `agentic_call_chain_analysis` | Traces execution from an entrypoint (e.g., `execute_agentic_workflow`) to graph tools.            |
-| `agentic_architecture_analysis` | Calculates coupling metrics, hub nodes, and layering issues for a subsystem.                    |
-| `agentic_api_surface_analysis` | Enumerates public functions/structs of a component and links them back to files/lines.           |
-| `agentic_context_builder`   | Gathers everything needed for prompt construction (files, dependencies, semantic neighbors).       |
-| `agentic_semantic_question` | Free-form “explain X” queries that blend embeddings + structured graph walks.                      |
-
-Each handler lives in `official_server.rs` and funnels into
-`execute_agentic_workflow`, which:
-
-1. Detects the LLM tier (`Small`, `Medium`, `Large`, `Massive`) using context-window metadata.
-2. Picks the corresponding prompt template from `prompts/`.
-3. Executes SurrealDB graph functions (`codegraph_graph::GraphFunctions`) and semantic
-   search helpers.
-4. Streams reasoning steps + final answers back through MCP.
+Every tool queries SurrealDB directly and returns structured rows with file paths and
+line numbers. There is no server-side agent and no LLM call.
 
 ## Architecture at a Glance
 
-- **Rig agents + CodeGraph AI** – enabled via the `ai-enhanced` feature flag on `codegraph-mcp-server`.
-  The agent runs a tool-calling loop over the graph tools with our prompts.
-- **Surreal Graph Storage** – compile with `codegraph-graph/surrealdb` (default in this repo) and
-  provide Surreal credentials via `CODEGRAPH_SURREALDB_*` env vars or `config/surrealdb_example.toml`.
-- **Embedding Providers** – choose via `CODEGRAPH_LLM_PROVIDER` and the `embeddings-*` Cargo features
-  (Ollama, OpenAI, Jina, etc.). All agentic tools require embeddings because they mix symbolic +
-  vector context.
-- **Transports** – STDIO transport listens on stdin/stdout (ideal for MCP-compliant hosts) and the
-  optional HTTP server exposes `/mcp` for streaming JSON-RPC over HTTP.
+- **Surreal graph storage** – compile with `codegraph-graph/surrealdb` and provide Surreal
+  credentials via `CODEGRAPH_SURREALDB_*` env vars or `config/surrealdb_example.toml`.
+- **Embedding providers** – choose via `CODEGRAPH_EMBEDDING_PROVIDER` and the
+  `embeddings-*` Cargo features (Ollama, OpenAI, Jina, etc.). Semantic search needs them;
+  the structural graph queries do not.
+- **Transports (server crate)** – STDIO listens on stdin/stdout; the optional HTTP server
+  exposes `/mcp` for streaming JSON-RPC over HTTP.
 
 ## Quick Start
 
@@ -64,95 +41,83 @@ export CODEGRAPH_SURREALDB_NAMESPACE=ouroboros
 export CODEGRAPH_SURREALDB_DATABASE=codegraph
 export CODEGRAPH_SURREALDB_USERNAME=root
 export CODEGRAPH_SURREALDB_PASSWORD=root
-export CODEGRAPH_LLM_PROVIDER=ollama          # or openai / anthropic / xai
-export MCP_CODE_AGENT_MAX_OUTPUT_TOKENS=4096  # optional override
+export CODEGRAPH_EMBEDDING_PROVIDER=ollama
+export CODEGRAPH_EMBEDDING_MODEL=qwen3-embedding:0.6b
 ```
 
-### 2. Run the STDIO MCP server
+### 2. Index the project
+
+```bash
+codegraph index . --scip-auto
+```
+
+Without a SCIP index the graph is AST-only. Generate one first with
+`scripts/scip-index.sh` (or let `--scip-auto` do it) so definition and reference edges
+exist.
+
+### 3. Run the STDIO MCP server
 
 ```bash
 cargo run -p codegraph-mcp-server --bin codegraph \
-  --features "ai-enhanced,embeddings-ollama" \
+  --features "daemon,server-http,embeddings-ollama" \
   -- start stdio
 ```
 
-Hook this process up to your MCP host (Claude Desktop, etc.).
+Hook this process up to your MCP host (Claude Code, OpenCode, etc.).
 
-### 3. (Optional) Run the HTTP transport
+### 4. (Optional) Run the HTTP transport
 
 ```bash
 cargo run -p codegraph-mcp-server --bin codegraph \
-  --features "ai-enhanced,embeddings-ollama,server-http" \
+  --features "server-http,embeddings-ollama" \
   -- start http --host 127.0.0.1 --port 3003
 ```
 
-Point the Python harness at it:
-
-```bash
-CODEGRAPH_HTTP_HOST=127.0.0.1 CODEGRAPH_HTTP_PORT=3003 \
-python test_http_mcp.py
-```
-
-or use the streaming tester (`test_agentic_tools_http.py`) which logs each request under
-`test_output_http/`.
-
 ## Invoking Tools Manually
 
-All MCP requests follow the standard JSON-RPC envelope. Example HTTP payload for
-`agentic_dependency_analysis`:
+All MCP requests follow the standard JSON-RPC envelope. Example for
+`get_reverse_dependencies`:
 
 ```jsonc
 {
   "jsonrpc": "2.0",
   "id": "1",
-  "method": "agentic_dependency_analysis",
+  "method": "tools/call",
   "params": {
-    "query": "Analyze the dependency chain for the AgenticOrchestrator. What does it depend on?",
-    "workspaceId": "default"
+    "name": "get_reverse_dependencies",
+    "arguments": {
+      "node_id": "nodes:`0f0f013b-df13-d632-1366-59ce8ed1c0b5`",
+      "edge_type": "calls"
+    }
   }
 }
 ```
 
-The response contains:
-
-- `reasoning`: step-by-step chain of thought
-- `tool_call`: the Surreal function invocation (e.g., `get_transitive_dependencies`)
-- `analysis`: markdown/JSON summary
-- `components` + `file_locations`: structured references with file paths + line numbers
+Responses contain the matching edges with `file_path`, `line_number` and bounded
+`content` rows.
 
 ## Configuration + Environment Variables
 
-| Variable                               | Purpose                                                                    |
-|----------------------------------------|----------------------------------------------------------------------------|
-| `CODEGRAPH_SURREALDB_URL` (+ namespace/db/user/password) | Points the server at your SurrealDB instance.                             |
-| `CODEGRAPH_LLM_PROVIDER`               | `ollama`, `openai`, `anthropic`, `xai`, etc.                               |
-| `CODEGRAPH_EMBEDDING_PROVIDER`         | Chooses embedding backend (see Cargo feature flags above).                 |
-| `MCP_CODE_AGENT_MAX_OUTPUT_TOKENS`     | Hard override for the agent's final response length.                       |
-| `CODEGRAPH_HTTP_HOST` / `CODEGRAPH_HTTP_PORT` | Used by the HTTP server & test harnesses.                        |
+| Variable | Purpose |
+|---|---|
+| `CODEGRAPH_SURREALDB_URL` (+ namespace/db/user/password) | Points the server at your SurrealDB instance. |
+| `CODEGRAPH_EMBEDDING_PROVIDER` | Chooses embedding backend (see Cargo feature flags above). |
+| `CODEGRAPH_HTTP_HOST` / `CODEGRAPH_HTTP_PORT` | Used by the HTTP server. |
+| `CODEGRAPH_TOOL_CONTENT_CHARS` | Snippet length per result row (`0` disables shortening). |
 
-For advanced tuning (batch sizes, prompt overrides, tier thresholds) see
-`crates/codegraph-mcp/src/context_aware_limits.rs` and the prompt files under `src/prompts/`.
+For tuning see `crates/codegraph-mcp/src/context_aware_limits.rs` and the prompt files
+under `crates/codegraph-mcp-server/src/prompts/`.
 
 ## Testing
 
-- `python test_agentic_tools.py` – exercises all tools over STDIO.
-- `python test_agentic_tools_http.py` – same via HTTP transport (outputs logs to `test_output_http/`).
-- `python test_http_mcp.py` – minimal MCP smoke test for custom HTTP clients.
-- `cargo test -p codegraph-mcp --features "ai-enhanced"` – Rust-level tests for orchestrator pieces.
-
-Every successful run drops JSON logs into `test_output/` (STDIO) or
-`test_output_http/` (HTTP) so you can diff reasoning traces between commits.
-
-## Observability Tips
-
-- Set `--debug` when starting the server to tee agent traces into
-  `~/.codegraph/logs`.
-- Each tool emits structured output; store them if you need regressions.
-- The Python harness prints timing data (e.g., 26.6s for `agentic_code_search`) so
-  you can monitor throughput after embedding/provider changes.
+- `cargo test -p codegraph-mcp --lib` – indexer/analyzer unit tests.
+- `cargo test -p codegraph-mcp --test reconciliation_test --test daemon_watch` –
+  reconciliation and watch regressions.
+- `cargo test -p codegraph-mcp --features embeddings --test deferred_policy_test` –
+  deferred inference policy.
 
 ## Need More?
 
-- See `docs/faiss_rocksdb_deprecation_plan.md` for the Surreal-only roadmap.
-- `TESTING.md` documents the recommended feature flags for Ollama / OpenAI / Anthropic setups.
-- The `codegraph-api` crate exposes the same Surreal graph via GraphQL/REST if you need to build custom dashboards.
+- [Indexing pipeline](../docs/INDEXING_PIPELINE.md)
+- [Usage guide](../docs/USAGE_GUIDE.md)
+- [Testing guide](../docs/TESTING.md)

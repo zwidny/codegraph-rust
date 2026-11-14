@@ -74,6 +74,22 @@ release in mind.
 
 ## [Unreleased]
 
+### Removed - Agentic tools and the agent CLI
+
+- Removed the four server-side MCP tools `agentic_context`, `agentic_impact`,
+  `agentic_architecture` and `agentic_quality`, together with the `codegraph agent
+  context|impact|architecture|quality|instructions` command family.
+- Removed `codegraph config agent-status`.
+- Removed the `codegraph-mcp-rig` crate (the Rig-based agent backend) and the `rig-*` and
+  `legacy-agentic-tools` Cargo features. `ai-enhanced` remains, but only forwards to
+  `codegraph-mcp/ai-enhanced` and no longer controls MCP tool registration.
+- The MCP server now exposes 9 direct graph tools: `semantic_code_search`,
+  `get_reverse_dependencies`, `get_transitive_dependencies`, `trace_call_chain`,
+  `calculate_coupling_metrics`, `detect_circular_dependencies`,
+  `find_complexity_hotspots`, `get_hub_nodes` and `plan_check`. For synthesized
+  answers, compose these tools (or `codegraph query` / `codegraph plan`) yourself and
+  read the returned source locations.
+
 ### Fixed - Environment file layering
 
 - `ConfigManager::initialize_environment` now loads `./.env` first and `~/.codegraph.env`

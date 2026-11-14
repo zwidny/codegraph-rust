@@ -1,5 +1,9 @@
 # Debug Logging for Agentic Tools
 
+> **Partially historical:** v0.3.0 removed the agent tools and their reasoning traces.
+> `--debug` / `CODEGRAPH_DEBUG=1` still tee index and tool logs; the agent-specific
+> sections below describe the removed subsystem.
+
 This document explains how to use the debug logging feature to troubleshoot agentic tool execution.
 
 ## Quick Start
@@ -22,7 +26,7 @@ CODEGRAPH_DEBUG=1
 ### 2. Run Your Tests
 
 ```bash
-python3 test_agentic_tools_http.py
+codegraph query <symbol>
 ```
 
 ### 3. View the Debug Logs
