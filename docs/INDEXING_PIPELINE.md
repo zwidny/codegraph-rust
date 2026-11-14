@@ -72,17 +72,17 @@ supplied, local OpenAI-compatible provider, `CODEGRAPH_SEMANTIC_RESOLUTION=defer
 | tier | embedding | WALL | chunks | nodes | edges | `analyzers` | `embeddings_and_writes` | HNSW build |
 |---|---|---|---|---|---|---|---|---|
 | fast | off | 8.70 s | 0 | 37,111 | 45,287 | ~0.7 s | 0 | 0 |
-| fast | on | **40.03 s** | 37,132 | 37,111 | 45,287 | 0.68 s | 7.5 s | 21.5 s |
+| fast | on | **30.88 s** | 37,132 | 37,111 | 45,287 | 0.70 s | 8.1 s | 11.5 s |
 | balanced | off | 14.84 s | 0 | 38,057 | 79,801 | 0.86 s | 0 | 0 |
-| balanced | on | **47.98 s** | 38,080 | 38,057 | 79,781 | 0.85 s | 7.7 s | 23.7 s |
+| balanced | on | **34.49 s** | 38,080 | 38,057 | 79,781 | 0.85 s | 8.1 s | 11.8 s |
 | full | off | 26.55 s | 0 | 75,353 | 246,291 | 2.47 s | 0 | 0 |
-| full | on | **76.72 s** | 75,376 | 75,353 | 246,270 | 1.61 s | 11.7 s | 39.9 s |
+| full | on | **58.01 s** | 75,376 | 75,353 | 246,270 | 2.45 s | 12.1 s | 19.5 s |
 
 Read it as three independent dials:
 
-- **Turning embedding on costs 31–50 s**, and most of that is now the one-shot
-  HNSW build (21–40 s), not inference. Vector generation plus the binary write is
-  7.5–11.7 s when the cache is warm.
+- **Turning embedding on costs 20–32 s**, split roughly evenly between the one-shot
+  HNSW build (11.5–19.5 s) and vector generation plus the binary write (8.1–12.1 s,
+  warm cache).
 - **All analyzer stages together cost 18 s.** fast → balanced is +6 s; balanced → full
   (dataflow + architecture + `references` edges) is +12 s.
 - **Embedding changes no graph structure.** Node counts are identical and the ~20-edge
@@ -94,15 +94,19 @@ Two hardware-dependent details:
   and `--force` drops the indexes before writing so inserts never maintain them. Before
   that change the same run spent 92 s inside `embeddings_and_writes` maintaining HNSW
   per row; see the commit history around `d14acfb` / `ed6fc67`.
-- index build time scales with `m`/`ef_construction` (12/150 here). It is the largest
-  remaining item on the embedding path, so tune it before looking for other wins.
+- `m`/`ef_construction` are 12/64. Measured on the same 38,080 chunks, three builds
+  each: `m=12 ef=150` took 21.7–22.3 s, `m=12 ef=64` 11.6–11.7 s, `m=8 ef=32`
+  5.5–5.6 s — while recall@10 stayed inside a 0.94–0.98 band for all three. The
+  higher `ef_construction` bought no recall, so the cheap setting is in use.
+  Because the index is created with `IF NOT EXISTS`, an existing store keeps its old
+  parameters until a `--force` run drops and recreates it.
 
 A supplied SCIP index is imported on every tier — `balanced` drops `references` edges and
 does not synthesize them from SCIP occurrences, `full` does. See
 [LSP determinism](LSP_DETERMINISM.md).
 
 Practical consequence: for call-path and dependency queries only,
-`CODEGRAPH_EMBEDDING_POLICY=off` takes a full index from 76.7 s to 26.5 s.
+`CODEGRAPH_EMBEDDING_POLICY=off` takes a full index from 58.0 s to 26.5 s.
 
 ## Controls that change each phase
 
