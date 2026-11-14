@@ -19,7 +19,7 @@
 //! - the retrieval side (MCP tools / `GraphQueries`) still talks to SurrealDB,
 //!   so switching the write backend does not change query paths.
 
-use crate::analyzers::{AnalyzerSettings, find_tool_on_path, required_tools_for_languages};
+use crate::analyzers::AnalyzerSettings;
 use crate::estimation::parse_files_with_unified_extraction as shared_unified_parse;
 use anyhow::{Context, Result, anyhow, bail};
 use codegraph_core::{CodeNode, EdgeRelationship, EdgeType, NodeId, NodeType};
@@ -308,10 +308,8 @@ pub struct ProjectIndexer {
     embedding_column: EmbeddingColumn,
     project_root: PathBuf,
     reconcile_lock: TokioMutex<()>,
-    lsp_pool: crate::analyzers::lsp::LspPool,
     policies: crate::policy::InferencePolicies,
     startup_ms: u64,
-    lsp_support: TokioMutex<Option<String>>,
     #[cfg(feature = "embeddings")]
     cpu_pool: Arc<rayon::ThreadPool>,
     #[cfg(feature = "embeddings")]
@@ -351,50 +349,6 @@ impl ProjectIndexer {
             .clamp(1, 32);
 
         (batch_size, max_concurrent)
-    }
-
-    async fn validate_analyzer_tools(
-        languages: &[codegraph_core::Language],
-        settings: AnalyzerSettings,
-        path_env: &str,
-        project_root: &Path,
-    ) -> Result<()> {
-        if !settings.lsp_enabled() {
-            return Ok(());
-        }
-        if !settings.require_tools {
-            return Ok(());
-        }
-
-        let required = required_tools_for_languages(languages);
-        let mut problems: Vec<String> = Vec::new();
-
-        for tool in required {
-            if find_tool_on_path(tool.name, path_env).is_none() {
-                problems.push(format!("Missing {} (for {:?})", tool.name, tool.language));
-            } else if tool.name == "rust-analyzer" {
-                let mut failures = Vec::new();
-                for command in crate::analyzers::find_tool_candidates_on_path(tool.name, path_env) {
-                    match crate::analyzers::lsp::probe_rust_analyzer(&command, project_root).await {
-                        Ok(()) => {
-                            failures.clear();
-                            break;
-                        }
-                        Err(error) => failures.push(error.to_string()),
-                    }
-                }
-                problems.extend(failures);
-            }
-        }
-
-        if problems.is_empty() {
-            return Ok(());
-        }
-
-        Err(anyhow!(
-            "Required analyzer tools are unavailable: {}. Install the tools or choose a tier without LSP (e.g. --index-tier fast or CODEGRAPH_INDEX_TIER=fast).",
-            problems.join("\n")
-        ))
     }
 
     pub fn new(
@@ -739,10 +693,8 @@ impl ProjectIndexer {
                 embedding_column,
                 project_root,
                 reconcile_lock: TokioMutex::new(()),
-                lsp_pool: Default::default(),
                 policies,
                 startup_ms: startup.elapsed().as_millis() as u64,
-                lsp_support: TokioMutex::new(None),
                 #[cfg(feature = "embeddings")]
                 cpu_pool,
                 #[cfg(feature = "embeddings")]
@@ -926,10 +878,7 @@ impl ProjectIndexer {
                         self.config.scip_strict,
                     )?;
                     if entries.is_empty() {
-                        warn!(
-                            "--scip-auto produced no indexes; no SCIP enrichment will run \
-                             (set CODEGRAPH_LSP_FALLBACK=1 to fall back to language servers)"
-                        );
+                        warn!("--scip-auto produced no indexes; no SCIP enrichment will run");
                         Vec::new()
                     } else {
                         info!(
@@ -947,9 +896,7 @@ impl ProjectIndexer {
             // runs `codegraph index` should still learn that SCIP exists.
             if scip_specs.is_empty() {
                 info!(
-                    "💡 hint: no SCIP index supplied, so no compiler-index enrichment will run \
-                     (the language-server fallback is opt-in via CODEGRAPH_LSP_FALLBACK=1, about \
-                     21 minutes per 10k files). \
+                    "💡 hint: no SCIP index supplied, so no compiler-index enrichment will run. \
                      Generate one (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`) \
                      and set CODEGRAPH_SCIP_INDEX, or run scripts/scip-index.sh. \
                      See `codegraph index --help`."
@@ -1044,53 +991,10 @@ impl ProjectIndexer {
                 ..Default::default()
             };
 
-            let support_fingerprint = fingerprint(&(&support, &external_support))?;
-            {
-                let mut previous_support = self.lsp_support.lock().await;
-                if previous_support.as_ref() != Some(&support_fingerprint) {
-                    self.lsp_pool.clear().await;
-                    *previous_support = Some(support_fingerprint);
-                }
-            }
-            // A partial re-index must not start language servers: they load the whole
-            // workspace (tsserver reads the tsconfig project), so scoping the parsed files
-            // does not scope their memory use. Large repos abort on this.
             let reconcile_scope = Self::reconcile_scope(&self.project_root, path);
-            let mut analyzer_settings = AnalyzerSettings::from_env(self.config.indexing_tier);
-            let base_lsp_mode = analyzer_settings.lsp_mode;
-            analyzer_settings.lsp_mode = effective_lsp_mode(
-                base_lsp_mode,
-                reconcile_scope.is_some(),
-                partial_lsp_allowed(),
-            );
-            if base_lsp_mode != analyzer_settings.lsp_mode {
-                info!(
-                    "🧩 Partial re-index scope: language servers disabled \
-                     (set CODEGRAPH_LSP_ON_PARTIAL=1 to force them on)"
-                );
-            }
-            // Hard guard: do not start a language server when the machine is already short
-            // of memory. The cap is configurable for headroom tuning.
-            if analyzer_settings.lsp_enabled()
-                && let Some(free_mb) = available_memory_mb()
-            {
-                let minimum = std::env::var("CODEGRAPH_LSP_MIN_FREE_MB")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(4096);
-                if free_mb < minimum {
-                    analyzer_settings.lsp_mode = crate::analyzers::LspMode::Off;
-                    warn!(
-                        "Only {free_mb} MB available and CODEGRAPH_LSP_MIN_FREE_MB={minimum}; \
-                         disabling language servers for this run"
-                    );
-                }
-            }
-            let path_env = std::env::var("PATH").unwrap_or_default();
+            let analyzer_settings = AnalyzerSettings::from_env(self.config.indexing_tier);
             let mut analyzer_languages: HashSet<codegraph_core::Language> = HashSet::new();
-            let needs_language_scan = analyzer_settings.lsp_enabled()
-                || analyzer_settings.build_context
-                || analyzer_settings.dataflow;
+            let needs_language_scan = analyzer_settings.build_context || analyzer_settings.dataflow;
             if needs_language_scan {
                 let registry = codegraph_parser::LanguageRegistry::new();
                 for (p, _) in &files_to_index {
@@ -1101,26 +1005,11 @@ impl ProjectIndexer {
             }
             let analyzer_languages: Vec<codegraph_core::Language> =
                 analyzer_languages.into_iter().collect();
-            if scip_specs.is_empty() {
-                Self::validate_analyzer_tools(
-                    &analyzer_languages,
-                    analyzer_settings,
-                    &path_env,
-                    &self.project_root,
-                )
-                .await?;
-            }
 
-            let lsp_mode_label = match analyzer_settings.lsp_mode {
-                crate::analyzers::LspMode::Off => "off",
-                crate::analyzers::LspMode::SymbolsOnly => "symbols",
-                crate::analyzers::LspMode::SymbolsAndDefinitions => "symbols+definitions",
-            };
             info!(
-                "🧭 Indexing tier: {:?} | analyzers: build_context={} lsp={} enrichment={} module_linking={} dataflow={} docs_contracts={} architecture={}",
+                "🧭 Indexing tier: {:?} | analyzers: build_context={} enrichment={} module_linking={} dataflow={} docs_contracts={} architecture={}",
                 self.config.indexing_tier,
                 analyzer_settings.build_context,
-                lsp_mode_label,
                 analyzer_settings.enrichment,
                 analyzer_settings.module_linking,
                 analyzer_settings.dataflow,
@@ -1321,11 +1210,10 @@ impl ProjectIndexer {
             nodes.sort_by_key(|node| node.id);
             nodes.dedup_by_key(|node| node.id);
 
-            let mut lsp_enrichment_stats = crate::analyzers::lsp::LspEnrichmentStats::default();
+            let mut enrichment_stats = crate::analyzers::lsp::LspEnrichmentStats::default();
             let mut scip_covered: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
-            let fallback_enabled = lsp_fallback_enabled();
-            if !scip_specs.is_empty() && analyzer_settings.lsp_enabled() {
+            if !scip_specs.is_empty() {
                 let start = std::time::Instant::now();
                 for spec in &scip_specs {
                     let index_start = std::time::Instant::now();
@@ -1339,8 +1227,8 @@ impl ProjectIndexer {
                         analyzer_settings.lsp_definitions_enabled(),
                     )?;
                     scip_covered.extend(scip_stats.covered_files.iter().cloned());
-                    lsp_enrichment_stats.nodes_enriched += scip_stats.nodes_enriched;
-                    lsp_enrichment_stats.edges_resolved += scip_stats.edges_resolved;
+                    enrichment_stats.nodes_enriched += scip_stats.nodes_enriched;
+                    enrichment_stats.edges_resolved += scip_stats.edges_resolved;
                     info!(
                         "🧠 SCIP import complete for {}{}: {} nodes enriched + {} edges resolved from {} of {} documents ({} documents had indexed nodes) in {:.1?}",
                         spec.path.display(),
@@ -1359,29 +1247,16 @@ impl ProjectIndexer {
                 info!(
                     "🧠 SCIP import complete: {} indexes, {} nodes enriched + {} edges resolved in {:.1?}",
                     scip_specs.len(),
-                    lsp_enrichment_stats.nodes_enriched,
-                    lsp_enrichment_stats.edges_resolved,
+                    enrichment_stats.nodes_enriched,
+                    enrichment_stats.edges_resolved,
                     start.elapsed()
                 );
-                let uncovered = files.len().saturating_sub(scip_covered.len());
-                if fallback_enabled
-                    && analyzer_settings.lsp_enabled()
-                    && !analyzer_languages.is_empty()
-                {
-                    info!(
-                        "🧠 SCIP coverage: {}/{} files; language-server enrichment runs on the remaining {}",
-                        scip_covered.len(),
-                        files.len(),
-                        uncovered
-                    );
-                } else {
-                    info!(
-                        "🧠 SCIP coverage: {}/{} files; {} remain AST-only",
-                        scip_covered.len(),
-                        files.len(),
-                        uncovered
-                    );
-                }
+                info!(
+                    "🧠 SCIP coverage: {}/{} files; {} remain AST-only",
+                    scip_covered.len(),
+                    files.len(),
+                    files.len().saturating_sub(scip_covered.len())
+                );
             }
 
             if !scip_specs.is_empty() && scip_covered.is_empty() {
@@ -1398,148 +1273,18 @@ impl ProjectIndexer {
                 );
             }
 
-            if scip_specs.is_empty() && analyzer_settings.lsp_enabled() && !fallback_enabled {
+            if scip_specs.is_empty() {
                 warn!(
-                    "No SCIP index was supplied and CODEGRAPH_LSP_FALLBACK is off: \
-                     no compiler-index or language-server enrichment will run. \
+                    "No SCIP index was supplied: no compiler-index enrichment will run. \
                      Generate indexes with `scripts/scip-index.sh --export` and set \
-                     CODEGRAPH_SCIP_INDEX, or pass CODEGRAPH_LSP_FALLBACK=1 for one run."
+                     CODEGRAPH_SCIP_INDEX."
                 );
             }
 
-            let lsp_files = files_without_scip_coverage(&self.project_root, &files, &scip_covered);
-            // Language servers only run when enrichment is enabled, at least one server is
-            // available and something is actually uncovered. Otherwise every uncovered file
-            // keeps its AST-only result, which `files_without_enrichment` reports.
-            let lsp_fallback_will_run = analyzer_settings.lsp_enabled()
-                && !analyzer_languages.is_empty()
-                && !lsp_files.is_empty()
-                && fallback_enabled;
             let files_without_enrichment =
-                files_without_enrichment(lsp_fallback_will_run, lsp_files.len());
-            if !fallback_enabled && !lsp_files.is_empty() {
-                info!(
-                    "🧠 LSP fallback disabled (opt-in via CODEGRAPH_LSP_FALLBACK): {} files without SCIP coverage keep AST-only results",
-                    lsp_files.len()
-                );
-            }
-            if lsp_fallback_will_run {
-                let start = std::time::Instant::now();
-                info!(
-                    "🧠 Language-server analysis starting (mode: {}, languages: {:?})",
-                    lsp_mode_label, analyzer_languages
-                );
-
-                let project_root = self.project_root.clone();
-                let path_env = path_env.clone();
-
-                let mut language_files: std::collections::HashMap<
-                    codegraph_core::Language,
-                    Vec<PathBuf>,
-                > = std::collections::HashMap::new();
-                let registry = codegraph_parser::LanguageRegistry::new();
-                for p in &lsp_files {
-                    if let Some(lang) = registry.detect_language(&p.to_string_lossy()) {
-                        language_files.entry(lang).or_default().push(p.clone());
-                    }
-                }
-
-                let mut grouped: std::collections::BTreeMap<
-                    String,
-                    (crate::analyzers::LspServerSpec, Vec<PathBuf>),
-                > = std::collections::BTreeMap::new();
-                for (language, files) in language_files {
-                    if let Some(spec) = crate::analyzers::lsp_server_for_language(&language) {
-                        grouped
-                            .entry(spec.tool_name.to_owned())
-                            .or_insert_with(|| (spec.clone(), Vec::new()))
-                            .1
-                            .extend(files);
-                    }
-                }
-                let mut total_stats = crate::analyzers::lsp::LspEnrichmentStats::default();
-                for (_, (spec, mut files)) in grouped {
-                    files.sort();
-                    files.dedup();
-                    // Trade some cross-project accuracy for bounded memory: rust-analyzer
-                    // loads dependency crates by default, clangd indexes in the background.
-                    let mut server_args: Vec<&'static str> = spec.args.to_vec();
-                    server_args.extend(extra_server_args(
-                        spec.tool_name,
-                        clangd_background_allowed(),
-                    ));
-                    let mut candidates =
-                        crate::analyzers::find_tool_candidates_on_path(spec.tool_name, &path_env);
-                    // TypeScript 7 (native preview) ships `tsc --lsp` but no `tsserver.js`,
-                    // which `typescript-language-server` requires.
-                    if spec.tool_name == "typescript-language-server"
-                        && let Some((command, args)) = typescript_lsp_command(&project_root)
-                    {
-                        info!(
-                            "🧠 TypeScript native preview: using {} {}",
-                            command.display(),
-                            args.join(" ")
-                        );
-                        candidates = vec![command];
-                        server_args = args;
-                    }
-                    if candidates.is_empty() {
-                        return Err(anyhow!(
-                            "Missing required analyzer tool: {}",
-                            spec.tool_name
-                        ));
-                    }
-                    let mut success = false;
-                    let mut last_error = None;
-                    for tool in candidates {
-                        match crate::analyzers::lsp::enrich_async(
-                            &self.lsp_pool,
-                            Some(&source_snapshots),
-                            &tool,
-                            &server_args,
-                            spec.language_id,
-                            spec.name_joiner,
-                            analyzer_settings.lsp_definitions_enabled(),
-                            &project_root,
-                            &files,
-                            &mut nodes,
-                            &mut edges,
-                        )
-                        .await
-                        {
-                            Ok(stats) => {
-                                total_stats.nodes_enriched += stats.nodes_enriched;
-                                total_stats.edges_resolved += stats.edges_resolved;
-                                success = true;
-                                break;
-                            }
-                            Err(error) => {
-                                self.lsp_pool.clear().await;
-                                last_error = Some(error);
-                            }
-                        }
-                    }
-                    if !success {
-                        let reason = last_error
-                            .map(|error| error.to_string())
-                            .unwrap_or_else(|| "no usable LSP candidate".to_string());
-                        warn!(
-                            "LSP enrichment for {} failed: {reason}; continuing with AST-only results",
-                            spec.tool_name
-                        );
-                    }
-                }
-
-                lsp_enrichment_stats.nodes_enriched += total_stats.nodes_enriched;
-                lsp_enrichment_stats.edges_resolved += total_stats.edges_resolved;
-                info!(
-                    "🧠 Language-server analysis complete: {} nodes enriched + {} edges resolved in {:.1?}",
-                    total_stats.nodes_enriched,
-                    total_stats.edges_resolved,
-                    start.elapsed()
-                );
-            }
-            let mut enrichment_stats = crate::analyzers::enrichment::EnrichmentStats::default();
+                files_without_enrichment(files.len().saturating_sub(scip_covered.len()));
+            let mut basic_enrichment_stats =
+                crate::analyzers::enrichment::EnrichmentStats::default();
             if analyzer_settings.enrichment {
                 let start = std::time::Instant::now();
                 info!("🧾 Enrichment analysis starting (rustdoc + api surface)");
@@ -1564,15 +1309,15 @@ impl ProjectIndexer {
                 std::mem::swap(&mut nodes, &mut nodes_updated);
                 std::mem::swap(&mut edges, &mut edges_updated);
 
-                enrichment_stats = enrich_stats;
+                basic_enrichment_stats = enrich_stats;
                 info!(
                     "🧾 Enrichment analysis complete: docs={} api_marked={} exports={} reexports={} feature_enables={} lsp_uses={} in {:.1?}",
-                    enrichment_stats.docs_attached,
-                    enrichment_stats.api_marked,
-                    enrichment_stats.export_edges_added,
-                    enrichment_stats.reexport_edges_added,
-                    enrichment_stats.feature_enables_edges_added,
-                    enrichment_stats.uses_edges_derived,
+                    basic_enrichment_stats.docs_attached,
+                    basic_enrichment_stats.api_marked,
+                    basic_enrichment_stats.export_edges_added,
+                    basic_enrichment_stats.reexport_edges_added,
+                    basic_enrichment_stats.feature_enables_edges_added,
+                    basic_enrichment_stats.uses_edges_derived,
                     start.elapsed()
                 );
             }
@@ -1893,14 +1638,14 @@ impl ProjectIndexer {
                 analyzers_enabled: analyzer_settings.any_enabled(),
                 build_context_nodes,
                 build_context_edges,
-                lsp_nodes_enriched: lsp_enrichment_stats.nodes_enriched,
-                lsp_edges_resolved: lsp_enrichment_stats.edges_resolved,
+                lsp_nodes_enriched: enrichment_stats.nodes_enriched,
+                lsp_edges_resolved: enrichment_stats.edges_resolved,
                 files_without_enrichment,
-                docs_attached: enrichment_stats.docs_attached,
-                export_edges_added: enrichment_stats.export_edges_added,
-                reexport_edges_added: enrichment_stats.reexport_edges_added,
-                feature_enables_edges_added: enrichment_stats.feature_enables_edges_added,
-                uses_edges_derived: enrichment_stats.uses_edges_derived,
+                docs_attached: basic_enrichment_stats.docs_attached,
+                export_edges_added: basic_enrichment_stats.export_edges_added,
+                reexport_edges_added: basic_enrichment_stats.reexport_edges_added,
+                feature_enables_edges_added: basic_enrichment_stats.feature_enables_edges_added,
+                uses_edges_derived: basic_enrichment_stats.uses_edges_derived,
                 module_nodes_added: module_linker_stats.module_nodes_added,
                 module_contains_edges_added: module_linker_stats.contains_edges_added,
                 module_import_edges_added: module_linker_stats.module_import_edges_added,
@@ -4258,91 +4003,6 @@ mod tests {
         assert_eq!(column.dimension(), 3072);
     }
 
-    #[tokio::test]
-    async fn analyzer_requires_rust_analyzer_when_lsp_enabled() {
-        let settings =
-            AnalyzerSettings::for_tier(codegraph_core::config_manager::IndexingTier::Full);
-
-        let err = ProjectIndexer::validate_analyzer_tools(
-            &[codegraph_core::Language::Rust],
-            settings,
-            "",
-            Path::new("."),
-        )
-        .await
-        .expect_err("should fail when required tools are missing");
-        assert!(err.to_string().contains("Missing rust-analyzer"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn analyzer_rejects_broken_rustup_shims_and_accepts_working_fallbacks() {
-        use std::os::unix::fs::PermissionsExt;
-        let project = tempfile::tempdir().unwrap();
-        let broken = project.path().join("broken");
-        let working = project.path().join("working");
-        for directory in [&broken, &working] {
-            std::fs::create_dir(directory).unwrap();
-        }
-        std::fs::write(project.path().join("rust-toolchain.toml"), "sentinel").unwrap();
-        for (directory, script) in [
-            (
-                &broken,
-                "#!/bin/sh\nprintf \"Unknown binary 'rust-analyzer' in official toolchain 'stable'\\n\" >&2\nexit 1\n",
-            ),
-            (
-                &working,
-                "#!/bin/sh\n[ \"$1\" = --version ] && [ -f rust-toolchain.toml ] || exit 2\nprintf 'rust-analyzer test\\n'\n",
-            ),
-        ] {
-            let path = directory.join("rust-analyzer");
-            std::fs::write(&path, script).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let settings =
-            AnalyzerSettings::for_tier(codegraph_core::config_manager::IndexingTier::Balanced);
-        let error = ProjectIndexer::validate_analyzer_tools(
-            &[codegraph_core::Language::Rust],
-            settings,
-            broken.to_str().unwrap(),
-            project.path(),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("Unknown binary 'rust-analyzer'"), "{error}");
-        assert!(error.contains("rustup component add rust-analyzer"));
-        assert!(error.contains(broken.to_str().unwrap()));
-        let path = std::env::join_paths([&broken, &working]).unwrap();
-        ProjectIndexer::validate_analyzer_tools(
-            &[codegraph_core::Language::Rust],
-            settings,
-            path.to_str().unwrap(),
-            project.path(),
-        )
-        .await
-        .unwrap();
-        ProjectIndexer::validate_analyzer_tools(
-            &[codegraph_core::Language::Rust],
-            AnalyzerSettings::for_tier(codegraph_core::config_manager::IndexingTier::Fast),
-            broken.to_str().unwrap(),
-            project.path(),
-        )
-        .await
-        .unwrap();
-        ProjectIndexer::validate_analyzer_tools(
-            &[codegraph_core::Language::Rust],
-            AnalyzerSettings {
-                require_tools: false,
-                ..settings
-            },
-            broken.to_str().unwrap(),
-            project.path(),
-        )
-        .await
-        .unwrap();
-    }
-
     #[test]
     fn fast_tier_filters_noisy_edges() {
         let mut edges = vec![
@@ -4551,103 +4211,6 @@ struct FileStats {
 #[cfg(feature = "embeddings")]
 use codegraph_vector::prep::chunker::ChunkMeta;
 
-/// Language servers load the whole workspace, so a partial re-index disables them
-/// unless `CODEGRAPH_LSP_ON_PARTIAL` presses them back on.
-fn effective_lsp_mode(
-    base: crate::analyzers::LspMode,
-    partial_scope: bool,
-    allow_partial_lsp: bool,
-) -> crate::analyzers::LspMode {
-    if partial_scope && !allow_partial_lsp {
-        crate::analyzers::LspMode::Off
-    } else {
-        base
-    }
-}
-
-fn partial_lsp_allowed() -> bool {
-    matches!(
-        std::env::var("CODEGRAPH_LSP_ON_PARTIAL").as_deref(),
-        Ok("1" | "true" | "on")
-    )
-}
-
-/// TypeScript 7 native preview ships `tsc --lsp --stdio` but no `lib/tsserver.js`.
-///
-/// Returns the native command when the project's TypeScript cannot drive
-/// `typescript-language-server`; `None` means classic tsserver is available.
-fn typescript_lsp_command(project_root: &Path) -> Option<(PathBuf, Vec<&'static str>)> {
-    let mut dir = Some(project_root);
-    for _ in 0..4 {
-        let root = dir?;
-        let ts_dir = root.join("node_modules/typescript");
-        if ts_dir.join("lib/tsserver.js").is_file() {
-            return None;
-        }
-        let bin = root.join("node_modules/.bin/tsc");
-        let raw = ts_dir.join("bin/tsc");
-        let command = if bin.is_file() {
-            Some(bin)
-        } else if raw.is_file() {
-            Some(raw)
-        } else {
-            None
-        };
-        if let Some(command) = command {
-            return Some((command, vec!["--lsp", "--stdio"]));
-        }
-        dir = root.parent();
-    }
-    None
-}
-
-/// Extra server flags that trade some cross-project accuracy for lower memory use.
-fn extra_server_args(tool_name: &str, clangd_background_index: bool) -> Vec<&'static str> {
-    let mut extra = Vec::new();
-    // rust-analyzer rejects `--no-deps` on the LSP entrypoint (it belongs to
-    // `analysis-stats`), so never pass it here.
-    if tool_name == "clangd" && !clangd_background_index {
-        extra.push("--background-index=false");
-    }
-    extra
-}
-
-fn clangd_background_allowed() -> bool {
-    matches!(
-        std::env::var("CODEGRAPH_LSP_CLANGD_BACKGROUND").as_deref(),
-        Ok("1" | "true" | "on")
-    )
-}
-
-/// Available memory in MiB, when the platform exposes it cheaply.
-fn available_memory_mb() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in meminfo.lines() {
-            if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
-                return Some(kib / 1024);
-            }
-        }
-        None
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // No cheap "available" counter; total memory is a conservative upper bound.
-        let output = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        let bytes: u64 = String::from_utf8(output.stdout).ok()?.trim().parse().ok()?;
-        Some(bytes / 1024 / 1024)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
 /// Normalize a source path to a project-relative, posix-style key.
 ///
 /// Node ids embed this path, so the same file must resolve to one key regardless of
@@ -4676,50 +4239,11 @@ pub(crate) fn normalize_file_path(project_root: &Path, raw: &str) -> String {
     if out.is_empty() { ".".to_string() } else { out }
 }
 
-/// Files this run scanned that no supplied SCIP index covers. LSP enrichment
-/// runs only on these, so a mixed-language project gets compiler-grade symbol
-/// data where an index exists and language-server data everywhere else.
-pub(crate) fn files_without_scip_coverage(
-    project_root: &Path,
-    files: &[(PathBuf, u64)],
-    covered: &std::collections::BTreeSet<String>,
-) -> Vec<PathBuf> {
-    if covered.is_empty() {
-        return files.iter().map(|(path, _)| path.clone()).collect();
-    }
-    files
-        .iter()
-        .filter(|(path, _)| {
-            !covered.contains(&normalize_file_path(project_root, &path.to_string_lossy()))
-        })
-        .map(|(path, _)| path.clone())
-        .collect()
-}
-
-/// Files this run leaves AST-only: the scanned files no SCIP index covers, unless the
-/// language-server fallback actually ran over them.
-///
-/// `fallback_enabled` means the fallback is *going to run* for these files, not merely
-/// that `CODEGRAPH_LSP_FALLBACK` is set: a run with no language server or no uncovered
-/// file still reports the AST-only count.
-fn files_without_enrichment(fallback_enabled: bool, lsp_files: usize) -> usize {
-    if fallback_enabled { 0 } else { lsp_files }
-}
-
-/// Whether files without SCIP coverage may fall back to a language server.
-///
-/// Off by default: a compiler index is deterministic, and on EasyTier the
-/// language-server fallback cost 44 s of a 65 s full index for 0.48% more edges
-/// (see docs/LSP_DETERMINISM.md).
-///
-/// `CODEGRAPH_LSP_FALLBACK=1|true|on|yes` re-enables it for one run.
-fn lsp_fallback_enabled() -> bool {
-    matches!(
-        std::env::var("CODEGRAPH_LSP_FALLBACK")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if value == "1" || value == "true" || value == "on" || value == "yes"
-    )
+/// Files this run leaves AST-only: every scanned file that no supplied SCIP index
+/// covers. The caller passes `files.len() - scip_covered.len()`; the named helper keeps
+/// that contract explicit (and testable) instead of an anonymous subtraction.
+fn files_without_enrichment(uncovered_scip_files: usize) -> usize {
+    uncovered_scip_files
 }
 
 /// One `CODEGRAPH_SCIP_INDEX` entry: a SCIP artifact plus the optional directory
@@ -4732,7 +4256,7 @@ pub(crate) struct ScipIndexSpec {
 
 /// Parse `CODEGRAPH_SCIP_INDEX` as comma-separated `<path>[@<subdir>]` entries.
 ///
-/// Unset or blank values yield no indexes (the LSP path takes over). A malformed
+/// Unset or blank values yield no indexes (no compiler-index enrichment runs). A malformed
 /// entry is a hard error: silently treating `"a.scip,b.scip"` as one path would
 /// produce a confusing "file not found" far from the real mistake.
 pub(crate) fn parse_scip_indexes(raw: Option<&str>) -> Result<Vec<ScipIndexSpec>> {
@@ -4887,73 +4411,6 @@ mod scip_index_tests {
     }
 }
 
-#[cfg(test)]
-mod partial_lsp_tests {
-    use super::*;
-    use crate::analyzers::LspMode;
-
-    #[test]
-    fn partial_scope_disables_language_servers_unless_forced() {
-        assert_eq!(
-            effective_lsp_mode(LspMode::SymbolsAndDefinitions, true, false),
-            LspMode::Off
-        );
-        assert_eq!(
-            effective_lsp_mode(LspMode::SymbolsOnly, true, false),
-            LspMode::Off
-        );
-        assert_eq!(
-            effective_lsp_mode(LspMode::SymbolsOnly, true, true),
-            LspMode::SymbolsOnly
-        );
-        assert_eq!(
-            effective_lsp_mode(LspMode::SymbolsOnly, false, false),
-            LspMode::SymbolsOnly
-        );
-    }
-}
-
-#[cfg(test)]
-mod memory_guard_tests {
-    use super::*;
-
-    #[test]
-    fn extra_flags_shrink_server_memory_by_default() {
-        // rust-analyzer must not receive `--no-deps`: the LSP entrypoint rejects it.
-        assert!(extra_server_args("rust-analyzer", false).is_empty());
-        assert_eq!(
-            extra_server_args("clangd", false),
-            vec!["--background-index=false"]
-        );
-        assert!(extra_server_args("clangd", true).is_empty());
-        assert!(extra_server_args("typescript-language-server", false).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod typescript_lsp_tests {
-    use super::*;
-
-    #[test]
-    fn detects_native_typescript_without_tsserver() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("node_modules/typescript/lib")).unwrap();
-        std::fs::write(root.join("node_modules/typescript/lib/tsserver.js"), "").unwrap();
-        assert!(
-            typescript_lsp_command(root).is_none(),
-            "classic tsserver means typescript-language-server works"
-        );
-
-        std::fs::remove_file(root.join("node_modules/typescript/lib/tsserver.js")).unwrap();
-        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
-        std::fs::write(root.join("node_modules/.bin/tsc"), "").unwrap();
-        let (command, args) = typescript_lsp_command(root).expect("native tsc");
-        assert!(command.ends_with("node_modules/.bin/tsc"));
-        assert_eq!(args, vec!["--lsp", "--stdio"]);
-    }
-}
-
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -5078,160 +4535,21 @@ mod resolution_count_tests {
 }
 
 #[cfg(test)]
-mod scip_coverage_tests {
+mod enrichment_coverage_tests {
     use super::*;
 
-    fn files(paths: &[&str]) -> Vec<(PathBuf, u64)> {
-        paths.iter().map(|path| (PathBuf::from(path), 0)).collect()
-    }
-
-    fn covered(keys: &[&str]) -> std::collections::BTreeSet<String> {
-        keys.iter().map(|key| key.to_string()).collect()
-    }
-
     #[test]
-    fn scip_covered_files_are_skipped() {
-        let root = Path::new("/repo");
-        let scanned = files(&["src/a.rs", "src/b.go", "web/c.ts"]);
-        let remaining = files_without_scip_coverage(root, &scanned, &covered(&["src/a.rs"]));
+    fn files_without_enrichment_counts_uncovered_files_only() {
         assert_eq!(
-            remaining,
-            vec![PathBuf::from("src/b.go"), PathBuf::from("web/c.ts")],
-            "only files covered by a SCIP index should be removed from LSP input"
-        );
-        assert_eq!(remaining.len(), 2);
-        assert!(
-            !remaining.contains(&PathBuf::from("src/a.rs")),
-            "a SCIP-covered file must not be handed to LSP"
-        );
-    }
-
-    #[test]
-    fn no_scip_coverage_keeps_all_files() {
-        let root = Path::new("/repo");
-        let scanned = files(&["src/a.rs", "src/b.go", "web/c.ts"]);
-        let remaining = files_without_scip_coverage(root, &scanned, &covered(&[]));
-        assert_eq!(
-            remaining,
-            vec![
-                PathBuf::from("src/a.rs"),
-                PathBuf::from("src/b.go"),
-                PathBuf::from("web/c.ts"),
-            ],
-            "with no SCIP index every scanned file must stay in LSP input, in order"
-        );
-    }
-
-    #[test]
-    fn absolute_paths_match_coverage_keys() {
-        let root = Path::new("/repo");
-        let scanned = files(&["/repo/src/a.rs", "/repo/src/b.go"]);
-        let remaining = files_without_scip_coverage(root, &scanned, &covered(&["src/a.rs"]));
-        assert_eq!(
-            remaining,
-            vec![PathBuf::from("/repo/src/b.go")],
-            "absolute scanned paths must normalise to the same project-relative key SCIP emits"
-        );
-        assert!(
-            !remaining.contains(&PathBuf::from("/repo/src/a.rs")),
-            "SCIP keys are project-relative posix while scanned files may be absolute"
-        );
-    }
-
-    #[test]
-    fn uncovered_files_keep_their_order() {
-        let root = Path::new("/repo");
-        let scanned = files(&["src/a.rs", "src/b.go", "web/c.ts"]);
-        let remaining = files_without_scip_coverage(root, &scanned, &covered(&["src/b.go"]));
-        assert_eq!(
-            remaining,
-            vec![PathBuf::from("src/a.rs"), PathBuf::from("web/c.ts")],
-            "filtering must preserve the scanned order of the remaining files"
-        );
-    }
-
-    #[test]
-    fn files_without_enrichment_is_zero_when_fallback_ran() {
-        assert_eq!(
-            files_without_enrichment(true, 287),
-            0,
-            "files the language-server fallback actually processed are not AST-only"
-        );
-        assert_eq!(
-            files_without_enrichment(false, 287),
+            files_without_enrichment(287),
             287,
-            "without the fallback every uncovered file stays AST-only"
+            "without SCIP coverage every scanned file stays AST-only"
         );
         assert_eq!(
-            files_without_enrichment(false, 0),
+            files_without_enrichment(0),
             0,
             "full SCIP coverage reports no AST-only file"
         );
-    }
-}
-
-#[cfg(test)]
-mod lsp_fallback_tests {
-    use super::*;
-
-    /// `CODEGRAPH_LSP_FALLBACK` is read from the process environment, so these
-    /// tests must not overlap with each other.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-    /// Serialises the test and removes `CODEGRAPH_LSP_FALLBACK` on drop,
-    /// including when an assertion panics.
-    struct FallbackEnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl FallbackEnvGuard {
-        fn new(value: Option<&str>) -> Self {
-            let lock = ENV_MUTEX
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match value {
-                Some(value) => unsafe { std::env::set_var("CODEGRAPH_LSP_FALLBACK", value) },
-                None => unsafe { std::env::remove_var("CODEGRAPH_LSP_FALLBACK") },
-            }
-            Self { _lock: lock }
-        }
-    }
-
-    impl Drop for FallbackEnvGuard {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var("CODEGRAPH_LSP_FALLBACK") };
-        }
-    }
-
-    #[test]
-    fn lsp_fallback_defaults_to_disabled() {
-        let _guard = FallbackEnvGuard::new(None);
-        assert!(
-            !lsp_fallback_enabled(),
-            "unset CODEGRAPH_LSP_FALLBACK must keep the language-server fallback off"
-        );
-    }
-
-    #[test]
-    fn lsp_fallback_accepts_enabling_values() {
-        for value in ["1", "true", "ON", " yes "] {
-            let _guard = FallbackEnvGuard::new(Some(value));
-            assert!(
-                lsp_fallback_enabled(),
-                "CODEGRAPH_LSP_FALLBACK={value:?} must enable the language-server fallback"
-            );
-        }
-    }
-
-    #[test]
-    fn lsp_fallback_keeps_disabled_for_other_values() {
-        for value in ["0", "false", "anything"] {
-            let _guard = FallbackEnvGuard::new(Some(value));
-            assert!(
-                !lsp_fallback_enabled(),
-                "CODEGRAPH_LSP_FALLBACK={value:?} must leave the language-server fallback off"
-            );
-        }
     }
 }
 
