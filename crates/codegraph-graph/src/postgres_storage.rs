@@ -1865,24 +1865,31 @@ impl PgStore {
     pub async fn upsert_project_metadata(&self, record: &ProjectMetadataRecord) -> Result<()> {
         let last_analyzed = record.last_analyzed.to_rfc3339();
         let metadata = metadata_text(Some(&record.metadata))?.unwrap_or_else(|| "{}".to_string());
+        let project_id = pg_sanitize(&record.project_id);
+        let name = pg_sanitize(&record.name);
+        let root_path = pg_sanitize(&record.root_path);
+        let primary_language = record.primary_language.as_deref().map(pg_sanitize);
+        let codegraph_version = pg_sanitize(&record.codegraph_version);
+        let organization_id = record.organization_id.as_deref().map(pg_sanitize);
+        let domain = record.domain.as_deref().map(pg_sanitize);
 
         let client = self.pool.get().await.map_err(db_err)?;
         client
             .execute(
                 UPSERT_PROJECT_METADATA_SQL,
                 &[
-                    &record.project_id,
-                    &record.name,
-                    &record.root_path,
-                    &record.primary_language,
+                    &project_id,
+                    &name,
+                    &root_path,
+                    &primary_language,
                     &record.file_count,
                     &record.node_count,
                     &record.edge_count,
                     &record.avg_coverage_score,
                     &last_analyzed,
-                    &record.codegraph_version,
-                    &record.organization_id,
-                    &record.domain,
+                    &codegraph_version,
+                    &organization_id,
+                    &domain,
                     &metadata,
                 ],
             )
@@ -2045,6 +2052,16 @@ impl PgStore {
 // Backend-neutral adapter
 // ---------------------------------------------------------------------------
 
+/// Postgres `text` rejects NUL (`\0`); a single source file with a NUL byte would
+/// otherwise abort the whole index. Strip NULs before they reach COPY/INSERT.
+fn pg_sanitize(value: &str) -> String {
+    if value.as_bytes().contains(&0) {
+        value.replace('\0', "")
+    } else {
+        value.to_owned()
+    }
+}
+
 /// Pick the vector from whichever embedding column is populated. `1024` wins when
 /// several are set (the pgvector schema declares `vector(1024)`), otherwise the
 /// first populated column in ascending dimension order is used.
@@ -2083,19 +2100,27 @@ pub(crate) fn code_node_to_row(node: &CodeNode) -> NodeRow {
     let attributes = &node.metadata.attributes;
     NodeRow {
         id: node.id.to_string(),
-        project_id: attributes.get("project_id").cloned().unwrap_or_default(),
-        name: node.name.to_string(),
-        node_type: node.node_type.as_ref().map(|value| format!("{:?}", value)),
-        language: node.language.as_ref().map(|value| format!("{:?}", value)),
-        file_path: Some(node.location.file_path.clone()),
+        project_id: pg_sanitize(&attributes.get("project_id").cloned().unwrap_or_default()),
+        name: pg_sanitize(&node.name),
+        node_type: node
+            .node_type
+            .as_ref()
+            .map(|value| pg_sanitize(&format!("{:?}", value))),
+        language: node
+            .language
+            .as_ref()
+            .map(|value| pg_sanitize(&format!("{:?}", value))),
+        file_path: Some(pg_sanitize(&node.location.file_path)),
         start_line: Some(node.location.line as i32),
         end_line: node.location.end_line.map(|line| line as i32),
-        content: node.content.as_ref().map(|content| content.to_string()),
+        content: node.content.as_deref().map(pg_sanitize),
         complexity: node.complexity.map(|value| value as f64),
         chunk_count: attributes
             .get("chunk_count")
             .and_then(|value| value.parse::<i32>().ok()),
-        embedding_model: attributes.get("embedding_model").cloned(),
+        embedding_model: attributes
+            .get("embedding_model")
+            .map(|value| pg_sanitize(value)),
         embedding: node.embedding.clone(),
         metadata: if attributes.is_empty() {
             None
@@ -2109,7 +2134,7 @@ pub(crate) fn code_node_to_row(node: &CodeNode) -> NodeRow {
 pub(crate) fn code_edge_to_row(edge: &CodeEdge) -> EdgeRow {
     EdgeRow {
         id: edge.id.to_string(),
-        project_id: edge.project_id.clone().unwrap_or_default(),
+        project_id: pg_sanitize(&edge.project_id.clone().unwrap_or_default()),
         from_id: edge.from.to_string(),
         to_id: edge.to.to_string(),
         edge_type: edge.edge_type.to_string(),
@@ -2142,13 +2167,15 @@ pub(crate) fn chunk_record_to_row(record: &ChunkEmbeddingRecord) -> ChunkRow {
 
     ChunkRow {
         id: record.id.clone(),
-        project_id: record.project_id.clone(),
+        project_id: pg_sanitize(&record.project_id),
         chunk_index: record.chunk_index,
-        text: codegraph_core::decompress_string(&record.text)
-            .unwrap_or_else(|_| record.text.clone()),
-        parent_node: record.parent_node.clone(),
+        text: pg_sanitize(
+            &codegraph_core::decompress_string(&record.text)
+                .unwrap_or_else(|_| record.text.clone()),
+        ),
+        parent_node: pg_sanitize(&record.parent_node),
         embedding,
-        embedding_model: record.embedding_model.clone(),
+        embedding_model: pg_sanitize(&record.embedding_model),
     }
 }
 
@@ -2156,9 +2183,9 @@ pub(crate) fn chunk_record_to_row(record: &ChunkEmbeddingRecord) -> ChunkRow {
 pub(crate) fn symbol_record_to_row(record: &SymbolEmbeddingRecord) -> SymbolEmbeddingRow {
     SymbolEmbeddingRow {
         id: record.id.clone(),
-        project_id: record.project_id.clone(),
-        symbol: record.symbol.clone(),
-        normalized_symbol: record.normalized_symbol.clone(),
+        project_id: pg_sanitize(&record.project_id),
+        symbol: pg_sanitize(&record.symbol),
+        normalized_symbol: pg_sanitize(&record.normalized_symbol),
         embedding: pick_embedding(
             &record.embedding_384,
             &record.embedding_768,
@@ -2169,7 +2196,7 @@ pub(crate) fn symbol_record_to_row(record: &SymbolEmbeddingRecord) -> SymbolEmbe
             &record.embedding_3072,
             &record.embedding_4096,
         ),
-        embedding_model: Some(record.embedding_model.clone()),
+        embedding_model: Some(pg_sanitize(&record.embedding_model)),
         node_id: record.node_id.clone(),
         source_edge_id: record.source_edge_id.clone(),
         metadata: record.metadata.clone(),
@@ -2182,14 +2209,14 @@ pub(crate) fn symbol_record_to_row(record: &SymbolEmbeddingRecord) -> SymbolEmbe
 /// `last_indexed_at` is intentionally dropped (SQL `now()` stamps it).
 pub(crate) fn file_metadata_record_to_row(record: &FileMetadataRecord) -> FileMetadataRow {
     FileMetadataRow {
-        project_id: record.project_id.clone(),
-        file_path: record.file_path.clone(),
-        content_hash: record.content_hash.clone(),
+        project_id: pg_sanitize(&record.project_id),
+        file_path: pg_sanitize(&record.file_path),
+        content_hash: pg_sanitize(&record.content_hash),
         modified_at: Some(record.modified_at),
         file_size: Some(record.file_size),
         node_count: record.node_count as i32,
         edge_count: record.edge_count as i32,
-        language: record.language.clone(),
+        language: record.language.as_deref().map(pg_sanitize),
         parse_errors: record
             .parse_errors
             .as_ref()
@@ -5793,6 +5820,45 @@ mod storage_adapter_tests {
         assert_eq!(row.language.as_deref(), Some("Rust"));
         assert_eq!(row.embedding_model.as_deref(), Some("test-model"));
         assert_eq!(row.complexity, Some(3.5));
+    }
+
+    #[test]
+    fn pg_sanitize_strips_nul() {
+        assert_eq!(pg_sanitize("a\0b\0c"), "abc");
+        assert_eq!(pg_sanitize("plain"), "plain");
+        assert_eq!(pg_sanitize(""), "");
+    }
+
+    #[test]
+    fn code_node_row_strips_nul_bytes() {
+        let mut node = CodeNode::new(
+            "a\0b",
+            Some(NodeType::Function),
+            Some(Language::Rust),
+            Location {
+                file_path: "src/\0lib.rs".to_string(),
+                ..location()
+            },
+        );
+        node.content = Some("let x = \"a\0b\";".to_string().into());
+
+        let row = code_node_to_row(&node);
+
+        assert_eq!(row.name, "ab", "NULs are stripped from the node name");
+        assert_eq!(
+            row.file_path.as_deref(),
+            Some("src/lib.rs"),
+            "NULs are stripped from the file path"
+        );
+        assert_eq!(
+            row.content.as_deref(),
+            Some("let x = \"ab\";"),
+            "NULs are stripped from the source content"
+        );
+        assert!(
+            !row.content.as_deref().unwrap().contains('\0'),
+            "no NUL may reach the Postgres text column"
+        );
     }
 
     #[test]
