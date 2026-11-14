@@ -21,6 +21,7 @@ pub struct ChunkerConfig {
     pub skip_chunking: bool,
     /// Prefix each chunk's input with `"<file_name> <node_name>\n"` so identical
     /// source spans in different files/nodes do not produce identical vectors.
+    /// Default on; set `CODEGRAPH_CHUNK_CONTEXT=0` (or `false`) to disable.
     pub context_prefix: bool,
     pub cache_dir: Option<std::path::PathBuf>,
     pub use_text_splitter: bool,
@@ -40,7 +41,8 @@ impl ChunkerConfig {
             skip_chunking: std::env::var("CODEGRAPH_EMBEDDING_SKIP_CHUNKING")
                 .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             context_prefix: std::env::var("CODEGRAPH_CHUNK_CONTEXT")
-                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+                .map(|value| !(value == "0" || value.eq_ignore_ascii_case("false")))
+                .unwrap_or(true),
             cache_dir: None,
             token_counter: None,
             overlap_counter: None,
@@ -86,6 +88,11 @@ impl ChunkerConfig {
 
     pub fn skip_chunking(mut self, enabled: bool) -> Self {
         self.skip_chunking = enabled;
+        self
+    }
+
+    pub fn context_prefix(mut self, enabled: bool) -> Self {
+        self.context_prefix = enabled;
         self
     }
 }
@@ -679,7 +686,8 @@ mod pipeline_tests {
     fn byte_budget(limit: usize) -> ChunkerConfig {
         let mut config = ChunkerConfig::new(limit)
             .overlap_tokens(0)
-            .skip_chunking(false);
+            .skip_chunking(false)
+            .context_prefix(false);
         config.token_counter = Some(("byte-budget".into(), Arc::new(str::len)));
         config
     }
@@ -815,7 +823,8 @@ mod pipeline_tests {
             Arc::new(tokenizer),
             ChunkerConfig::new(32)
                 .overlap_tokens(0)
-                .skip_chunking(false),
+                .skip_chunking(false)
+                .context_prefix(false),
         )
         .unwrap();
         assert!(plan.chunks.len() > 1);
@@ -867,7 +876,10 @@ mod pipeline_tests {
             },
         )
         .with_content(text.clone());
-        let mut config = ChunkerConfig::new(47).overlap_tokens(0).smart_split(false);
+        let mut config = ChunkerConfig::new(47)
+            .overlap_tokens(0)
+            .smart_split(false)
+            .context_prefix(false);
         config.use_text_splitter = true;
         config.token_counter = Some(("utf8-byte-budget".into(), Arc::new(str::len)));
         let plan = build_chunk_plan(&[node], tokenizer, config).unwrap();
@@ -910,7 +922,9 @@ mod pipeline_tests {
         let plan = build_chunk_plan(
             &nodes,
             tokenizer.clone(),
-            ChunkerConfig::new(32).overlap_tokens(0),
+            ChunkerConfig::new(32)
+                .overlap_tokens(0)
+                .context_prefix(false),
         )
         .unwrap();
         assert!(
