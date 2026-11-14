@@ -182,6 +182,18 @@ fn position_error_context(relative_path: &str, range: &[i32; 4], encoding: i32) 
     )
 }
 
+/// SCIP writers may leave `position_encoding` Unspecified (0). Observed on
+/// scip-python 0.6.8: it emits UTF-16 code-unit columns but writes no encoding, so
+/// treating 0 as UTF-8 would misplace symbols after a non-ASCII character on the
+/// same line. scip-typescript (Node) is UTF-16 too; rust-analyzer and scip-go set
+/// UTF-8 explicitly, so they never reach this default.
+fn position_encoding(document: &Document) -> i32 {
+    match document.position_encoding.value() {
+        0 => 2, // Unspecified -> UTF-16
+        other => other,
+    }
+}
+
 fn byte_position(
     source: &str,
     starts: &[usize],
@@ -377,7 +389,7 @@ pub fn import(
                 continue;
             }
             let range = range(occurrence)?;
-            let encoding = document.position_encoding.value();
+            let encoding = position_encoding(&document);
             let byte =
                 byte_position(&text, &starts, range[0], range[1], encoding).with_context(|| {
                     position_error_context(&document.relative_path, &range, encoding)
@@ -463,7 +475,7 @@ pub fn import(
             }
             let target = *targets.first().unwrap();
             let range = range(occurrence)?;
-            let encoding = document.position_encoding.value();
+            let encoding = position_encoding(&document);
             let start =
                 byte_position(&text, &starts, range[0], range[1], encoding).with_context(|| {
                     position_error_context(&document.relative_path, &range, encoding)
@@ -662,6 +674,49 @@ mod tests {
         assert!(byte_position(text, &[0], 0, 1, 1).is_err());
         assert!(byte_position(text, &[0], 0, 0, 0).is_err());
         assert_ne!(symbol_key("a.rs", "local 0"), symbol_key("b.rs", "local 0"));
+    }
+
+    #[test]
+    fn unspecified_encoding_defaults_to_utf16() {
+        let document = Document {
+            position_encoding: scip::types::PositionEncoding::UnspecifiedPositionEncoding.into(),
+            ..Default::default()
+        };
+        assert_eq!(position_encoding(&document), 2);
+        assert_eq!(position_encoding(&Document::default()), 2);
+    }
+
+    #[test]
+    fn explicit_encodings_pass_through() {
+        let cases = [
+            (
+                scip::types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+                1,
+            ),
+            (
+                scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
+                2,
+            ),
+            (
+                scip::types::PositionEncoding::UTF32CodeUnitOffsetFromLineStart,
+                3,
+            ),
+        ];
+        for (encoding, expected) in cases {
+            let document = Document {
+                position_encoding: encoding.into(),
+                ..Default::default()
+            };
+            assert_eq!(position_encoding(&document), expected);
+        }
+    }
+
+    #[test]
+    fn utf16_column_after_non_ascii_maps_correctly() {
+        let text = "    s = \"é\"; return target()\n";
+        let starts = vec![0, text.len()];
+        let byte = byte_position(text, &starts, 0, 20, 2).unwrap();
+        assert!(text[byte..].starts_with("target"), "{}", &text[byte..]);
     }
 
     #[test]
