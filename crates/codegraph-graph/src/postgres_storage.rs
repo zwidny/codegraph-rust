@@ -800,6 +800,16 @@ fn vector_indexes_disabled() -> bool {
     )
 }
 
+/// `true` when a parallel HNSW build could not get its shared memory segment,
+/// which happens when the Postgres container's `/dev/shm` is smaller than
+/// `maintenance_work_mem`.
+fn shared_memory_exhausted(error: &tokio_postgres::Error) -> bool {
+    // `Display` on this error is just "db error"; the server message lives in the
+    // Debug rendering of the DbError cause.
+    let text = format!("{error:?}");
+    text.contains("shared memory segment") || text.contains("No space left on device")
+}
+
 /// Project a caller/callee row (`CALLERS_OF_NAME_SQL` / `CALLEES_OF_NAME_SQL`) into
 /// [`crate::storage::CallRelation`]. A NULL `file_path` becomes an empty string.
 fn call_relation_from_row(row: tokio_postgres::Row) -> crate::storage::CallRelation {
@@ -2525,12 +2535,39 @@ impl crate::storage::IndexStorage for PgStore {
             );
         }
 
-        let client = self.pool.get().await.map_err(db_err)?;
-        client
-            .batch_execute(&statements.join("\n"))
+        // Building into memory is much faster than spilling to disk: measured on
+        // 38,080 EasyTier chunks with two parallel workers, 64 MB (the server
+        // default) took 11.6 s and 256 MB took 4.4 s. pgvector needs /dev/shm at
+        // least that large for a parallel build, and a small container shm makes
+        // the build fail outright ("could not resize shared memory segment"), so
+        // this is attempted in a transaction and retried without it.
+        let sql = statements.join("\n");
+        let mut client = self.pool.get().await.map_err(db_err)?;
+        let transaction = client.transaction().await.map_err(db_err)?;
+        transaction
+            .batch_execute("SET LOCAL maintenance_work_mem = '256MB'")
             .await
             .map_err(db_err)?;
-        Ok(true)
+        match transaction.batch_execute(&sql).await {
+            Ok(()) => {
+                transaction.commit().await.map_err(db_err)?;
+                Ok(true)
+            }
+            Err(error) if shared_memory_exhausted(&error) => {
+                // /dev/shm is smaller than maintenance_work_mem. Roll back the
+                // SET and build with the server default instead of failing.
+                transaction.rollback().await.ok();
+                tracing::warn!(
+                    "HNSW build could not use 256MB of shared memory ({error}); \
+                     building with the server default. Raise the Postgres container's \
+                     shm_size (for example --shm-size=512m) to speed this up."
+                );
+                let client = self.pool.get().await.map_err(db_err)?;
+                client.batch_execute(&sql).await.map_err(db_err)?;
+                Ok(true)
+            }
+            Err(error) => Err(db_err(error).into()),
+        }
     }
 
     async fn reset_vector_indexes(&self) -> anyhow::Result<()> {
