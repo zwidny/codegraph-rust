@@ -247,7 +247,7 @@ impl GraphToolSchemas {
                    Works for both conceptual searches and specific identifiers. \
                    Returns relevant code snippets, definitions, and related nodes ranked by relevance. Best practice: start with a low threshold (e.g., 0.2–0.4) and raise it in follow-up queries to narrow scope. \
                    Each row carries three scores: `vector_score` (cosine similarity, the score `threshold` filters on), \
-                   `text_score` (BM25), and `combined_score` (RRF rank, 1/(60+rank) - ordering only, not a similarity). \
+                   `text_score` (ts_rank_cd, not BM25), and `combined_score` (RRF rank, 1/(60+rank) - ordering only, not a similarity). \
                    The response's `score_semantics` object restates this.".to_string(),
             parameters: json!({
                 "type": "object",

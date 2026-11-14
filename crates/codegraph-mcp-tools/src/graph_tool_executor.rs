@@ -122,7 +122,7 @@ fn retain_in_project_rows(rows: Vec<JsonValue>, project_root: &Path) -> Vec<Json
 fn score_semantics() -> JsonValue {
     json!({
         "vector_score": "Cosine similarity from the HNSW chunk search (0..1). The `threshold` parameter filters on this score.",
-        "text_score": "BM25 full-text score over node name and content (higher is better, unbounded).",
+        "text_score": "ts_rank_cd full-text score over node name and content (Postgres coverage/density rank, not BM25 — no corpus IDF; higher is better, unbounded).",
         "combined_score": "Reciprocal Rank Fusion (RRF) of the vector and text lists, computed as 1/(60+rank). Use it for ordering only; it is not a similarity value.",
         "threshold_applies_to": "vector_score",
         "ordering": "Rows are ordered by combined_score descending."
@@ -1302,8 +1302,8 @@ mod tests {
 
         let text = semantics["text_score"].as_str().unwrap();
         assert!(
-            text.to_lowercase().contains("bm25"),
-            "text_score must name BM25: {text}"
+            text.to_lowercase().contains("ts_rank_cd"),
+            "text_score must name ts_rank_cd: {text}"
         );
 
         let combined = semantics["combined_score"].as_str().unwrap();
