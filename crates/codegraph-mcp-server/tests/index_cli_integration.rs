@@ -305,58 +305,6 @@ async fn jina_index_requests_honor_dotenv_task_precedence_and_v5_defaults() {
     server.abort();
 }
 
-#[cfg(unix)]
-#[test]
-fn broken_rustup_shim_is_reported_before_parsing_even_for_another_project() {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::tempdir().unwrap();
-    let invocation_root = directory.path();
-    let root = invocation_root.join("project");
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-    std::fs::write(root.join("project.marker"), "").unwrap();
-    let config = root.join("providers.toml");
-    codegraph_core::config_manager::ConfigManager::create_default_config(&config).unwrap();
-    std::fs::create_dir(invocation_root.join("bin")).unwrap();
-    let shim = invocation_root.join("bin/rust-analyzer");
-    std::fs::write(&shim, "#!/bin/sh\n[ -f project.marker ] || { printf 'wrong project directory' >&2; exit 2; }\nprintf \"Unknown binary 'rust-analyzer' in official toolchain 'stable'\" >&2\nexit 1\n").unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let output = offline_index_command(&root, &config)
-        .current_dir(invocation_root)
-        .args([
-            "index",
-            "--languages",
-            "Rust",
-            "--verbose",
-            "--index-tier",
-            "balanced",
-            "--stats-json",
-            "stats.json",
-            "project",
-        ])
-        .env("PATH", "bin")
-        .env("CODEGRAPH_ANALYZERS", "1")
-        .env("CODEGRAPH_ANALYZERS_REQUIRE_TOOLS", "1")
-        .env_remove("CODEGRAPH_SCIP_INDEX")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let logs = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), stderr);
-    assert!(stderr.contains("Unknown binary 'rust-analyzer'"), "{logs}");
-    assert!(
-        stderr.contains("rustup component add rust-analyzer"),
-        "{logs}"
-    );
-    assert!(!logs.contains("wrong project directory"), "{logs}");
-    assert!(!logs.contains("UNIFIED AST EXTRACTION COMPLETE"), "{logs}");
-    assert!(
-        !logs.contains("Language-server analysis starting"),
-        "{logs}"
-    );
-    assert!(!invocation_root.join("stats.json").exists());
-}
-
 #[cfg(all(feature = "embeddings-ollama", feature = "server-http"))]
 #[tokio::test]
 async fn embedding_requests_honor_cli_env_and_config_batch_precedence() {

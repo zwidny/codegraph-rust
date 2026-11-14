@@ -5,6 +5,23 @@ All notable changes to the CodeGraph MCP Intelligence Platform will be documente
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed - Unused local rerank pipeline
+
+- Deleted `crates/codegraph-vector/src/reranker.rs` (~400 lines): `ReRankingPipeline`,
+  `EmbeddingReRanker`, `CrossEncoderReRanker`, `RerankerConfig`, `RerankedResult` and
+  `ReRankingMetrics` had no callers anywhere in the workspace (verified by compiling with
+  `reranker` removed from `lib.rs`). Its `CrossEncoderReRanker` was a placeholder that scored
+  keyword hits minus a length penalty and never loaded a model, so removing it takes away no
+  real capability.
+- The live reranker is untouched: `reranking::factory::create_reranker` (Jina / Ollama) still
+  runs in `semantic_code_search` when `[rerank]` is configured, and `RerankConfig` in
+  `codegraph-core` is unchanged.
+- Dropped `index_cli_integration`'s `broken_rustup_shim_is_reported_before_parsing_...` case.
+  It asserted that indexing fails when `rust-analyzer` is missing, a behaviour that went away
+  with the language-server path in 0.3.0; the remaining three cases pass.
+
 ## [0.4.0] - 2026-11-14
 
 Removes the agent and everything that only existed to serve it: the four server-side tools,
@@ -78,7 +95,7 @@ surface underneath them.
 - `GraphFunctions::get_node_edge_summary` backs those diagnostics with one
   project-scoped query; failures never turn an empty result into an error.
 
-## [Unreleased]
+## Historical entries (pre-0.3.0, never archived)
 
 Entries below were written before 0.3.0 and never archived into a release section, so
 their version attribution was never verified. Several describe the agent/Rig backend that
