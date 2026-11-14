@@ -91,3 +91,11 @@ surrealdb = ["codegraph-graph/surrealdb"]
 cloud = ["embeddings-jina", "codegraph-graph/surrealdb"]
 server-http = []
 ai-enhanced = ["embeddings"]
+
+[[example]]
+# Dumps nodes/edges through SurrealQL and toggles SurrealDB vector indexes, so it only
+# builds with the `surrealdb` feature. The workspace default is `postgres`, and
+# `cargo test --workspace` builds every example, so an unconditional example would break
+# the default build.
+name = "indexing_benchmark"
+required-features = ["surrealdb"]
