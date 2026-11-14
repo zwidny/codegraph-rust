@@ -1,77 +1,85 @@
-# Retrieval modes and needle results (measured) — with a correction
+# Retrieval modes and needle results (measured, corrected)
 
-Two evaluations of the search stack, using `scripts/benchmarks/retrieval-eval.py`
-on this repository's index (`codegraph-rust`, ~31,600 chunks, 1024-dim F2LLM
-embeddings, Postgres backend). Three rankings from the same candidate pool:
+Search-stack evaluation on this repository's index (`codegraph-rust`, ~31,600
+chunks, 1024-dim F2LLM embeddings, Postgres). Metrics from
+`scripts/benchmarks/retrieval-eval.py`. Relevant docs per query are the chunks of
+the target symbol (`parent_node`).
+
+Three rankings from the same candidate pool:
 
 - **vector** — `chunks.embedding <=> query`
-- **text** — `ts_rank_cd(chunks.content_tsv, <tsquery>)`. **This is not BM25.**
-  `ts_rank_cd` has no corpus IDF; the product's own code says so
-  (`postgres_storage.rs`: "Ranking uses `ts_rank_cd`, not BM25").
-- **hybrid** — reciprocal rank fusion of the two (k=60), top 10.
+- **text** — full-text over `chunks.content_tsv`. Two variants are compared:
+  the product's `ts_rank_cd`, and a **real BM25** (IDF + tf saturation + length
+  normalisation) computed in SQL for this evaluation.
+- **hybrid** — reciprocal rank fusion of vector and text (k=60), top 10.
 
-Relevant docs per query are the chunks of the target symbol (`parent_node`).
+## ts_rank_cd is not BM25
 
-## The correction
+The product's text channel is `ts_rank_cd`, which has no corpus IDF and only
+scores documents that satisfy the tsquery. The semantics swing the result
+entirely, so it is unusable as a BM25 baseline:
 
-An earlier version of this doc concluded "RRF helps identifier queries but hurts
-natural-language queries". **That NL conclusion is retracted**: it was produced
-by a text channel that could not rank anything.
+| query set | tsquery | text nDCG@10 |
+|---|---|---|
+| natural language | `websearch_to_tsquery` (AND) | 0.0267 |
+| natural language | OR'd lexemes | 0.0023 |
+| identifier | AND | 0.7200 |
+| identifier | OR | 0.1717 |
 
-`ts_rank_cd` only scores documents that satisfy the tsquery, and the tsquery
-semantics swing the result entirely:
+So an earlier version of this doc, which judged RRF on the AND/OR variant, was
+measuring a broken ranker. That is why a real BM25 had to be built before
+comparing vector and hybrid on natural language.
 
-| query set | tsquery | text nDCG@10 | note |
+## Real BM25 (IDF + tf + length, computed in SQL)
+
+`df` from `unnest(content_tsv)` per project, `tf = cardinality(positions)`,
+`dl = sum of tf`, `avgdl` per project, `k1=1.2, b=0.75`, `idf = ln(1 + (N-df+0.5)/(df+0.5))`.
+No extension, runs on Postgres 16.
+
+Identifier queries (symbol name):
+
+| mode | nDCG@10 | MRR@10 | Recall@10 | Hit@1 | Hit@5 |
+|---|---|---|---|---|---|
+| vector | 0.5425 | 0.5059 | 0.6609 | 0.443 | 0.583 |
+| bm25 | 0.6423 | 0.5960 | 0.7913 | 0.513 | 0.687 |
+| **hybrid** | **0.6797** | **0.6362** | **0.8174** | **0.548** | **0.722** |
+
+Natural-language queries (doc comment):
+
+| mode | nDCG@10 | MRR@10 | Recall@10 | Hit@1 | Hit@5 |
+|---|---|---|---|---|---|
+| **vector** | **0.5300** | **0.4715** | **0.7179** | **0.359** | **0.577** |
+| bm25 | 0.2505 | 0.2112 | 0.3718 | 0.115 | 0.321 |
+| hybrid | 0.4049 | 0.3393 | 0.6154 | 0.218 | 0.487 |
+
+## Conclusion
+
+- For identifier queries the text channel is strong and **uniform RRF adds over
+  vector** (0.54 -> 0.68 nDCG).
+- For natural-language queries the text channel is about half as good as vector
+  (0.25 vs 0.53), and **uniform RRF regresses vector to 0.40**. This is now a
+  real result on a real BM25, not an artifact.
+- Therefore: **weighted RRF, or a confidence gate** that drops a channel whose
+  top score is weak, is the correct next change. Equal fusion is only safe when
+  both channels are comparable for the query type.
+
+## Libraries evaluated for real BM25 in Postgres
+
+| option | licence | BM25 | notes |
 |---|---|---|---|
-| natural language | `websearch_to_tsquery` (AND) | 0.0267 | a 6-word description needs all 6 in one chunk — near-zero |
-| natural language | `to_tsquery` of OR'd lexemes | 0.0023 | OR over generic words ("server", "http") matches thousands — also near-zero |
-| identifier | AND | 0.7200 | short name, both terms usually present |
-| identifier | OR | 0.1717 | OR lets a common token dominate — noise |
+| `timescale/pg_textsearch` | PostgreSQL licence | yes | requires **Postgres 17/18** and `shared_preload_libraries`; our deployment is PG 16 |
+| ParadeDB `pg_search` | **AGPL-3.0** | yes | PG14+; AGPL is a risk for product distribution |
+| Tantivy (Rust) | Apache-2.0 | yes | in-app engine; large architectural change |
+| SQL BM25 (this doc) | none | yes | validated here on PG16; slower, keeps the current image |
 
-So there is no single "fair" `ts_rank_cd` baseline, and a fusion metric built on
-top of a near-random list cannot tell us whether RRF helps. To evaluate the text
-channel honestly it must be a **real IDF-weighted BM25** (compute document
-frequency over the corpus), which `ts_rank_cd` does not provide.
-
-## What the numbers do show (identifier queries, AND tsquery)
-
-| mode | nDCG@10 | MRR@10 | Recall@10 | Hit@1 | Hit@5 |
-|---|---|---|---|---|---|
-| vector | 0.5257 | 0.4905 | 0.640 | 0.435 | 0.565 |
-| text (ts_rank_cd, AND) | 0.6726 | 0.6276 | 0.815 | 0.545 | 0.755 |
-| hybrid (RRF) | **0.7381** | **0.7055** | **0.840** | **0.640** | **0.815** |
-
-For identifier queries the text channel is a strong ranker and RRF over it adds
-over vector. This much is supported.
-
-## Natural language (vector only is trustworthy here)
-
-| mode | nDCG@10 | MRR@10 | Recall@10 | Hit@1 | Hit@5 |
-|---|---|---|---|---|---|
-| vector | 0.5222 | 0.4656 | 0.701 | 0.346 | 0.598 |
-| text (ts_rank_cd) | ~0.00 | ~0.00 | ~0.01 | 0.00 | 0.04 |
-
-The vector channel retrieves the described symbol about a third of the time at
-rank 1 and six in ten within five. What the text channel does on descriptions is
-**undefined until a real BM25 exists**; its column here only shows that
-`ts_rank_cd` cannot serve as that baseline.
-
-## Follow-ups this exposes
-
-1. **Implement IDF-weighted BM25** in the text channel (or vendor a real BM25 in
-   SQL), then re-run both query sets. Only then can vector-vs-hybrid be decided
-   on natural language.
-2. The MCP tool description said `text_score (BM25)` while the implementation is
-   `ts_rank_cd`; the label is corrected. If BM25 is wanted, implement it, don't
-   relabel.
-3. `full_text_nodes` uses `to_tsquery('english', $1)` (AND) — multi-word
-   natural-language queries hit the AND wall above.
+Production still runs `ts_rank_cd`; adopting `pg_textsearch` (PG17 bump) or
+porting this SQL BM25 (with a maintained `df` table) are the two paths.
 
 ## Caveats
 
 - Doc comments are a proxy for natural-language intent, not human-labelled queries.
 - Identifier queries trivially favour exact-token matching.
-- Embeddings come from the configured local model; a different model moves the vector numbers.
+- The BM25 numbers use a one-off SQL harness, not the product's text channel.
 
 ## Reproduce
 
