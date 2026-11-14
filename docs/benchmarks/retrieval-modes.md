@@ -80,17 +80,42 @@ better list. Before (text weak) hybrid 0.40 < vector 0.53; after (text strong)
 hybrid 0.74 < bm25 0.84. That is the theoretical reason a **confidence gate or
 learned weights** are needed — equal-weight RRF is not adaptive.
 
+## Implemented, and what it does (and does not) fix
+
+Two changes are in:
+
+- **Doc indexed** (`cb178c2`): `nodes.search_tsv` = name + content + `metadata->>'doc'`,
+  generated column + GIN, used by `FULL_TEXT_NODES_SQL`. This makes the prose
+  searchable. It is what lifts a **real BM25** to 0.84 in the ablation above.
+- **Weighted RRF** (`72a2c11`): default `vector=0.5, name=1.0, content=1.0`
+  (`CODEGRAPH_RRF_WEIGHTS` overrides). Helps identifier queries, where the text
+  list is populated and strong.
+
+**But the product still uses `ts_rank_cd`, not BM25, and the text query is
+AND-only** (`tsquery_prefix` joins every term with `&`). For a long natural-language
+description the AND query requires all terms to co-occur, so the content list is
+**empty**; `ts_rank_cd` also has no IDF (an OR variant measured 0.0025). Net: on
+descriptions the product's text channel contributes nothing, so
+`semantic_code_search` falls back to vector alone. Neither of the two changes
+makes NL hybrid better on its own.
+
+The remaining step is therefore **a real BM25 text channel with IDF and an
+OR/term-weight query mode** (SQL BM25 on PG16, or `pg_textsearch` on PG17+).
+Only then do the doc indexing and the RRF weights pay off for descriptions, and
+only then should the weights be re-tuned.
+
 ## Conclusion
 
-- For identifier queries the text channel is strong and **uniform RRF adds over
+- For identifier queries the text channel is strong and **weighted RRF adds over
   vector** (0.54 -> 0.68 nDCG).
 - On natural language, the original "vector beats BM25" was **confounded**: the
-  described text was not in the searchable field (33.7% term overlap). Indexing
-  the doc comment lifts BM25 to 0.84 on the same queries.
-- In both directions **uniform RRF regresses toward the weaker channel**. The
-  correct next change is a confidence gate or weighted RRF, not equal weights.
-- The product still needs a decision: index doc/comment text (cheap, large win
-  for description queries) and adopt a real BM25 (SQL port or pg_textsearch).
+  described text was not in the searchable field (33.7% term overlap). Indexing it
+  lifts a **real BM25** to 0.84 - but the product's `ts_rank_cd` + AND query does
+  not reach that, because it has no IDF and ANDs every term.
+- In both directions **uniform RRF regresses toward the weaker channel**; weighted
+  RRF (now shipped) fixes the identifier side. The description side needs the real
+  BM25 first.
+- Next: BM25 text channel (IDF + OR), then re-tune `CODEGRAPH_RRF_WEIGHTS`.
 
 ## Libraries evaluated for real BM25 in Postgres
 
