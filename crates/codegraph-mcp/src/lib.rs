@@ -13,10 +13,7 @@ pub mod transport;
 pub mod utils;
 mod writer;
 
-pub use codegraph_mcp_core::context_aware_limits;
 pub use codegraph_mcp_core::{
-    config_manager::*,
-    context_aware_limits::{ContextAwareLimits, ContextTier},
     debug_logger::*,
     error::{McpError, Result},
     message::*,

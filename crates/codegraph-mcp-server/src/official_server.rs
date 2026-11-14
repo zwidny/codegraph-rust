@@ -319,10 +319,7 @@ impl CodeGraphMCPServer {
     //     ))]))
     // }
 
-    /// Enhanced semantic search with AI-powered analysis for finding code patterns and architectural insights
-    // #[tool(
-    //     description = "Search code with AI insights (2-5s). Returns relevant code + analysis of patterns and architecture. Use for: understanding code behavior, finding related functionality, discovering patterns. Fast alternative: vector_search. Required: query. Optional: limit (default 5)."
-    // )]
+    /// Return the instructions a client reads before its first tool call.
     async fn read_initial_instructions(
         &self,
         _params: Parameters<EmptyRequest>,

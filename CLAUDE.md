@@ -37,7 +37,6 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # what CI
 ### Stale references to ignore
 
 - Makefile targets referring to `codegraph-api`, `high_perf_test/`, or `scripts/` point at things that no longer exist.
-- `docs/TESTING.md` uses feature names (`onnx`, `ollama`, `cloud-jina`, ...) and a `test_mcp_tools.py` that don't match the current tree.
 - `[workspace.metadata.cargo-features]` in the root `Cargo.toml` is documentation only; cargo does not consume it. The real feature flags are on `codegraph-mcp-server` (`ai-enhanced`, `server-http`, `daemon`, `embeddings-*`, `full`). `ai-enhanced` only forwards to `codegraph-mcp/ai-enhanced`; it does not gate MCP tool registration.
 - `docs/README.md` mentions a `codegraph-cache` crate that has been removed.
 
@@ -61,7 +60,7 @@ codegraph start stdio --watch           # MCP server over stdio, with re-index-o
 
 Storage should use a **shared SurrealDB server** (`CODEGRAPH_SURREALDB_URL`, container or self-hosted; apply `schema/codegraph_v2.surql` yourself, the schema is not applied automatically in server mode). Server mode has no per-client file lock: read-only MCP clients and `codegraph index` can run concurrently, and several clients can share one database. Without the URL, `codegraph` falls back to an embedded SurrealKV store at `<project>/.codegraph/db` (`SurrealDbConfig::for_project` in `crates/codegraph-graph/src/surrealdb_storage.rs`), which gets `schema/codegraph_v2.surql` applied on first open; that fallback is **compatibility-only and substantially slower**, and its engine locks the directory, so only one process per project. This repository's `.env` uses the shared mode (`ws://127.0.0.1:8010`, Docker `surrealdb/surrealdb` with SurrealKV), so do not assume the single-writer restriction applies here and do not recommend the embedded store.
 
-Config resolution (`crates/codegraph-core/src/config_manager.rs`): `./.codegraph.toml`, then `~/.codegraph/config.toml`, overridden by `CODEGRAPH_*` env vars. Environment files are layered: `./.env` loads first and `~/.codegraph.env` loads second as a fallback (dotenv never overwrites an already-set variable), so a project `.env` only needs the keys that differ from the machine-wide defaults. Previously the project `.env` suppressed `~/.codegraph.env` entirely; keep that fallback intact. See `.env.example` and `config/example.toml`. The `[llm]` section is parsed for compatibility but the shipped graph tools do not call an LLM. The loader ignores unknown TOML keys silently, and `[rerank]`, `[performance]`, `[logging]` are parsed but only shown in status output.
+Config resolution (`crates/codegraph-core/src/config_manager.rs`): `./.codegraph.toml`, then `~/.codegraph/config.toml`, overridden by `CODEGRAPH_*` env vars. Environment files are layered: `./.env` loads first and `~/.codegraph.env` loads second as a fallback (dotenv never overwrites an already-set variable), so a project `.env` only needs the keys that differ from the machine-wide defaults. Previously the project `.env` suppressed `~/.codegraph.env` entirely; keep that fallback intact. See `.env.example` and `config/example.toml`. The `[llm]` section was removed in v0.3.0 (no shipped code calls an LLM) and a leftover block is ignored silently. The loader ignores unknown TOML keys silently, and `[rerank]`, `[performance]`, `[logging]` are parsed but only shown in status output.
 
 Project init runs before application configuration or the async runtime. `project_init.rs` offers Claude/Codex/both/none, reuses existing CodeGraph hooks, validates both guide files and selected settings, then merges owned instruction blocks. `agent_hooks.rs` preserves unrelated project settings and reuses Codex inline TOML hooks without rewriting TOML. `--no-index` stops after setup; otherwise init loads the selected project's `.env` and configuration and uses the normal index command. Explicit `--config` paths stay relative to the invoking directory. This is separate from global `codegraph config init`; no user-level hooks are created. Test with `cargo test -p codegraph-mcp-server --lib` and `cargo test -p codegraph-mcp-server --test project_init_integration`.
 
@@ -149,9 +148,9 @@ validates its parameters, runs the corresponding graph function and returns raw 
 4. Those call `fn::*` SurrealQL functions defined in `schema/codegraph.surql`, wrapped by
    `crates/codegraph-graph/src/graph_functions.rs`.
 
-There is no server-side agent, prompt tier or model call in this path. The former Rig
-backend and its tier prompts were removed in v0.3.0; historical design notes remain in
-`docs/AGENT_PROMPT_TIERS.md` and `docs/architecture/agent-memory-design.md`.
+There is no server-side agent or model call in this path. The former Rig backend and its
+tier prompts were removed in v0.3.0; historical design notes remain in
+`docs/architecture/agent-memory-design.md`.
 
 ### Schema
 
@@ -162,7 +161,7 @@ Three SurrealDB schemas must stay in sync with the storage layer and with each o
 - About half the source files start with two `// ABOUTME:` comment lines summarising the file's purpose (`# ABOUTME:` in shell scripts). Follow this on new files.
 - Analyzer output must be deterministic, scoped by `project_id`, and carry provenance metadata (analyzer name, confidence).
 - Adding a language touches three layers: the enum in `codegraph-core/src/types.rs`, grammar registration in `codegraph-parser/src/language.rs`, and an extractor in `codegraph-parser/src/languages/`; then update `docs/SUPPORTED_LANGUAGES.md`.
-- User-facing changes to configuration, providers, or tiers should update `docs/AI_PROVIDERS.md` / `docs/AGENT_PROMPT_TIERS.md`. `CONTRIBUTING.md` has the full "what to change where" map.
+- User-facing changes to configuration, providers, or tiers should update `docs/AI_PROVIDERS.md`. `CONTRIBUTING.md` has the full "what to change where" map.
 - `rules-for-claude-code/codegraph_rule.md` is guidance for *consumers* of the CodeGraph MCP server, not for developing this repo.
 
 <!-- codegraph:begin -->

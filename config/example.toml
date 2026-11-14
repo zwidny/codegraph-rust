@@ -34,18 +34,11 @@ top_n = 10                             # results retained after reranking
 # model = "dengcao/Qwen3-Reranker-8B:Q3_K_M"
 # api_base = "http://localhost:11434"
 
-# LLM settings are parsed for compatibility only: no CodeGraph feature calls a model.
-# Each key is read unless the matching environment variable is set:
-# CODEGRAPH_LLM_PROVIDER, CODEGRAPH_LLM_MODEL, CODEGRAPH_CONTEXT_WINDOW.
-# API keys are read from the environment only (ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY).
-[llm]
-enabled = true                         # parsed only; nothing in CodeGraph consults this
-provider = "ollama"                    # ollama | lmstudio | anthropic | openai | xai | openai-compatible
-model = "qwen2.5-coder:14b"
-context_window = 32768                 # your model's real token limit; selects the prompt tier
-# ollama_url = "http://localhost:11434"
-# lmstudio_url = "http://localhost:1234"
-# openai_compatible_url = "http://localhost:8000/v1"
+# The former [llm] section was removed in v0.3.0, when CodeGraph stopped shipping an
+# in-process agent. It is ignored silently (unknown sections do not raise an error), so
+# delete it from an existing file. Model providers below are used for embeddings and
+# reranking only. CODEGRAPH_CONTEXT_WINDOW still sizes the tool-result limit the MCP
+# client receives.
 
 [indexing]
 tier = "fast"                          # fast | balanced | full

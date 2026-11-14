@@ -1,5 +1,5 @@
-// ABOUTME: Debug logging module for agentic tool execution
-// ABOUTME: Captures tool inputs/outputs and reasoning steps when CODEGRAPH_DEBUG=1
+// ABOUTME: Debug logging module for MCP tool execution
+// ABOUTME: Captures tool inputs/outputs when CODEGRAPH_DEBUG=1
 
 use chrono::Utc;
 use serde_json::Value as JsonValue;
@@ -145,57 +145,6 @@ impl DebugLogger {
         Self::write_entry(&entry);
     }
 
-    /// Log an agentic reasoning step
-    pub fn log_reasoning_step(step_number: usize, thought: &str, action: Option<&str>) {
-        if !Self::is_enabled() {
-            return;
-        }
-
-        let entry = serde_json::json!({
-            "timestamp": Utc::now().to_rfc3339(),
-            "event": "reasoning_step",
-            "step": step_number,
-            "thought": thought,
-            "action": action,
-        });
-
-        Self::write_entry(&entry);
-    }
-
-    /// Log agent execution start
-    pub fn log_agent_start(query: &str, analysis_type: &str, tier: &str) {
-        if !Self::is_enabled() {
-            return;
-        }
-
-        let entry = serde_json::json!({
-            "timestamp": Utc::now().to_rfc3339(),
-            "event": "agent_execution_start",
-            "query": query,
-            "analysis_type": analysis_type,
-            "context_tier": tier,
-        });
-
-        Self::write_entry(&entry);
-    }
-
-    /// Log agent execution completion
-    pub fn log_agent_finish(success: bool, output: Option<&JsonValue>, error: Option<&str>) {
-        if !Self::is_enabled() {
-            return;
-        }
-
-        let entry = serde_json::json!({
-            "timestamp": Utc::now().to_rfc3339(),
-            "event": "agent_execution_finish",
-            "success": success,
-            "output": output,
-            "error": error,
-        });
-
-        Self::write_entry(&entry);
-    }
-
     /// Write a JSON entry to the log file
     fn write_entry(entry: &JsonValue) {
         let mut logger_guard = DEBUG_LOGGER.lock().unwrap();
@@ -228,29 +177,6 @@ impl DebugLogger {
             _ => result.clone(),
         }
     }
-}
-
-/// Macro for convenient debug logging
-#[macro_export]
-macro_rules! debug_log {
-    (tool_start, $tool:expr_2021, $params:expr_2021) => {
-        $crate::debug_logger::DebugLogger::log_tool_start($tool, $params);
-    };
-    (tool_finish, $tool:expr_2021, $result:expr_2021) => {
-        $crate::debug_logger::DebugLogger::log_tool_finish($tool, $result);
-    };
-    (tool_error, $tool:expr_2021, $params:expr_2021, $error:expr_2021) => {
-        $crate::debug_logger::DebugLogger::log_tool_error($tool, $params, $error);
-    };
-    (reasoning, $step:expr_2021, $thought:expr_2021, $action:expr_2021) => {
-        $crate::debug_logger::DebugLogger::log_reasoning_step($step, $thought, $action);
-    };
-    (agent_start, $query:expr_2021, $type:expr_2021, $tier:expr_2021) => {
-        $crate::debug_logger::DebugLogger::log_agent_start($query, $type, $tier);
-    };
-    (agent_finish, $success:expr_2021, $output:expr_2021, $error:expr_2021) => {
-        $crate::debug_logger::DebugLogger::log_agent_finish($success, $output, $error);
-    };
 }
 
 #[cfg(test)]
@@ -315,22 +241,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn agent_start_and_error_finish_logged() {
-        let dir = setup_temp_logger();
-        DebugLogger::log_agent_start("q", "analysis", "Medium");
-        DebugLogger::log_agent_finish(false, None, Some("boom"));
-        DebugLogger::flush();
-
-        let events = read_events(&dir);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event"], "agent_execution_start");
-        assert_eq!(events[1]["event"], "agent_execution_finish");
-        assert_eq!(events[1]["success"], false);
-        assert_eq!(events[1]["error"], "boom");
-    }
-
-    #[test]
-    #[serial]
     fn tool_error_logged_after_start() {
         let dir = setup_temp_logger();
         let params = serde_json::json!({"foo": "bar"});
@@ -342,18 +252,5 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["event"], "tool_call_start");
         assert_eq!(events[1]["event"], "tool_call_error");
-    }
-
-    #[test]
-    #[serial]
-    fn reasoning_steps_keep_order() {
-        let dir = setup_temp_logger();
-        DebugLogger::log_reasoning_step(1, "t1", Some("a"));
-        DebugLogger::log_reasoning_step(2, "t2", Some("b"));
-        DebugLogger::flush();
-        let events = read_events(&dir);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["step"], 1);
-        assert_eq!(events[1]["step"], 2);
     }
 }

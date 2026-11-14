@@ -11,7 +11,6 @@ Welcome to the comprehensive documentation for the CodeGraph project.
 - [Indexing pipeline: stages, timings and controls](INDEXING_PIPELINE.md)
 - [CLI and direct graph queries](USAGE_GUIDE.md#cli-access-for-code-agents)
 - [AI provider configuration (embeddings)](AI_PROVIDERS.md)
-- [Historical agent prompt tiers (removed in v0.3.0)](AGENT_PROMPT_TIERS.md)
 - [Supported languages](SUPPORTED_LANGUAGES.md)
 
 ## Architecture Visualization

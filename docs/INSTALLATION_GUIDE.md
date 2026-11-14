@@ -145,12 +145,6 @@ batch_size = 64
 ollama_url = "http://localhost:11434"
 # lmstudio_url = "http://localhost:1234"
 
-[llm]
-enabled = false                        # retained for config compatibility; the graph tools do not call an LLM
-provider = "ollama"                    # ollama | anthropic | openai | xai | lmstudio | openai-compatible
-model = "qwen2.5-coder:14b"
-context_window = 32768                 # your model's real limit; selects the prompt tier
-
 [indexing]
 tier = "fast"                          # fast | balanced | full
 
@@ -169,9 +163,10 @@ level = "info"
 
 Storage has no config-file section: `codegraph` connects to a shared server at `ws://127.0.0.1:8000` by default, or to `CODEGRAPH_SURREALDB_URL` (plus the `CODEGRAPH_SURREALDB_*` variables) when set. The embedded per-project store is opt-in through a `surrealkv://` URL; it is a compatibility fallback that is substantially slower and single-writer.
 
-The `[llm]` section is parsed for configuration compatibility, but the shipped MCP and
-CLI graph tools do not call an LLM. [AI_PROVIDERS.md](AI_PROVIDERS.md) lists every variable
-and key.
+The `[llm]` section was removed in v0.3.0 together with the built-in agent; nothing in
+CodeGraph calls a language model. A leftover `[llm]` block is ignored silently (unknown TOML
+sections do not raise an error). [AI_PROVIDERS.md](AI_PROVIDERS.md) lists every variable and
+key.
 
 ### Environment variables and `.env`
 

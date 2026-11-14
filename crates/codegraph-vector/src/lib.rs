@@ -42,11 +42,10 @@ pub mod incremental;
 #[cfg(feature = "persistent")]
 pub mod persistent;
 
-pub mod insights_generator;
 pub mod ml;
 #[cfg(feature = "surrealdb")]
 pub mod rag;
-pub mod reranker; // NEW: Fast reranking pipeline for insights generation // NEW: High-performance insights with reranking
+pub mod reranker; // Fast reranking pipeline
 pub mod reranking; // NEW: Text-based reranking for RAG (Jina API, Ollama chat)
 
 pub use embedding::*;
@@ -91,10 +90,9 @@ pub use incremental::*;
 #[allow(ambiguous_glob_reexports)]
 pub use persistent::*;
 
-pub use insights_generator::*;
 #[cfg(feature = "surrealdb")]
 pub use rag::*;
-pub use reranker::*; // Re-export reranker types // Re-export insights types
+pub use reranker::*; // Re-export reranker types
 pub use reranking::*; // Re-export text-based reranking types
 
 // Re-export common types for convenience

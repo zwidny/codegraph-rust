@@ -114,7 +114,7 @@ it to coding agents over MCP, so they can ask relationship questions instead of 
 
 - **Graph + embeddings** — semantic search over a real call/definition graph, not just text.
 - **Direct graph tools** — `semantic_code_search`, `get_reverse_dependencies`, `trace_call_chain`, … (9 in total, no LLM)
-- **Tier-aware prompts and context protection** — fit the agent's real context window.
+- **Bounded tool results and context protection** — every result fits the client's real context window.
 - **Tiered indexing** — fast / balanced / full, with incremental re-indexing.
 - **Hybrid search** — vector + BM25 fused for retrieval.
 - **Draft plan checks** — `codegraph plan check` validates a planned graph (entities, relations, constraints) before the code exists, and `codegraph plan store` keeps it as an isolated `plan:<id>` project; see [docs/PLAN_CHECK.md](docs/PLAN_CHECK.md).
@@ -185,15 +185,13 @@ CODEGRAPH_EMBEDDING_PROVIDER=ollama          # ollama | lmstudio | jina | openai
 CODEGRAPH_EMBEDDING_MODEL=qwen3-embedding:0.6b
 CODEGRAPH_EMBEDDING_DIMENSION=1024
 
-# Optional legacy settings: the shipped graph tools do not call an LLM
-# CODEGRAPH_LLM_PROVIDER=anthropic
-# CODEGRAPH_LLM_MODEL=claude-sonnet-4
+# Caps the bytes returned to the MCP client; no LLM is involved
 # CODEGRAPH_CONTEXT_WINDOW=200000
 ```
 
 Every variable is listed in `.env.example`; per-provider examples are in
 [AI_PROVIDERS.md](docs/AI_PROVIDERS.md). Environment variables override any config file, and
-the same settings can live in a `[llm]` / `[embedding]` config section (see
+the same embedding settings can live in an `[embedding]` config section (see
 [Configuration](https://github.com/zwidny/codegraph-rust#configuration)).
 
 ### 3. Database (shared server, the default)
@@ -423,8 +421,8 @@ Use any model with dimensions 384-4096:
 - **Cloud:** OpenAI, Jina AI
 
 ### LLM
-Not required. The graph tools and CLI queries run without a model; the `[llm]` config
-section is parsed for compatibility only.
+Not required and not used. The graph tools and CLI queries run without a model; the former
+`[llm]` config section was removed in v0.3.0 along with the built-in agent.
 
 ### Database
 - **SurrealDB 3.x shared server or container** at `ws://127.0.0.1:8000` by default, or via `CODEGRAPH_SURREALDB_URL`, with HNSW vector indexes - concurrent MCP reads and `codegraph index` against the same project, and multiple clients; also [Surreal Cloud](https://surrealdb.com/cloud)
@@ -457,16 +455,14 @@ provider = "ollama"
 model = "qwen3-embedding:0.6b"
 dimension = 1024
 
-[llm]
-provider = "anthropic"
-model = "claude-sonnet-4"
-context_window = 200000
-
 [indexing]
 tier = "fast"
 ```
 
-The `[llm]` section is parsed for configuration compatibility but the shipped graph tools do not call an LLM. [AI_PROVIDERS.md](docs/AI_PROVIDERS.md) lists every variable and key.
+The former `[llm]` section was removed in v0.3.0: nothing in CodeGraph calls a language
+model, so provider configuration only covers embeddings and reranking. An existing `[llm]`
+block is ignored silently (unknown TOML sections do not raise an error).
+[AI_PROVIDERS.md](docs/AI_PROVIDERS.md) lists every variable and key.
 
 Storage: `codegraph` connects to a shared SurrealDB server at `ws://127.0.0.1:8000` by
 default, or to `CODEGRAPH_SURREALDB_URL` (plus the other `CODEGRAPH_SURREALDB_*` variables)

@@ -33,10 +33,6 @@ pub struct CodeGraphConfig {
     #[serde(default)]
     pub rerank: RerankConfig,
 
-    /// LLM configuration for insights
-    #[serde(default)]
-    pub llm: LLMConfig,
-
     /// Performance and resource settings
     #[serde(default)]
     pub performance: PerformanceConfig,
@@ -121,120 +117,6 @@ impl Default for EmbeddingConfig {
             jina_task: default_jina_task(),
             dimension: default_embedding_dimension(),
             batch_size: default_batch_size(),
-        }
-    }
-}
-
-/// LLM configuration for insights generation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LLMConfig {
-    /// Enable LLM insights (false = context-only mode for agents)
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// LLM provider: "ollama", "lmstudio", "anthropic", "openai", "xai", "openai-compatible"
-    #[serde(default = "default_llm_provider")]
-    pub provider: String,
-
-    /// Model identifier
-    /// For LM Studio: model name (e.g., "lmstudio-community/DeepSeek-Coder-V2-Lite-Instruct-GGUF")
-    /// For Ollama: model name (e.g., "qwen2.5-coder:14b")
-    /// For Anthropic: model name (e.g., "claude-3-5-sonnet-20241022")
-    /// For OpenAI: model name (e.g., "gpt-4o")
-    /// For xAI: model name (e.g., "grok-4-fast", "grok-4-turbo")
-    /// For OpenAI-compatible: custom model name
-    #[serde(default)]
-    pub model: Option<String>,
-
-    /// LM Studio URL
-    #[serde(default = "default_lmstudio_url")]
-    pub lmstudio_url: String,
-
-    /// Ollama URL
-    #[serde(default = "default_ollama_url")]
-    pub ollama_url: String,
-
-    /// OpenAI-compatible base URL (for custom endpoints)
-    #[serde(default)]
-    pub openai_compatible_url: Option<String>,
-
-    /// Anthropic API key
-    #[serde(default)]
-    pub anthropic_api_key: Option<String>,
-
-    /// OpenAI API key
-    #[serde(default)]
-    pub openai_api_key: Option<String>,
-
-    /// xAI API key
-    #[serde(default)]
-    pub xai_api_key: Option<String>,
-
-    /// xAI base URL (default: https://api.x.ai/v1)
-    #[serde(default = "default_xai_base_url")]
-    pub xai_base_url: String,
-
-    /// Context window size
-    #[serde(default = "default_context_window")]
-    pub context_window: usize,
-
-    /// Temperature for generation
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
-
-    /// Insights mode: "context-only", "balanced", or "deep"
-    #[serde(default = "default_insights_mode")]
-    pub insights_mode: String,
-
-    /// Maximum tokens to generate (legacy parameter)
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
-
-    /// Maximum output tokens (for Responses API and reasoning models)
-    #[serde(default)]
-    pub max_completion_token: Option<usize>,
-
-    /// MCP code agent maximum output tokens (for agentic workflows)
-    /// Overrides tier-based defaults if set
-    #[serde(default)]
-    pub mcp_code_agent_max_output_tokens: Option<usize>,
-
-    /// Reasoning effort for reasoning models: "minimal", "medium", "high"
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
-
-    /// Request timeout in seconds
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-
-    /// Use legacy Chat Completions API instead of modern Responses API
-    /// Set CODEGRAPH_USE_COMPLETIONS_API=true to enable backward compatibility
-    #[serde(default)]
-    pub use_completions_api: bool,
-}
-
-impl Default for LLMConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false, // Default to context-only for speed
-            provider: default_llm_provider(),
-            model: None,
-            lmstudio_url: default_lmstudio_url(),
-            ollama_url: default_ollama_url(),
-            openai_compatible_url: None,
-            anthropic_api_key: None,
-            openai_api_key: None,
-            xai_api_key: None,
-            xai_base_url: default_xai_base_url(),
-            context_window: default_context_window(),
-            temperature: default_temperature(),
-            insights_mode: default_insights_mode(),
-            max_tokens: default_max_tokens(),
-            max_completion_token: None, // Will use max_tokens if not set
-            mcp_code_agent_max_output_tokens: None, // Use tier-based defaults if not set
-            reasoning_effort: None,     // Only for reasoning models
-            timeout_secs: default_timeout_secs(),
-            use_completions_api: false, // Default to Responses API
         }
     }
 }
@@ -407,81 +289,10 @@ fn default_embedding_dimension() -> usize {
 fn default_batch_size() -> usize {
     64
 }
-fn default_llm_provider() -> String {
-    "lmstudio".to_string()
-}
-fn default_xai_base_url() -> String {
-    "https://api.x.ai/v1".to_string()
-}
 
 /// Context window assumed when none is configured.
 pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
-fn default_context_window() -> usize {
-    DEFAULT_CONTEXT_WINDOW
-}
-
-/// `[llm]` settings exactly as written in a config file; `None` means the key is absent.
-/// All fields are `None` when the section sets `enabled = false`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ExplicitLlmSettings {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub context_window: Option<usize>,
-    pub ollama_url: Option<String>,
-    pub lmstudio_url: Option<String>,
-    pub openai_compatible_url: Option<String>,
-}
-
-impl ExplicitLlmSettings {
-    /// Extract the `[llm]` keys present in a TOML document. Invalid TOML and keys of
-    /// the wrong type are treated as absent; full validation is `ConfigManager::load`'s job.
-    pub fn from_toml_str(content: &str) -> Self {
-        let Ok(document) = content.parse::<toml::Table>() else {
-            return Self::default();
-        };
-        let Some(llm) = document.get("llm").and_then(|v| v.as_table()) else {
-            return Self::default();
-        };
-        // `enabled = false` switches the section off. `codegraph config init` writes every
-        // default explicitly (including provider = "lmstudio") with enabled = false, and
-        // that generated file must not count as the user's choice of provider.
-        if llm.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-            return Self::default();
-        }
-        let text = |key: &str| {
-            llm.get(key)
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-        };
-        Self {
-            provider: text("provider"),
-            model: text("model"),
-            context_window: llm
-                .get("context_window")
-                .and_then(|v| v.as_integer())
-                .and_then(|v| usize::try_from(v).ok())
-                .filter(|v| *v > 0),
-            ollama_url: text("ollama_url"),
-            lmstudio_url: text("lmstudio_url"),
-            openai_compatible_url: text("openai_compatible_url"),
-        }
-    }
-}
-fn default_temperature() -> f32 {
-    0.1
-}
-fn default_insights_mode() -> String {
-    "context-only".to_string()
-}
-fn default_max_tokens() -> usize {
-    4096
-}
-fn default_timeout_secs() -> u64 {
-    120
-}
 fn default_num_threads() -> usize {
     num_cpus::get()
 }
@@ -553,14 +364,6 @@ impl ConfigManager {
         info!("   🔧 Embedding model: {:?}", config.embedding.model);
         info!("   📐 Embedding dimension: {}", config.embedding.dimension);
         info!("   🌐 Ollama URL: {}", config.embedding.ollama_url);
-        info!(
-            "   💬 LLM insights: {}",
-            if config.llm.enabled {
-                "enabled"
-            } else {
-                "disabled (context-only)"
-            }
-        );
 
         Ok(Self {
             config,
@@ -636,38 +439,14 @@ impl ConfigManager {
         }
     }
 
-    /// The `[llm]` keys the user actually wrote in the config file, without defaults.
-    ///
-    /// The agent backend layers these under its environment variables. Reading only
-    /// explicit keys matters because `LLMConfig` fills unset fields with defaults (for
-    /// example `provider = "lmstudio"`), which must not override provider detection
-    /// from API keys. A missing or unreadable file yields empty settings.
-    pub fn explicit_llm_settings() -> ExplicitLlmSettings {
-        let Some(path) = Self::config_file_path() else {
-            return ExplicitLlmSettings::default();
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(content) => ExplicitLlmSettings::from_toml_str(&content),
-            Err(e) => {
-                warn!(
-                    "Could not read {} for [llm] settings: {}",
-                    path.display(),
-                    e
-                );
-                ExplicitLlmSettings::default()
-            }
-        }
-    }
-
-    /// Context window the agent and its tool-result limits are sized for:
-    /// `CODEGRAPH_CONTEXT_WINDOW`, then `CODEGRAPH_LLM_CONTEXT_WINDOW`, then
-    /// `[llm] context_window` in the config file, then the default.
+    /// Context window the MCP client's tool-result limits are sized for:
+    /// `CODEGRAPH_CONTEXT_WINDOW`, then the legacy `CODEGRAPH_LLM_CONTEXT_WINDOW`
+    /// alias, then the default. The removed `[llm]` section is no longer consulted.
     pub fn agent_context_window() -> usize {
         std::env::var("CODEGRAPH_CONTEXT_WINDOW")
             .or_else(|_| std::env::var("CODEGRAPH_LLM_CONTEXT_WINDOW"))
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .or_else(|| Self::explicit_llm_settings().context_window)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW)
     }
 
@@ -694,8 +473,7 @@ impl ConfigManager {
             config.embedding.model = Some(model);
         }
         if let Ok(url) = std::env::var("CODEGRAPH_OLLAMA_URL") {
-            config.embedding.ollama_url = url.clone();
-            config.llm.ollama_url = url;
+            config.embedding.ollama_url = url;
         }
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             config.embedding.openai_api_key = Some(key);
@@ -733,47 +511,6 @@ impl ConfigManager {
         }
         if let Ok(task) = std::env::var("JINA_API_TASK").or_else(|_| std::env::var("JINA_TASK")) {
             config.embedding.jina_task = task;
-        }
-
-        // LLM configuration
-        if let Ok(provider) =
-            std::env::var("CODEGRAPH_LLM_PROVIDER").or_else(|_| std::env::var("LLM_PROVIDER"))
-        {
-            config.llm.provider = provider;
-        }
-        // Same precedence the agent backend uses, so status output names the model it requests.
-        if let Ok(model) = std::env::var("CODEGRAPH_LLM_MODEL")
-            .or_else(|_| std::env::var("CODEGRAPH_AGENT_MODEL"))
-            .or_else(|_| std::env::var("CODEGRAPH_MODEL"))
-        {
-            config.llm.model = Some(model);
-            config.llm.enabled = true; // Enable if model specified
-        }
-        if let Ok(context) = std::env::var("CODEGRAPH_CONTEXT_WINDOW") {
-            if let Ok(size) = context.parse() {
-                config.llm.context_window = size;
-            }
-        }
-        if let Ok(temp) = std::env::var("CODEGRAPH_TEMPERATURE") {
-            if let Ok(t) = temp.parse() {
-                config.llm.temperature = t;
-            }
-        }
-
-        if let Ok(effort) = std::env::var("CODEGRAPH_REASONING_EFFORT") {
-            config.llm.reasoning_effort = Some(effort);
-        }
-
-        if let Ok(max_output) = std::env::var("MCP_CODE_AGENT_MAX_OUTPUT_TOKENS") {
-            if let Ok(tokens) = max_output.parse() {
-                config.llm.mcp_code_agent_max_output_tokens = Some(tokens);
-            }
-        }
-
-        // API selection
-        if let Ok(use_completions) = std::env::var("CODEGRAPH_USE_COMPLETIONS_API") {
-            config.llm.use_completions_api =
-                use_completions.to_lowercase() == "true" || use_completions == "1";
         }
 
         // Indexing configuration
@@ -827,26 +564,6 @@ impl ConfigManager {
                     other
                 )));
             }
-        }
-
-        // Validate insights mode
-        match config.llm.insights_mode.as_str() {
-            "context-only" | "balanced" | "deep" => {}
-            other => {
-                return Err(ConfigError::ValidationError(format!(
-                    "Invalid insights mode: {}. Must be one of: context-only, balanced, deep",
-                    other
-                )));
-            }
-        }
-
-        // Warn about deprecated API usage
-        if config.llm.use_completions_api {
-            tracing::warn!(
-                "⚠️  Using legacy Chat Completions API. \
-                 Consider upgrading to Responses API for better performance. \
-                 Set CODEGRAPH_USE_COMPLETIONS_API=false or remove the variable."
-            );
         }
 
         // Validate log level
@@ -953,8 +670,6 @@ mod tests {
     fn test_default_config() {
         let config = CodeGraphConfig::default();
         assert_eq!(config.embedding.provider, "auto");
-        assert_eq!(config.llm.enabled, false);
-        assert_eq!(config.llm.insights_mode, "context-only");
         assert_eq!(config.indexing.tier, IndexingTier::Fast);
     }
 
@@ -1015,62 +730,6 @@ mod tests {
         assert!(config.rerank.validate().is_ok());
         assert_eq!(config.rerank.ollama.unwrap().model, "fixture-reranker");
         assert!(config.rerank.jina.is_none());
-    }
-
-    #[test]
-    fn test_explicit_llm_settings_reads_only_present_keys() {
-        let settings = ExplicitLlmSettings::from_toml_str(
-            r#"
-            [embedding]
-            provider = "ollama"
-
-            [llm]
-            provider = "anthropic"
-            model = "claude-sonnet-4"
-            context_window = 200000
-            ollama_url = "  "
-            "#,
-        );
-        assert_eq!(settings.provider.as_deref(), Some("anthropic"));
-        assert_eq!(settings.model.as_deref(), Some("claude-sonnet-4"));
-        assert_eq!(settings.context_window, Some(200_000));
-        assert_eq!(settings.ollama_url, None);
-        assert_eq!(settings.lmstudio_url, None);
-    }
-
-    #[test]
-    fn test_explicit_llm_settings_ignores_disabled_and_generated_defaults() {
-        let disabled = ExplicitLlmSettings::from_toml_str(
-            "[llm]\nenabled = false\nprovider = \"lmstudio\"\nmodel = \"m\"\n",
-        );
-        assert_eq!(disabled, ExplicitLlmSettings::default());
-
-        // What `codegraph config init` writes: every default spelled out, enabled = false.
-        let generated = toml::to_string_pretty(&CodeGraphConfig::default()).unwrap();
-        assert!(generated.contains("provider = \"lmstudio\""));
-        assert_eq!(
-            ExplicitLlmSettings::from_toml_str(&generated),
-            ExplicitLlmSettings::default()
-        );
-
-        let enabled =
-            ExplicitLlmSettings::from_toml_str("[llm]\nenabled = true\nprovider = \"ollama\"\n");
-        assert_eq!(enabled.provider.as_deref(), Some("ollama"));
-    }
-
-    #[test]
-    fn test_explicit_llm_settings_absent_or_invalid() {
-        assert_eq!(
-            ExplicitLlmSettings::from_toml_str("[embedding]\nprovider = \"ollama\"\n"),
-            ExplicitLlmSettings::default()
-        );
-        assert_eq!(
-            ExplicitLlmSettings::from_toml_str("not = [valid"),
-            ExplicitLlmSettings::default()
-        );
-        let wrong_types =
-            ExplicitLlmSettings::from_toml_str("[llm]\nprovider = 3\ncontext_window = \"big\"\n");
-        assert_eq!(wrong_types, ExplicitLlmSettings::default());
     }
 
     #[test]

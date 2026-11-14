@@ -325,8 +325,8 @@ fn shorten_content(value: &mut JsonValue, max_chars: usize) {
 
 impl GraphToolExecutor {
     /// Create a new tool executor with shared EmbeddingGenerator
-    /// Derives max result size from the agent's context window (environment, then
-    /// `[llm] context_window` in the config file, then the default)
+    /// Derives max result size from the client context window (`CODEGRAPH_CONTEXT_WINDOW`,
+    /// then the legacy `CODEGRAPH_LLM_CONTEXT_WINDOW` alias, then the default)
     pub fn new(
         graph: Arc<dyn GraphQuery>,
         config: Arc<CodeGraphConfig>,
@@ -666,7 +666,7 @@ impl GraphToolExecutor {
             .as_str()
             .ok_or_else(|| McpError::Protocol("Missing node_id".to_string()))?;
 
-        // Default to "calls" if edge_type not provided (for LATS compatibility)
+        // Defensive default: the schema marks edge_type required, but a client may still omit it
         let edge_type = params["edge_type"].as_str().unwrap_or("calls");
 
         let depth = params["depth"].as_i64().unwrap_or(3) as i32;
@@ -794,7 +794,7 @@ impl GraphToolExecutor {
             .as_str()
             .ok_or_else(|| McpError::Protocol("Missing node_id".to_string()))?;
 
-        // Default to "calls" if edge_type not provided (for LATS compatibility)
+        // Defensive default: the schema marks edge_type required, but a client may still omit it
         let edge_type = params["edge_type"].as_str().unwrap_or("calls");
 
         let depth = params["depth"].as_i64().unwrap_or(3) as i32;

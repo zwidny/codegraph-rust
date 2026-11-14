@@ -1,6 +1,10 @@
-# CodeGraph AI providers: embeddings + LLMs
+# CodeGraph AI providers: embeddings + reranking
 
-This document explains how to configure CodeGraph’s embedding providers (for indexing/search). LLM settings are parsed for compatibility but are not used by the shipped graph tools.
+This document explains how to configure CodeGraph’s embedding providers (for indexing/search)
+and its optional reranking providers. CodeGraph ships no model of its own: the former `[llm]`
+configuration and the built-in agent that consumed it were removed in v0.3.0, so nothing here
+calls a language model. The 9 graph tools and `codegraph query` / `codegraph plan` query the
+graph directly.
 
 It is based on the runtime configuration loader in `crates/codegraph-core/src/config_manager.rs` and provider implementations in:
 
@@ -29,7 +33,7 @@ If you use `.env`, it’s loaded automatically at startup (you do not need `dire
 
 ## `.env` examples
 
-### Local (Ollama embeddings + Ollama LLM)
+### Local (Ollama embeddings)
 
 ```bash
 # SurrealDB shared server. Default target is ws://127.0.0.1:8000; a surrealkv:// URL opts into the slower embedded store
@@ -43,35 +47,25 @@ CODEGRAPH_SURREALDB_PASSWORD=root
 CODEGRAPH_EMBEDDING_PROVIDER=ollama
 CODEGRAPH_OLLAMA_URL=http://localhost:11434
 CODEGRAPH_EMBEDDING_MODEL=hf.co/nomic-ai/nomic-embed-code-GGUF:Q4_K_M
-
-# Built-in agent LLM
-CODEGRAPH_LLM_PROVIDER=ollama
-CODEGRAPH_LLM_MODEL=qwen2.5-coder:14b
 ```
 
-### Local (LM Studio embeddings + LM Studio LLM)
+### Local (LM Studio embeddings)
 
 ```bash
 CODEGRAPH_EMBEDDING_PROVIDER=lmstudio
 CODEGRAPH_EMBEDDING_MODEL=jinaai/jina-embeddings-v3
-
-CODEGRAPH_LLM_PROVIDER=lmstudio
-CODEGRAPH_LLM_MODEL=local-model
 ```
 
-Note: the embedding endpoint is `embedding.lmstudio_url` in TOML. The agent's LM Studio endpoint is `LMSTUDIO_URL` / `CODEGRAPH_LMSTUDIO_URL`, or `llm.lmstudio_url` in TOML.
+Note: the LM Studio endpoint is `embedding.lmstudio_url` in TOML; the environment only
+overrides it through `CODEGRAPH_LMSTUDIO_URL`.
 
-### Remote (Jina embeddings + OpenAI LLM)
+### Remote (Jina embeddings)
 
 ```bash
 CODEGRAPH_EMBEDDING_PROVIDER=jina
 JINA_API_KEY=...
 CODEGRAPH_EMBEDDING_MODEL=jina-embeddings-v4
 JINA_API_BASE=https://api.jina.ai/v1
-
-CODEGRAPH_LLM_PROVIDER=openai
-OPENAI_API_KEY=...
-CODEGRAPH_LLM_MODEL=gpt-5.1-codex
 ```
 
 Notes:
@@ -83,7 +77,7 @@ Notes:
 
 Create either `./.codegraph.toml` (project-local) or `~/.codegraph/config.toml` (global).
 
-### Example: Jina embeddings + xAI Grok LLM
+### Example: Jina embeddings
 
 ```toml
 [embedding]
@@ -95,14 +89,9 @@ jina_late_chunking = true
 dimension = 2048
 batch_size = 64
 
-[llm]
-enabled = true
-provider = "xai"
-model = "grok-4-1-fast-reasoning"
-context_window = 2000000
 ```
 
-`XAI_API_KEY` and `JINA_API_KEY` go in the environment.
+`JINA_API_KEY` goes in the environment.
 
 ## Embedding providers (indexing + search)
 
@@ -225,12 +214,20 @@ Chunking and batching can be tuned via environment variables:
 
 If you change embedding dimensions/models, ensure your SurrealDB schema supports the chosen dimension fields.
 
-## LLM settings (not used by the shipped tools)
+## Providers after the agent removal
 
-The `[llm]` section and `CODEGRAPH_LLM_*` variables are still parsed for configuration
-compatibility, but the shipped MCP server and CLI do not call an LLM: the 9 graph tools
-and `codegraph query` / `codegraph plan` query the graph directly. A former built-in agent
-consumed these settings; it was removed in v0.3.0.
+CodeGraph's shipped surface — indexing, the 9 MCP graph tools, `codegraph query` and
+`codegraph plan` — never calls a language model. Provider configuration therefore exists
+only for embeddings and reranking.
+
+The `[llm]` section and the `CODEGRAPH_LLM_*` / `MCP_CODE_AGENT_MAX_OUTPUT_TOKENS`
+variables were removed in v0.3.0 together with the built-in agent. Configuration files and
+`.env` files may still carry them: unknown TOML sections are ignored silently (no
+`deny_unknown_fields`) and unknown environment variables are simply never read, so an old
+file keeps loading — delete the leftovers at your convenience.
+
+`CODEGRAPH_CONTEXT_WINDOW` survives with a narrower meaning: it sizes the tool-result limit
+handed back to the MCP client; it does not influence any model call.
 
 ## Graph schema selection (optional)
 

@@ -27,10 +27,6 @@ pub struct RerankerConfig {
     pub cross_encoder_top_k: usize,
     pub cross_encoder_threshold: f32,
 
-    /// Stage 3: LLM-based insights (optional)
-    pub enable_llm_insights: bool,
-    pub llm_top_k: usize,
-
     /// Performance optimization
     pub enable_batch_processing: bool,
     pub batch_size: usize,
@@ -48,10 +44,6 @@ impl Default for RerankerConfig {
             enable_cross_encoder: true,
             cross_encoder_top_k: 20,
             cross_encoder_threshold: 0.5,
-
-            // Stage 3: LLM - only process top 10 (optional)
-            enable_llm_insights: false, // Disabled by default for speed
-            llm_top_k: 10,
 
             // Performance
             enable_batch_processing: true,
@@ -293,10 +285,6 @@ impl ReRankingPipeline {
             "   📊 Stage 2: Cross-encoder rerank (target: top {})",
             self.config.cross_encoder_top_k
         );
-        info!(
-            "   📊 Stage 3: LLM insights (enabled: {}, target: top {})",
-            self.config.enable_llm_insights, self.config.llm_top_k
-        );
 
         // Stage 1: Fast embedding-based filtering
         let stage1_start = std::time::Instant::now();
@@ -403,19 +391,6 @@ impl ReRankingPipeline {
 
         Ok(results)
     }
-
-    /// Get candidates ready for LLM processing (if enabled)
-    pub fn get_llm_candidates(&self, reranked_results: &[RerankedResult]) -> Vec<RerankedResult> {
-        if !self.config.enable_llm_insights {
-            return Vec::new();
-        }
-
-        reranked_results
-            .iter()
-            .take(self.config.llm_top_k)
-            .cloned()
-            .collect()
-    }
 }
 
 /// Metrics for reranking performance
@@ -424,7 +399,6 @@ pub struct ReRankingMetrics {
     pub total_candidates: usize,
     pub stage1_passed: usize,
     pub stage2_passed: usize,
-    pub llm_processed: usize,
     pub stage1_duration_ms: f64,
     pub stage2_duration_ms: f64,
     pub total_duration_ms: f64,

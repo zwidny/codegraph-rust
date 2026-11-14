@@ -1,105 +1,97 @@
-# Debug Logging for Agentic Tools
+# Debug Logging for MCP Tool Calls
 
-> **Partially historical:** v0.3.0 removed the agent tools and their reasoning traces.
-> `--debug` / `CODEGRAPH_DEBUG=1` still tee index and tool logs; the agent-specific
-> sections below describe the removed subsystem.
+CodeGraph can record every MCP graph-tool call (input parameters, results and
+errors) to a JSONL file. It is off by default and has no effect on the indexed
+graph or on query results.
 
-This document explains how to use the debug logging feature to troubleshoot agentic tool execution.
+There is no server-side agent any more (removed in v0.3.0), so the log contains
+only tool-call events: no reasoning steps and no agent start/finish records.
 
 ## Quick Start
 
-### 1. Enable Debug Logging
+### 1. Enable debug logging
 
-Set the environment variable before starting the MCP server:
+The logger is initialized when the CLI starts (before the MCP server runs), so
+set the environment variable before launching the server:
 
 ```bash
 export CODEGRAPH_DEBUG=1
-codegraph start http --port 3000
+codegraph start stdio
 ```
 
-Or add to your `.env` file:
+`CODEGRAPH_DEBUG` accepts `1`, `true` or `TRUE` (the value is compared
+case-insensitively for `true`). Any other value, or leaving it unset, keeps the
+logger disabled.
+
+Or add it to your `.env` file:
 
 ```bash
 CODEGRAPH_DEBUG=1
 ```
 
-### 2. Run Your Tests
+### 2. Call a tool
+
+Once the server is running, each tool invocation appends one or more lines to
+the current log file:
 
 ```bash
 codegraph query <symbol>
 ```
 
-### 3. View the Debug Logs
+Note that only calls that go through the MCP tool executor are logged; a CLI
+command that answers without invoking a tool writes nothing.
 
-```bash
-python3 tools/view_debug_logs.py
-```
+### 3. Read the log
+
+The log is plain JSONL, so `jq` (see [Raw log analysis](#raw-log-analysis)) or
+any JSON line reader can inspect it. There is no bundled viewer script.
 
 ## What Gets Logged
 
-The debug logger captures:
+Three event types are written, one JSON object per line:
 
-1. **Agent Execution Start/Finish**
-   - Query text
-   - Analysis type (code_search, dependency_analysis, etc.)
-   - Context tier (Small, Medium, Large, Massive)
-   - Success/failure status
-   - Error messages
+1. **`tool_call_start`** — tool name and the parameters passed to it.
+2. **`tool_call_finish`** — tool name, the full result, and a summarized result
+   (`result_summary`).
+3. **`tool_call_error`** — tool name, parameters and the error message.
 
-2. **Tool Calls**
-   - Tool name (semantic_code_search, get_transitive_dependencies, etc.)
-   - Input parameters
-   - Output results with summary
-   - Result counts and sample data
+`result_summary` is derived from the result shape:
 
-3. **Reasoning Steps** (if available)
-   - Step number
-   - Thought process
-   - Action taken
+- array → `{"type": "array", "count": N, "sample": <first element or null>}`
+- object → `{"type": "object", "keys": [...]}`
+- anything else → the value itself
 
 ## Log File Location
 
-Debug logs are written to:
+Each process that starts with logging enabled creates one timestamped file:
 
 ```
-.codegraph/debug/agentic_debug_YYYYMMDD_HHMMSS.jsonl
+<debug dir>/agentic_debug_YYYYMMDD_HHMMSS.jsonl
 ```
 
-Each line is a JSON object representing one event.
+The `agentic_debug_` prefix is a historical name kept for compatibility; it does
+not imply agent output.
+
+- Default debug directory: `.codegraph/debug/` under the process's current
+  working directory.
+- The timestamp uses UTC (`YYYYMMDD_HHMMSS`).
 
 ## Configuration
 
-### Custom Debug Directory
+### Custom debug directory
 
 ```bash
 export CODEGRAPH_DEBUG_DIR=/path/to/custom/debug/dir
 ```
 
-Default: `.codegraph/debug/` in current working directory
-
-## Viewing Logs
-
-### View Latest Log
-
-```bash
-python3 tools/view_debug_logs.py
-```
-
-### View Specific Log
-
-```bash
-python3 tools/view_debug_logs.py .codegraph/debug/agentic_debug_20250101_120000.jsonl
-```
-
-### Follow Live (like `tail -f`)
-
-```bash
-python3 tools/view_debug_logs.py --follow
-```
+If `CODEGRAPH_DEBUG_DIR` is unset, the default `.codegraph/debug/` directory is
+used. The directory is created on startup when logging is enabled.
 
 ## Log Format
 
-Each log entry is a JSON object on a single line (JSONL format):
+Each log entry is a JSON object on a single line (JSONL format).
+
+Tool call start:
 
 ```json
 {
@@ -112,6 +104,8 @@ Each log entry is a JSON object on a single line (JSONL format):
 }
 ```
 
+Tool call finish:
+
 ```json
 {
   "timestamp": "2025-01-01T12:00:05.678910Z",
@@ -119,126 +113,126 @@ Each log entry is a JSON object on a single line (JSONL format):
   "tool": "semantic_code_search",
   "result": {
     "tool": "semantic_code_search",
-    "result": [...]
+    "result": []
   },
   "result_summary": {
     "type": "array",
-    "count": 5,
-    "sample": {...}
+    "count": 0,
+    "sample": null
   }
+}
+```
+
+Tool call error:
+
+```json
+{
+  "timestamp": "2025-01-01T12:00:05.678910Z",
+  "event": "tool_call_error",
+  "tool": "get_reverse_dependencies",
+  "parameters": {
+    "node_id": "nodes:...",
+    "edge_type": "calls"
+  },
+  "error": "..."
 }
 ```
 
 ## Common Debugging Scenarios
 
-### Tool Returns Empty Results
+### Tool returns empty results
 
-Look for `tool_call_finish` events:
+Filter `tool_call_finish` events where `result_summary.count` is `0`:
 
-```
-✅ TOOL RESULT: semantic_code_search
-  📊 Returned 0 results
-  ⚠️  WARNING: Empty result array!
+```bash
+jq 'select(.event == "tool_call_finish" and .result_summary.count == 0) | .tool' \
+  .codegraph/debug/agentic_debug_*.jsonl
 ```
 
 **Possible causes:**
+
 - `project_id` mismatch between server and database
 - No embeddings in database
 - Query threshold too high
 - Full-text search indexes missing
 
-### Agent Gets Stuck
+### Tool parameters wrong
 
-Look for repeated reasoning steps or missing tool calls:
+Inspect `tool_call_start` events for the exact parameters that reached the
+executor:
 
-```
-💭 STEP 1: I need to search for configuration code
-  🎬 Action: semantic_code_search
-
-💭 STEP 2: The search returned no results, trying different query
-  🎬 Action: semantic_code_search
-
-💭 STEP 3: Still no results, unable to proceed
-```
-
-**Possible causes:**
-- Tools not returning expected data
-- Agent prompt doesn't handle empty results
-- Context tier too small for the task
-
-### Tool Parameters Wrong
-
-Look at `tool_call_start` events:
-
-```
-🔧 TOOL CALL: semantic_code_search
-  📥 Parameters:
-     query: "config"
-     limit: 10
+```bash
+jq 'select(.event == "tool_call_start") | {tool, parameters}' \
+  .codegraph/debug/agentic_debug_*.jsonl
 ```
 
 **Check:**
+
 - Are parameters being passed correctly?
 - Is `project_id` being inferred from PWD?
-- Are embeddings being generated with correct dimension?
+- Are embeddings generated with the correct dimension?
 
 ## Raw Log Analysis
 
-For advanced debugging, you can parse the JSONL directly:
+For advanced debugging, parse the JSONL directly:
 
 ```bash
-# Extract all tool results
+# All tool results
 jq 'select(.event == "tool_call_finish")' .codegraph/debug/agentic_debug_*.jsonl
 
 # Count empty results
-jq 'select(.event == "tool_call_finish" and .result_summary.count == 0) | .tool' .codegraph/debug/agentic_debug_*.jsonl
+jq 'select(.event == "tool_call_finish" and .result_summary.count == 0) | .tool' \
+  .codegraph/debug/agentic_debug_*.jsonl
 
-# Extract all reasoning steps
-jq 'select(.event == "reasoning_step")' .codegraph/debug/agentic_debug_*.jsonl
+# All errors
+jq 'select(.event == "tool_call_error") | {tool, error}' \
+  .codegraph/debug/agentic_debug_*.jsonl
 ```
 
 ## Performance Impact
 
-Debug logging has minimal performance impact:
+Debug logging is cheap and inert when disabled:
 
-- Events are written asynchronously
-- File I/O is buffered and flushed immediately
-- Logging only occurs when `CODEGRAPH_DEBUG=1`
-- No performance impact when disabled
+- Logging only occurs when `CODEGRAPH_DEBUG` is enabled at startup.
+- Each event is written and flushed immediately, so the file is always
+  readable while the server runs.
+- Entries are serialized JSON lines; no background task or network access is
+  involved.
 
 ## Troubleshooting
 
-### No Debug Logs Generated
+### No debug logs generated
 
-1. Check `CODEGRAPH_DEBUG=1` is set
-2. Check server startup output for:
+1. Check `CODEGRAPH_DEBUG=1` (or `true`) was set **before** starting the process.
+2. Check startup output for:
    ```
    🐛 Debug logging enabled: .codegraph/debug/agentic_debug_20250101_120000.jsonl
    ```
-3. Check directory is writable:
+3. Check the directory is writable:
    ```bash
    ls -ld .codegraph/debug/
    ```
 
-### Logs Not Updating
+### Logs not updating
 
-1. Ensure server is actually running
-2. Check if agentic tools are being called
-3. Try `--follow` mode to watch live updates
+1. Ensure the server is actually running.
+2. Confirm the tool calls under test reach the MCP server (a CLI path that does
+   not invoke a tool writes nothing).
+3. Tail the active file:
+   ```bash
+   tail -f .codegraph/debug/agentic_debug_*.jsonl
+   ```
 
-### Parse Errors
+### Parse errors
 
-If `view_debug_logs.py` shows parse errors:
-
-1. Check log file isn't corrupted
-2. Ensure server finished writing (stop server first)
-3. Try parsing with `jq` to find malformed line:
+1. Check the log file is not corrupted.
+2. Stop the server before copying the file.
+3. Find the malformed line with `jq`:
    ```bash
    jq -c . .codegraph/debug/agentic_debug_*.jsonl
    ```
 
 ## See Also
 
-- [TESTING.md](TESTING.md) - Running agentic tool tests
-- [CLAUDE.md](CLAUDE.md) - MCP server configuration
-- [crates/codegraph-mcp/src/debug_logger.rs](crates/codegraph-mcp/src/debug_logger.rs) - Debug logger implementation
+- [CLAUDE.md](../CLAUDE.md) - MCP server configuration
+- [crates/codegraph-mcp-core/src/debug_logger.rs](../crates/codegraph-mcp-core/src/debug_logger.rs) - Debug logger implementation

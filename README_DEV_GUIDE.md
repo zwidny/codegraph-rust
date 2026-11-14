@@ -8,14 +8,21 @@
 
 ## 1. 它是什么
 
-CodeGraph 把仓库解析成 **符号 + 边的知识图谱**，再给每个符号和 chunk 生成向量，最后通过 4 个高层工具提供给编码 agent：
+CodeGraph 把仓库解析成 **符号 + 边的知识图谱**，再给每个符号和 chunk 生成向量，最后通过 MCP 暴露 **9 个直连图工具**（本地查询，无 LLM）：
 
 | 工具 | 回答什么问题 |
 |---|---|
-| `agent context` | 实现位置、调用者、解释行为、为任务收集上下文 |
-| `agent impact` | 改动影响面、调用链 |
-| `agent architecture` | 模块边界、公开 API 面 |
-| `agent quality` | 耦合、复杂度、风险热点 |
+| `semantic_code_search` | 这个符号 / 概念在哪 |
+| `get_reverse_dependencies` | 谁调用 / 依赖它 |
+| `get_transitive_dependencies` | 它传递依赖了什么 |
+| `trace_call_chain` | 从它出发的调用链 |
+| `calculate_coupling_metrics` | 耦合度 |
+| `detect_circular_dependencies` | 循环依赖 |
+| `find_complexity_hotspots` | 复杂度热点 |
+| `get_hub_nodes` | 中心模块 |
+| `plan_check` | 校验草稿逻辑图（离线） |
+
+CLI 侧对应 `codegraph query <symbol>`（查符号）与 `codegraph plan`（校验 / 存储计划）。
 
 数据流：
 
@@ -37,7 +44,6 @@ CodeGraph 把仓库解析成 **符号 + 边的知识图谱**，再给每个符�
 |---|---|---|
 | **SurrealDB server** | `ws://127.0.0.1:8010` | 存储（支持并发读写，**推荐**） |
 | infinity embedding | `http://127.0.0.1:8766/v1` | 索引期和查询期的向量化 |
-| DeepSeek API | `https://api.deepseek.com/v1` | agent 的推理后端 |
 
 启动 SurrealDB server（**推荐**，嵌入式是排他锁，无法并发）：
 
@@ -137,11 +143,9 @@ CODEGRAPH_SURREALDB_DATABASE=codegraph
 CODEGRAPH_SURREALDB_USERNAME=root
 CODEGRAPH_SURREALDB_PASSWORD=root
 
-# ---- Agent LLM ----
-CODEGRAPH_LLM_PROVIDER=openai-compatible
-CODEGRAPH_OPENAI_COMPATIBLE_URL=https://api.deepseek.com/v1
-CODEGRAPH_LLM_MODEL=deepseek-flash
-CODEGRAPH_CONTEXT_WINDOW=1048576            # >500k → Massive tier
+# ---- 工具返回体上限 ----
+# 只决定 MCP 工具返回的字节上限（context_window × 2，封顶 200 KB），不涉及任何模型调用
+CODEGRAPH_CONTEXT_WINDOW=1048576
 
 # ---- 索引策略 ----
 CODEGRAPH_INDEX_TIER=balanced
@@ -182,7 +186,7 @@ CODEGRAPH_SEMANTIC_RESOLUTION / VECTOR_INDEX_TIMEOUT_SECS
 CODEGRAPH_CHUNK_DB_BATCH_SIZE / SYMBOL_DB_BATCH_SIZE / NODE_DB_BATCH_SIZE
 CODEGRAPH_HNSW_EFC / HNSW_M
 CODEGRAPH_MODEL_REVISION（注意：首次设置触发一次全量重算）
-CODEGRAPH_LLM_* / OPENAI_* / CONTEXT_WINDOW
+CODEGRAPH_OPENAI_* / CONTEXT_WINDOW
 ```
 
 ---
@@ -514,7 +518,7 @@ namespace 改变）。这两次一次性成本之后：
 | `crates/codegraph-mcp/src/indexer.rs` | 节点持久化批独立配置（`CODEGRAPH_NODE_DB_BATCH_SIZE`） | 默认跟随 embedding 批 64 导致 406 次事务 |
 | `crates/codegraph-mcp/src/indexer.rs` | 关系解析改 rayon 并行 + DashMap 记忆化 | 96k 边串行循环实测 197s → 110s |
 | `schema/codegraph_v2.surql` | `array::range(1, $safe_depth)` → `array::range(1, $safe_depth + 1)`（2 处） | depth=1 时范围为空，`fn::expand`/`fn::trace_call_chain` 静默返回空 |
-| `crates/codegraph-mcp-server/src/official_server.rs` | 暴露 8 个直连图工具为 MCP tools + 懒加载 executor | 客户端可自行编排，0.3–5s vs agent 55s |
+| `crates/codegraph-mcp-server/src/official_server.rs` | 暴露 9 个直连图工具为 MCP tools + 懒加载 executor | 客户端可自行编排，0.3–5s vs 已删除的 agent 55s+ |
 | `crates/codegraph-vector/src/openai_provider.rs` | 未知模型维度改用配置值（原硬编码 1536） | 自托管模型被当成 OpenAI 默认模型，检索失准 |
 
 回归测试：
@@ -538,7 +542,6 @@ cargo +1.97.1 test -p codegraph-graph --features surrealdb --test ingestion_writ
 | `Transaction write conflict` | SurrealKV 并发写冲突 | 已加重试；仍失败则重跑（缓存命中很快） |
 | `HTTP 500` from 8766 | 容器 OOM 崩溃 | 减 `PROVIDER_CONCURRENCY` / `BATCH_SIZE` |
 | `413` from 8766 | 单条超 8192 token | 降 `CHUNK_MAX_TOKENS` |
-| `MaxTurnsError: 8` | agent 问题太宽泛 | 缩小问题范围或换 `--focus` |
 | 索引报 `not ready` 但数据完整 | compaction 未完成 | 数据可用；下次打开不阻塞 |
 | `INDEXING COMPLETE` 后卡 10+ 分钟才退出 | 旧版 `reconcile_catalog` 全表 `NOT IN` | 已改 per-file 版本；旧库需重跑一次 |
 | 查询命中第三方代码 | `vendor/` 被索引 | 加进 `.gitignore` 后重建 |

@@ -105,8 +105,8 @@ Responses contain the matching edges with `file_path`, `line_number` and bounded
 | `CODEGRAPH_HTTP_HOST` / `CODEGRAPH_HTTP_PORT` | Used by the HTTP server. |
 | `CODEGRAPH_TOOL_CONTENT_CHARS` | Snippet length per result row (`0` disables shortening). |
 
-For tuning see `crates/codegraph-mcp/src/context_aware_limits.rs` and the prompt files
-under `crates/codegraph-mcp-server/src/prompts/`.
+For tuning see `CODEGRAPH_TOOL_CONTENT_CHARS` and `CODEGRAPH_CONTEXT_WINDOW`, and the
+prompt files under `crates/codegraph-mcp-server/src/prompts/`.
 
 ## Testing
 
@@ -120,4 +120,3 @@ under `crates/codegraph-mcp-server/src/prompts/`.
 
 - [Indexing pipeline](../docs/INDEXING_PIPELINE.md)
 - [Usage guide](../docs/USAGE_GUIDE.md)
-- [Testing guide](../docs/TESTING.md)

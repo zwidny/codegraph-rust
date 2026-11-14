@@ -2064,15 +2064,6 @@ CODEGRAPH_EMBEDDING_PROVIDER=auto
 # CODEGRAPH_EMBEDDING_DIMENSION=2048
 
 # ============================================================================
-# LLM PROVIDER (compatibility only; no CodeGraph feature calls a model)
-# ============================================================================
-# The graph tools, the CLI queries and indexing all run without a model. These
-# keys are still parsed so an existing .env keeps loading without errors.
-# CODEGRAPH_LLM_PROVIDER=lmstudio
-# CODEGRAPH_LLM_MODEL=qwen2.5-coder:14b
-# CODEGRAPH_LLM_ENABLED=false
-
-# ============================================================================
 # LOGGING
 # ============================================================================
 # Log level: trace, debug, info, warn, error
@@ -2125,12 +2116,6 @@ CODEGRAPH_EMBEDDING_PROVIDER=auto
                         "top_n": config.rerank.top_n,
                         "jina_model": config.rerank.jina.as_ref().map(|j| &j.model),
                         "ollama_model": config.rerank.ollama.as_ref().map(|o| &o.model),
-                    },
-                    "llm": {
-                        "enabled": config.llm.enabled,
-                        "provider": config.llm.provider,
-                        "model": config.llm.model,
-                        "context_window": config.llm.context_window,
                     }
                 });
                 println!("{}", serde_json::to_string_pretty(&json_output)?);
@@ -2162,21 +2147,6 @@ CODEGRAPH_EMBEDDING_PROVIDER=auto
                 if let Some(ref ollama) = config.rerank.ollama {
                     println!("    Ollama Model: {}", ollama.model);
                 }
-
-                println!("\n  {}", "LLM Settings:".green().bold());
-                println!("    Provider: {}", config.llm.provider.yellow());
-                println!(
-                    "    Enabled: {}",
-                    if config.llm.enabled {
-                        "yes".green()
-                    } else {
-                        "no (context-only)".yellow()
-                    }
-                );
-                if let Some(model) = config.llm.model.as_deref() {
-                    println!("    Model: {}", model.yellow());
-                }
-                println!("    Context Window: {}", config.llm.context_window);
             }
         }
         ConfigAction::Set { key, value } => {

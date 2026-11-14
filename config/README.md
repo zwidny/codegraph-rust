@@ -20,7 +20,6 @@ For a file named `codegraph.toml`, select it explicitly with
 | --- | --- |
 | `[embedding]` | Embedding provider, model, dimension, batch size and provider URLs used by indexing and search. |
 | `[rerank]` | Optional query-time semantic-search reranking (`none`, `jina`, `ollama`), independently of embeddings. Provider defaults are supplied; nested `[rerank.jina]` and `[rerank.ollama]` blocks customize them. |
-| `[llm]` | Provider, model, context window and endpoint URLs for the agentic tools. Environment variables win over these keys; `enabled = false` makes the agent ignore the section; API keys come from the environment only. |
 | `[indexing]` | Default indexing tier (`fast`, `balanced`, `full`). |
 | `[daemon]` | File-watcher behaviour for `codegraph start --watch` and `codegraph daemon`. |
 
@@ -37,7 +36,8 @@ and `CODEGRAPH_OLLAMA_URL`, ahead of `OLLAMA_RERANK_MODEL` and `OLLAMA_URL`.
 Changes require restarting the process, without reindexing.
 
 The loader also accepts `[performance]` and `[logging]`. Unknown sections and keys
-are ignored silently.
+are ignored silently, so a leftover `[llm]` block from before v0.3.0 (when the built-in
+agent was removed) loads without an error and has no effect.
 
 Storage is not configured here. Each project uses an embedded store at
 `<project>/.codegraph/db`; set `CODEGRAPH_SURREALDB_URL` to use a SurrealDB server instead.
@@ -47,7 +47,6 @@ Storage is not configured here. Each project uses an embedded store at
 ```bash
 codegraph config show          # merged configuration
 codegraph config show --json   # resolved reranker provider/model and retained-result count
-codegraph config agent-status  # provider, model, context tier the agent will use
 codegraph config validate
 ```
 

@@ -233,7 +233,7 @@ metadata.
 
 **Configure via environment:**
 ```bash
-# Set this to match your agent LLM's real context window
+# Set this to match your MCP client's real context window
 CODEGRAPH_CONTEXT_WINDOW=128000            # default: 128K
 
 # Optional snippet-length override
