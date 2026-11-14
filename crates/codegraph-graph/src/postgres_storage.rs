@@ -49,6 +49,21 @@
 //! `embedding_1024` regardless of the requested `embedding_384`..`embedding_4096`
 //! name. Vectors that are not 1024-dimensional are rejected by pgvector.
 //!
+//! ## Vector (HNSW) indexes
+//!
+//! [`SCHEMA_DDL`] deliberately creates **no** HNSW indexes. Creating them with the
+//! tables would make every `INSERT` maintain the index, which costs roughly 196x the
+//! write throughput measured on a 5,000-row/1024-dimension batch (54 ms vs 10,630 ms)
+//! and dominated EasyTier's 38,080-chunk indexing run. Instead
+//! [`IndexStorage::ensure_vector_indexes`] builds them after the rows are durable,
+//! matching the `CODEGRAPH_VECTOR_INDEX_MODE=deferred` contract: write first, index
+//! once. `CODEGRAPH_VECTOR_INDEX_MODE=off` (also `false`/`no`/`0`) skips them, and the
+//! `nodes_hnsw` index is always requested because [`PgStore::knn_nodes`] needs it.
+//!
+//! Index names stay `chunks_hnsw` / `nodes_hnsw` / `sym_hnsw`, and creation uses
+//! `IF NOT EXISTS`, so upgrading an older database reuses the indexes it already has
+//! rather than rebuilding or dropping them.
+//!
 //! ## Upgrading an existing database
 //!
 //! `CREATE TABLE IF NOT EXISTS` never adds columns, so the DDL also runs
@@ -179,7 +194,8 @@ pub struct ReconcileStats {
 }
 
 /// DDL for the chunk, edge, node, symbol-embedding, file-metadata and
-/// project-metadata tables. Every statement is idempotent.
+/// project-metadata tables. Every statement is idempotent. HNSW indexes are
+/// intentionally absent; see the module-level "Vector (HNSW) indexes" note.
 pub const SCHEMA_DDL: &str = r#"
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -195,7 +211,6 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS chunks_project ON chunks(project_id);
 CREATE INDEX IF NOT EXISTS chunks_parent ON chunks(parent_node);
-CREATE INDEX IF NOT EXISTS chunks_hnsw ON chunks USING hnsw (embedding vector_cosine_ops) WITH (m=12, ef_construction=150);
 CREATE INDEX IF NOT EXISTS chunks_tsv ON chunks USING gin(content_tsv);
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -236,7 +251,6 @@ CREATE INDEX IF NOT EXISTS nodes_project ON nodes(project_id);
 CREATE INDEX IF NOT EXISTS nodes_project_file ON nodes(project_id, file_path);
 CREATE INDEX IF NOT EXISTS nodes_project_name ON nodes(project_id, name);
 CREATE INDEX IF NOT EXISTS nodes_name_prefix ON nodes(project_id, name text_pattern_ops);
-CREATE INDEX IF NOT EXISTS nodes_hnsw ON nodes USING hnsw (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);
 CREATE INDEX IF NOT EXISTS nodes_tsv ON nodes USING gin(content_tsv);
 
 CREATE TABLE IF NOT EXISTS symbol_embeddings (
@@ -255,7 +269,6 @@ CREATE TABLE IF NOT EXISTS symbol_embeddings (
 CREATE INDEX IF NOT EXISTS sym_project ON symbol_embeddings(project_id);
 CREATE INDEX IF NOT EXISTS sym_project_norm ON symbol_embeddings(project_id, normalized_symbol);
 CREATE INDEX IF NOT EXISTS sym_node ON symbol_embeddings(node_id);
-CREATE INDEX IF NOT EXISTS sym_hnsw ON symbol_embeddings USING hnsw (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);
 
 CREATE TABLE IF NOT EXISTS file_metadata (
   project_id      text NOT NULL,
@@ -768,6 +781,22 @@ const UPSERT_BATCH_SIZE: usize = 5000;
 
 fn db_err<E: std::fmt::Display>(error: E) -> CodeGraphError {
     CodeGraphError::Database(error.to_string())
+}
+
+/// Whether `CODEGRAPH_VECTOR_INDEX_MODE` disables HNSW creation.
+///
+/// Mirrors the `off` arm of the SurrealDB parser while also accepting the common
+/// boolean spellings, case-insensitively. Any other value (including unset, whose
+/// default is `deferred`) leaves index creation enabled.
+fn vector_indexes_disabled() -> bool {
+    matches!(
+        std::env::var("CODEGRAPH_VECTOR_INDEX_MODE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "false" | "no" | "0"
+    )
 }
 
 /// Project a caller/callee row (`CALLERS_OF_NAME_SQL` / `CALLEES_OF_NAME_SQL`) into
@@ -2391,14 +2420,55 @@ impl crate::storage::IndexStorage for PgStore {
             .map_err(db_err)?)
     }
 
-    /// Always `true`: the HNSW indexes are built by [`SCHEMA_DDL`], so there is
-    /// nothing to check at runtime. `dimension` and `tables` are ignored because
-    /// this backend keeps a single fixed-dimension `embedding_1024` column.
+    /// Build the HNSW indexes that [`SCHEMA_DDL`] no longer creates.
+    ///
+    /// Called after the rows are durable so the index is built once instead of being
+    /// maintained on every `INSERT` (see the module-level "Vector (HNSW) indexes"
+    /// note). `CODEGRAPH_VECTOR_INDEX_MODE=off` (also `false`/`no`/`0`, case
+    /// insensitive) skips the work and returns `false`; an older database keeps any
+    /// indexes it already has, because nothing here drops them.
+    ///
+    /// `nodes_hnsw` is always created: [`Self::knn_nodes`] depends on it even though
+    /// `nodes` is not one of the vector tables the caller reports. `chunks_hnsw` and
+    /// `sym_hnsw` are built only when `tables` names them. Every column is typed
+    /// `vector(1024)`, so any other `dimension` is a configuration error.
     async fn ensure_vector_indexes(
         &self,
-        _dimension: usize,
-        _tables: &[String],
+        dimension: usize,
+        tables: &[String],
     ) -> anyhow::Result<bool> {
+        if vector_indexes_disabled() {
+            return Ok(false);
+        }
+        if dimension != 1024 {
+            return Err(CodeGraphError::Configuration(format!(
+                "Postgres vector indexes are fixed at 1024 dimensions, got {dimension}"
+            ))
+            .into());
+        }
+
+        let mut statements = vec![
+            "CREATE INDEX IF NOT EXISTS nodes_hnsw ON nodes USING hnsw \
+             (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);",
+        ];
+        if tables.iter().any(|table| table == "chunks") {
+            statements.push(
+                "CREATE INDEX IF NOT EXISTS chunks_hnsw ON chunks USING hnsw \
+                 (embedding vector_cosine_ops) WITH (m=12, ef_construction=150);",
+            );
+        }
+        if tables.iter().any(|table| table == "symbol_embeddings") {
+            statements.push(
+                "CREATE INDEX IF NOT EXISTS sym_hnsw ON symbol_embeddings USING hnsw \
+                 (embedding_1024 vector_cosine_ops) WITH (m=12, ef_construction=150);",
+            );
+        }
+
+        let client = self.pool.get().await.map_err(db_err)?;
+        client
+            .batch_execute(&statements.join("\n"))
+            .await
+            .map_err(db_err)?;
         Ok(true)
     }
 
@@ -2645,9 +2715,14 @@ mod tests {
              project_metadata tables"
         );
         assert_eq!(
-            index_count, 18,
-            "expected 18 chunks/edges/nodes/symbol/file_metadata indexes \
-             (project_metadata is keyed by its primary key and needs no extra index)"
+            index_count, 15,
+            "expected 15 chunks/edges/nodes/symbol/file_metadata indexes \
+             (project_metadata is keyed by its primary key and needs no extra index; \
+             the three HNSW indexes are built after the write by ensure_vector_indexes)"
+        );
+        assert!(
+            !SCHEMA_DDL.contains("USING hnsw"),
+            "HNSW indexes must not be part of the DDL: per-INSERT maintenance costs ~196x write throughput"
         );
     }
 
@@ -2658,14 +2733,8 @@ mod tests {
     }
 
     #[test]
-    fn nodes_ddl_covers_all_indexes() {
-        for index in [
-            "nodes_project_file",
-            "nodes_hnsw",
-            "nodes_tsv",
-            "sym_project_norm",
-            "sym_hnsw",
-        ] {
+    fn nodes_ddl_covers_non_vector_indexes() {
+        for index in ["nodes_project_file", "nodes_tsv", "sym_project_norm"] {
             assert!(
                 SCHEMA_DDL.contains(&format!("CREATE INDEX IF NOT EXISTS {index} ")),
                 "SCHEMA_DDL is missing index {index}"
@@ -3076,6 +3145,61 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("poc_{tag}_{}_{nanos}_{n}", std::process::id())
+    }
+
+    /// `std::env::set_var` is process-wide, so the vector-index-mode tests must not
+    /// run concurrently with each other.
+    static VECTOR_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialises a test and restores `CODEGRAPH_VECTOR_INDEX_MODE` to "unset" on
+    /// drop, including when an assertion panics.
+    struct VectorIndexModeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl VectorIndexModeGuard {
+        fn new(value: Option<&str>) -> Self {
+            let lock = VECTOR_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match value {
+                Some(value) => unsafe { std::env::set_var("CODEGRAPH_VECTOR_INDEX_MODE", value) },
+                None => unsafe { std::env::remove_var("CODEGRAPH_VECTOR_INDEX_MODE") },
+            }
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for VectorIndexModeGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("CODEGRAPH_VECTOR_INDEX_MODE") };
+        }
+    }
+
+    /// HNSW indexes are table-level objects, not project-scoped, so tests that assert
+    /// on their presence would otherwise see each other's indexes. Drop them first.
+    async fn drop_vector_indexes(store: &PgStore) {
+        let client = store.pool.get().await.expect("pool get");
+        client
+            .batch_execute(
+                "DROP INDEX IF EXISTS chunks_hnsw; \
+                 DROP INDEX IF EXISTS nodes_hnsw; \
+                 DROP INDEX IF EXISTS sym_hnsw;",
+            )
+            .await
+            .expect("drop vector indexes");
+    }
+
+    async fn has_index(store: &PgStore, name: &str) -> bool {
+        let client = store.pool.get().await.expect("pool get");
+        client
+            .query_one(
+                "SELECT to_regclass($1) IS NOT NULL",
+                &[&format!("public.{name}")],
+            )
+            .await
+            .expect("check index presence")
+            .get(0)
     }
 
     #[tokio::test]
@@ -4769,13 +4893,86 @@ mod tests {
         let Some(store) = store_or_skip() else {
             return;
         };
+        let _guard = VectorIndexModeGuard::new(None);
+
+        drop_vector_indexes(&store).await;
+        store.ensure_schema().await.expect("ensure_schema");
+        assert!(
+            !has_index(&store, "chunks_hnsw").await,
+            "SCHEMA_DDL must not create HNSW indexes; they are built after the write"
+        );
 
         use crate::storage::IndexStorage;
         let ready = store
-            .ensure_vector_indexes(1024, &["nodes".to_string(), "chunks".to_string()])
+            .ensure_vector_indexes(1024, &["chunks".to_string()])
             .await
             .expect("ensure_vector_indexes");
-        assert!(ready, "Postgres builds its HNSW indexes in SCHEMA_DDL");
+        assert!(ready, "1024 dimensions must build the requested indexes");
+        assert!(
+            has_index(&store, "chunks_hnsw").await,
+            "chunks_hnsw is built when `chunks` is requested"
+        );
+        assert!(
+            has_index(&store, "nodes_hnsw").await,
+            "nodes_hnsw is always built because KNN depends on it"
+        );
+        assert!(
+            !has_index(&store, "sym_hnsw").await,
+            "sym_hnsw is only built when `symbol_embeddings` is requested"
+        );
+
+        let again = store
+            .ensure_vector_indexes(1024, &["chunks".to_string()])
+            .await
+            .expect("ensure_vector_indexes must be idempotent");
+        assert!(
+            again,
+            "a second call succeeds and reuses the existing indexes"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn ensure_vector_indexes_rejects_non_1024() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        let _guard = VectorIndexModeGuard::new(None);
+
+        use crate::storage::IndexStorage;
+        let error = store
+            .ensure_vector_indexes(384, &[])
+            .await
+            .expect_err("384 dimensions cannot index a vector(1024) column");
+        assert!(
+            error.to_string().contains("1024"),
+            "the error must name the fixed dimension: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn ensure_vector_indexes_off_creates_nothing() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+
+        drop_vector_indexes(&store).await;
+        store.ensure_schema().await.expect("ensure_schema");
+        let _guard = VectorIndexModeGuard::new(Some("off"));
+
+        use crate::storage::IndexStorage;
+        let ready = store
+            .ensure_vector_indexes(1024, &["chunks".to_string()])
+            .await
+            .expect("ensure_vector_indexes");
+        assert!(!ready, "off mode reports that no index was built");
+        for index in ["chunks_hnsw", "nodes_hnsw", "sym_hnsw"] {
+            assert!(
+                !has_index(&store, index).await,
+                "{index} must not be created when CODEGRAPH_VECTOR_INDEX_MODE=off"
+            );
+        }
     }
 
     // ---- `query` / `plan` parity methods ----
