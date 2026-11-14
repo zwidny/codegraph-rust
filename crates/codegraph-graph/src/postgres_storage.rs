@@ -88,10 +88,11 @@ use codegraph_core::CodeNode;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+use bytes::BufMut;
 use codegraph_core::{CodeGraphError, Result};
 use deadpool_postgres::Pool;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{IsNull, Kind, ToSql, Type, to_sql_checked};
 
 /// One row of the `chunks` table.
 #[derive(Debug, Clone)]
@@ -302,12 +303,12 @@ CREATE TABLE IF NOT EXISTS project_metadata (
 );
 "#;
 
-/// Staging table for `COPY`. The embedding is carried as text so we never have to
-/// encode pgvector's binary wire format; the `INSERT ... SELECT` performs the cast.
+/// Staging table for `COPY`. The embedding is carried in pgvector's native binary
+/// format (see [`PgVector`]) so the `INSERT ... SELECT` merges already-typed values.
 const STAGING_DDL: &str = r#"
 CREATE TEMP TABLE chunks_staging (
   id text, project_id text, chunk_index integer, text text,
-  parent_node text, embedding text, embedding_model text
+  parent_node text, embedding vector(1024), embedding_model text
 ) ON COMMIT DROP;
 "#;
 
@@ -318,7 +319,7 @@ FROM STDIN BINARY
 
 const MERGE_STAGING: &str = r#"
 INSERT INTO chunks (id, project_id, chunk_index, text, parent_node, embedding, embedding_model)
-SELECT id, project_id, chunk_index, text, parent_node, embedding::vector, embedding_model
+SELECT id, project_id, chunk_index, text, parent_node, embedding, embedding_model
 FROM chunks_staging
 ON CONFLICT (id) DO UPDATE SET
   project_id = EXCLUDED.project_id,
@@ -861,6 +862,42 @@ pub(crate) fn embedding_text(values: Option<&[f32]>) -> Option<String> {
     values.map(vector_text)
 }
 
+/// Writes a `vector` in pgvector's binary wire format.
+///
+/// `vector_recv` in pgvector reads an `int16` dimension, an `int16` unused field,
+/// then one `float4` per dimension. Sending this instead of a `[0.1,0.2,...]` string
+/// cuts a 1024-dim row from 9,544 bytes to 4,100 and skips 1,024 float parses per
+/// row on the server.
+///
+/// An empty slice encodes `dim = 0`, which pgvector rejects (`vector must have at
+/// least 1 dimension`); this matches the previous `'[]'::vector` path rather than
+/// silently storing a NULL or zero vector.
+#[derive(Debug)]
+struct PgVector<'a>(&'a [f32]);
+
+impl ToSql for PgVector<'_> {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        let dim =
+            i16::try_from(self.0.len()).map_err(|_| "vector has more than i16::MAX dimensions")?;
+        out.put_i16(dim);
+        out.put_i16(0);
+        for value in self.0 {
+            out.put_f32(*value);
+        }
+        Ok(IsNull::No)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    to_sql_checked!();
+}
+
 /// Serialise optional metadata for a `text` staging column; the merge casts it to
 /// `jsonb`. `None` stays `NULL`.
 pub(crate) fn metadata_text(value: Option<&serde_json::Value>) -> Result<Option<String>> {
@@ -1195,6 +1232,25 @@ impl PgStore {
         Ok(present)
     }
 
+    /// Resolve the OID of pgvector's `vector` type.
+    ///
+    /// The OID depends on extension installation order, so it cannot be hardcoded.
+    /// `Kind::Simple` and the `public` schema are the minimal `Type` tokio-postgres
+    /// accepts; a vector column has no array or domain modifiers.
+    async fn vector_type(&self, client: &deadpool_postgres::Client) -> Result<Type> {
+        let oid: u32 = client
+            .query_one("SELECT 'vector'::regtype::oid", &[])
+            .await
+            .map_err(db_err)?
+            .get(0);
+        Ok(Type::new(
+            "vector".to_string(),
+            oid,
+            Kind::Simple,
+            "public".to_string(),
+        ))
+    }
+
     /// Insert or update chunks in one transaction: `COPY` into a temporary table,
     /// then merge with `ON CONFLICT (id) DO UPDATE`.
     pub async fn upsert_chunks(&self, rows: &[ChunkRow]) -> Result<u64> {
@@ -1203,6 +1259,7 @@ impl PgStore {
         }
 
         let mut client = self.pool.get().await.map_err(db_err)?;
+        let vector_type = self.vector_type(&client).await?;
         let transaction = client.transaction().await.map_err(db_err)?;
         transaction
             .batch_execute(STAGING_DDL)
@@ -1219,12 +1276,11 @@ impl PgStore {
             Type::INT4,
             Type::TEXT,
             Type::TEXT,
-            Type::TEXT,
+            vector_type,
             Type::TEXT,
         ];
         let mut writer = std::pin::pin!(BinaryCopyInWriter::new(sink, &types));
         for row in rows {
-            let embedding = vector_text(&row.embedding);
             writer
                 .as_mut()
                 .write(&[
@@ -1233,7 +1289,7 @@ impl PgStore {
                     &row.chunk_index,
                     &row.text,
                     &row.parent_node,
-                    &embedding,
+                    &PgVector(&row.embedding),
                     &row.embedding_model,
                 ])
                 .await
@@ -3635,6 +3691,66 @@ mod tests {
             .expect("select")
             .get(0);
         assert_eq!(text, "updated text");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn chunks_write_vectors_in_binary_format() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("chunk_binary");
+        let embedding = unit_vector(3);
+        store
+            .upsert_chunks(&[chunk("binary_a", &project, embedding.clone())])
+            .await
+            .expect("upsert_chunks");
+
+        let client = store.pool.get().await.expect("pool get");
+
+        // pgvector stores int16 dim + int16 unused + 1024 * float4 = 4100 bytes,
+        // which is what pg_column_size reports (measured, not derived: the varlena
+        // header is not counted). The old text path stored ~9.5 KB per row, so this
+        // distinguishes native vector storage from a text blob.
+        let column_size: i32 = client
+            .query_one(
+                "SELECT pg_column_size(embedding) FROM chunks WHERE id = $1",
+                &[&"binary_a"],
+            )
+            .await
+            .expect("pg_column_size")
+            .get(0);
+        assert_eq!(
+            column_size, 4100,
+            "native vector storage is header + dim + unused + f32 payload"
+        );
+
+        // The binary wire payload `vector_send` emits is 2 + 2 + 4 * 1024 = 4100.
+        let wire_size: i32 = client
+            .query_one(
+                "SELECT octet_length(vector_send(embedding)) FROM chunks WHERE id = $1",
+                &[&"binary_a"],
+            )
+            .await
+            .expect("vector_send length")
+            .get(0);
+        assert_eq!(wire_size, 4100, "pgvector binary wire format");
+
+        let read_back: String = client
+            .query_one(
+                "SELECT embedding::text FROM chunks WHERE id = $1",
+                &[&"binary_a"],
+            )
+            .await
+            .expect("read embedding")
+            .get(0);
+        assert_eq!(
+            read_back,
+            vector_text(&embedding),
+            "vector values must round-trip through COPY BINARY"
+        );
     }
 
     fn node(id: &str, project_id: &str) -> NodeRow {
