@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   joining it would resolve against the working directory — which could read another
   project's version file or silently keep a stale cache. It now returns an empty
   version, preserving the pre-versioning behaviour.
+- A leftover `[llm] context_window` now warns instead of disappearing silently. Removing
+  `LLMConfig` in 0.4.0 also dropped that key from the `agent_context_window()` chain, so a
+  user who had configured a 32k window got the 128k default and `max_result_bytes` grew
+  from ~65 KB to ~256 KB — enough to exceed a small model's context. The warning fires
+  once per process, only when neither `CODEGRAPH_CONTEXT_WINDOW` nor
+  `CODEGRAPH_LLM_CONTEXT_WINDOW` is set, and is written to stderr when no tracing
+  subscriber is installed (CLI paths install none). `config/example.toml` now states
+  0.4.0 as the release that removed the section and explains the migration.
 
 ## [0.4.0] - 2026-11-14
 

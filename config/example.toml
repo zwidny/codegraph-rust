@@ -34,11 +34,12 @@ top_n = 10                             # results retained after reranking
 # model = "dengcao/Qwen3-Reranker-8B:Q3_K_M"
 # api_base = "http://localhost:11434"
 
-# The former [llm] section was removed in v0.3.0, when CodeGraph stopped shipping an
-# in-process agent. It is ignored silently (unknown sections do not raise an error), so
-# delete it from an existing file. Model providers below are used for embeddings and
-# reranking only. CODEGRAPH_CONTEXT_WINDOW still sizes the tool-result limit the MCP
-# client receives.
+# The former [llm] section was removed in v0.4.0, when CodeGraph stopped shipping an
+# in-process agent. A leftover [llm] context_window is no longer read, so the MCP
+# tool-result limit (context_window * 2 bytes) falls back to the default 128000 window
+# (~256 KB) instead of the window you configured. Set CODEGRAPH_CONTEXT_WINDOW to keep
+# your previous ceiling. Unknown sections do not raise an error, so delete [llm] from an
+# existing file. Model providers below are for embeddings and reranking only.
 
 [indexing]
 tier = "fast"                          # fast | balanced | full

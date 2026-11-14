@@ -441,7 +441,11 @@ impl ConfigManager {
 
     /// Context window the MCP client's tool-result limits are sized for:
     /// `CODEGRAPH_CONTEXT_WINDOW`, then the legacy `CODEGRAPH_LLM_CONTEXT_WINDOW`
-    /// alias, then the default. The removed `[llm]` section is no longer consulted.
+    /// alias, then the default.
+    ///
+    /// Only environment variables are consulted. The `[llm] context_window` value that
+    /// the removed in-process agent used to read has no effect; [`legacy_llm_context_window`]
+    /// detects it so loading a config file can warn about it.
     pub fn agent_context_window() -> usize {
         std::env::var("CODEGRAPH_CONTEXT_WINDOW")
             .or_else(|_| std::env::var("CODEGRAPH_LLM_CONTEXT_WINDOW"))
@@ -456,6 +460,30 @@ impl ConfigManager {
 
         let config: CodeGraphConfig =
             toml::from_str(&content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+
+        if let Some(value) = legacy_llm_context_window(&content)
+            && std::env::var("CODEGRAPH_CONTEXT_WINDOW").is_err()
+            && std::env::var("CODEGRAPH_LLM_CONTEXT_WINDOW").is_err()
+        {
+            // `ConfigManager::load` can run more than once per process (startup plus a
+            // command handler); warn only on the first sighting.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let message = format!(
+                    "`[llm] context_window = {value}` is no longer used: the in-process agent was \
+                     removed in v0.4.0. The MCP tool-result budget now follows \
+                     CODEGRAPH_CONTEXT_WINDOW (default {DEFAULT_CONTEXT_WINDOW}); set it to keep \
+                     your previous ceiling."
+                );
+                warn!("{message}");
+                // CLI commands such as `codegraph config show` do not install a tracing
+                // subscriber, so a log-only warning would stay invisible there.
+                if !tracing::dispatcher::has_been_set() {
+                    eprintln!("{message}");
+                }
+            }
+        }
 
         Ok(config)
     }
@@ -662,9 +690,43 @@ impl ConfigManager {
     }
 }
 
+/// Detect a `[llm] context_window` left behind by the removed agent config.
+///
+/// The value is no longer read; callers warn so an upgrade does not silently
+/// multiply the MCP tool-result budget (`max_result_bytes = window * 2`).
+pub(crate) fn legacy_llm_context_window(source: &str) -> Option<u64> {
+    let value: toml::Value = toml::from_str(source).ok()?;
+    let integer = value.get("llm")?.get("context_window")?.as_integer()?;
+    u64::try_from(integer).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_llm_context_window_reads_the_removed_key() {
+        assert_eq!(
+            legacy_llm_context_window("[llm]\ncontext_window = 32768\n"),
+            Some(32768)
+        );
+    }
+
+    #[test]
+    fn legacy_llm_context_window_ignores_missing_section() {
+        assert_eq!(
+            legacy_llm_context_window("[indexing]\ntier = \"fast\"\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_llm_context_window_ignores_non_integer() {
+        assert_eq!(
+            legacy_llm_context_window("[llm]\ncontext_window = \"big\"\n"),
+            None
+        );
+    }
 
     #[test]
     fn test_default_config() {
