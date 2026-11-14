@@ -47,11 +47,13 @@ process: `scripts/scip-index.sh` selects the right indexer per language and prin
 | TypeScript | `scip-typescript index` | Needs a TypeScript project |
 | JavaScript | `scip-typescript index` | Same indexer as TS |
 | Go | `scip-go` | |
+| Python | `scip-python index` | Run from the project root; **do not** pass `--cwd` (it yields a ~72-byte empty index). Verify `wc -c` before importing |
 
-Languages without a SCIP indexer (Python, Java, C/C++, Swift, C#, Ruby, PHP, Kotlin) are
+Languages without a built-in indexer (Java, C/C++, Swift, C#, Ruby, PHP, Kotlin) are
 **AST-only**: they are parsed and linked, but receive no compiler-derived definition edges.
-A SCIP index built by other tooling can still be supplied for them through
-`CODEGRAPH_SCIP_INDEX`.
+Any SCIP index built by other tooling can still be supplied for them through
+`CODEGRAPH_SCIP_INDEX` — the importer is language-agnostic, so "no built-in indexer" does
+not mean "no compiler edges are possible".
 
 You can disable the analyzer stages entirely via:
 

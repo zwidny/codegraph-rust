@@ -147,6 +147,11 @@ round-trips in the historical measurement that motivated the change, 12.3 GB pea
 525 MB `index.scip`. The language-server path has since been removed; SCIP is the only
 compiler-enrichment path.
 
+Per-language indexers in use: `rust-analyzer scip`, `scip-typescript index` (TS/JS),
+`scip-go`, and `scip-python index` for Python (CodeGraph parses Python, so its SCIP edges
+import normally). Run `scip-python` from the project root **without** `--cwd` — that flag
+makes it emit a 72-byte index with zero documents, which the import then rejects.
+
 `scip-typescript` embeds no document text and writes no `index.sources.json`. Documents
 without a manifest entry are accepted with a single warning that reports the count;
 an entry that exists but disagrees with the captured source is rejected as stale, and

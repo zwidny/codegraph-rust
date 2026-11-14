@@ -141,11 +141,17 @@ CODEGRAPH_SCIP_INDEX=/abs/rust.scip codegraph index crates/codegraph-core \
 - For a large repository, run one full `codegraph index <root>` pass with a SCIP index, then
   use partial re-indexes for day-to-day edits.
 - **Prefer SCIP over AST-only.** Generate a compiler index first and pass it via
-  `CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`;
-  comma-separated, `path@subdir` for an index built inside a subdirectory). Measured on a
-  10k-file tree: analysis 21 min -> 2.4 s + 3.9 s import. `scripts/scip-index.sh` does this
-  per language and prints the value. A language with no index stays AST-only; there is no
-  language-server fallback.
+  `CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`,
+  `scip-python index`; comma-separated, `path@subdir` for an index built inside a
+  subdirectory). Measured on a 10k-file tree: analysis 21 min -> 2.4 s + 3.9 s import.
+  `scripts/scip-index.sh` generates the ones it knows and prints the value.
+- **Any language with a SCIP indexer can be enriched, not only the four above.** CodeGraph
+  parses Python natively, so a Python SCIP index contributes definition/reference edges like
+  any other. Generate it with `scip-python index --project-name <name> --output <path>`
+  from the project root and do **not** add `--cwd` — that flag makes scip-python emit a
+  72-byte empty index. Check the artifact first (`wc -c <path>`, well above 1 KB); a
+  72-byte file holds zero documents and the import aborts. A language with no index stays
+  AST-only; there is no language-server fallback.
 
 ---
 

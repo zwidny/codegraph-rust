@@ -171,14 +171,14 @@ enum Commands {
                       - RECOMMENDED: generate a SCIP index first, then import it. Without one the graph\n\
                         has no definition or reference edges. Importing a SCIP index for a 10k-file\n\
                         tree takes seconds and yields those edges. Generate with `rust-analyzer scip .` (Rust),\n\
-                        `scip-typescript index` (TS/JS) or `scip-go` (Go), then set\n\
-                        CODEGRAPH_SCIP_INDEX. This repository ships scripts/scip-index.sh to do all\n\
-                        of that per language and print the value.\n\
+                        `scip-typescript index` (TS/JS), `scip-go` (Go) or `scip-python index` (Python),\n\
+                        then set CODEGRAPH_SCIP_INDEX. This repository ships scripts/scip-index.sh to do\n\
+                        all of that per language and print the value.\n\
                       - CODEGRAPH_SCIP_INDEX takes a comma-separated list; each entry is\n\
                         <path>[@<subdir>], where subdir is the index's directory relative to the project\n\
-                        root, e.g. \"rust.scip,go.scip@easytier-go,ui.scip@ui\". Setting it disables\n\
-                        language servers for the whole run, so a mixed-language project needs one index\n\
-                        per language; a language without an index gets no symbol enrichment.\n\
+                        root, e.g. \"rust.scip,go.scip@easytier-go,ui.scip@ui\". A mixed-language project\n\
+                        needs one index per language; a language without an index gets no compiler\n\
+                        enrichment but is still parsed.\n\
                       - Vector indexes are built once after all rows are durable\n\
                         (CODEGRAPH_VECTOR_INDEX_MODE=deferred, the default); on a fresh store this writes\n\
                         chunks several times faster than maintaining HNSW per insert. Existing stores keep\n\

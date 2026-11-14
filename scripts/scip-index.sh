@@ -54,6 +54,25 @@ if [ -f "$ROOT/Cargo.toml" ] || find "$ROOT" -maxdepth 3 -name Cargo.toml -print
   fi
 fi
 
+# --- Python (scip-python; must run from the project root, WITHOUT --cwd) ---
+if [ -f "$ROOT/pyproject.toml" ] || [ -f "$ROOT/setup.py" ] || [ -f "$ROOT/requirements.txt" ]; then
+  out="$OUT/python.scip"
+  if have scip-python; then
+    name="$(basename "$ROOT")"
+    ( cd "$ROOT" && scip-python index --project-name "$name" --output "$out" >/dev/null 2>&1 ) || true
+    # scip-python exits 0 even when it emits an empty index (e.g. if --cwd was passed);
+    # a real index is far larger than 1KB, an empty one is ~72 bytes.
+    if [ -f "$out" ] && [ "$(wc -c <"$out")" -gt 1024 ]; then
+      entries+=("$out")
+    else
+      echo "warn: scip-python produced an empty/short index (<1KB); Python stays AST-only" >&2
+      rm -f "$out"
+    fi
+  else
+    echo "warn: scip-python not found; Python stays AST-only" >&2
+  fi
+fi
+
 # --- TypeScript / JavaScript (per workspace package) ---
 while IFS= read -r pkg; do
   dir="$(dirname "$pkg")"

@@ -897,8 +897,8 @@ impl ProjectIndexer {
             if scip_specs.is_empty() {
                 info!(
                     "💡 hint: no SCIP index supplied, so no compiler-index enrichment will run. \
-                     Generate one (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`) \
-                     and set CODEGRAPH_SCIP_INDEX, or run scripts/scip-index.sh. \
+                     Generate one (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`, \
+                     `scip-python index`) and set CODEGRAPH_SCIP_INDEX, or run scripts/scip-index.sh. \
                      See `codegraph index --help`."
                 );
             }

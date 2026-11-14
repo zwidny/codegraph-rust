@@ -166,7 +166,7 @@ fn warn_if_index_predates_sources(index: &Path, sources: &SourceSnapshots) {
     }
     if newer > 0 {
         warn!(
-            "SCIP index {} is older than {} of {} captured sources; recorded positions may not match the current text. Regenerate it (`rust-analyzer scip .`, `scip-typescript index`, or `scip-go`) to avoid position errors",
+            "SCIP index {} is older than {} of {} captured sources; recorded positions may not match the current text. Regenerate it (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`, or `scip-python index`) to avoid position errors",
             index.display(),
             newer,
             total

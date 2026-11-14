@@ -77,11 +77,17 @@ The index tier filters edges, it does not gate enrichment: `fast` drops `Uses`/`
 on every tier.
 
 **Prefer SCIP over AST-only.** Generate a compiler index first and pass it via
-`CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`;
-comma-separated entries, `path@subdir` when the index was built inside a subdirectory).
-On a 10k-file tree this cut analysis from 21 minutes to 2.4 s plus a 3.9 s import, and it
-contributes definition edges even on `balanced`. `scripts/scip-index.sh` generates every
-language and prints the value. A language without an index gets no compiler enrichment but
-is still parsed; there is no language-server fallback.
+`CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`,
+`scip-python index`; comma-separated entries, `path@subdir` when the index was built inside
+a subdirectory). On a 10k-file tree this cut analysis from 21 minutes to 2.4 s plus a 3.9 s
+import, and it contributes definition edges even on `balanced`. `scripts/scip-index.sh`
+generates the ones it knows and prints the value.
+
+Any language with a SCIP indexer can be enriched, not only those four: CodeGraph parses
+Python natively, so a Python SCIP index contributes its edges too. Generate it with
+`scip-python index --project-name <name> --output <path>` from the project root and do
+**not** add `--cwd` (it produces a ~72-byte empty index); check `wc -c` before importing,
+since a 72-byte file holds zero documents and the import aborts. A language without an index
+gets no compiler enrichment but is still parsed; there is no language-server fallback.
 
 Reload this guidance with `codegraph agent instructions` after context loss.
