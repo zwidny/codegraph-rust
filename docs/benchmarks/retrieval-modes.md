@@ -52,16 +52,45 @@ Natural-language queries (doc comment):
 | bm25 | 0.2505 | 0.2112 | 0.3718 | 0.115 | 0.321 |
 | hybrid | 0.4049 | 0.3393 | 0.6154 | 0.218 | 0.487 |
 
+## Ablation: index the doc comment
+
+The natural-language query is the symbol's doc comment, but `content_tsv` is
+`name || text` — the comment lives in node metadata, not the searchable text. In
+the 200-node sample only **33.7%** of doc terms appear in `content_tsv` (avg
+13.4 terms/doc). That is a **field mismatch**, not a property of BM25.
+
+Re-indexing the doc comment into the text field (`name || text || doc`) and
+re-running with the same doc as the query:
+
+| doc indexed | mode | nDCG@10 | MRR@10 | Recall@10 |
+|---|---|---|---|---|
+| no | vector | 0.5300 | 0.4715 | 0.7179 |
+| no | bm25 | 0.2505 | 0.2112 | 0.3718 |
+| no | hybrid | 0.4049 | 0.3393 | 0.6154 |
+| **yes** | vector | 0.5300 | 0.4715 | 0.7179 |
+| **yes** | **bm25** | **0.8439** | **0.8033** | **0.9744** |
+| **yes** | hybrid | 0.7363 | 0.6747 | 0.9231 |
+
+So the 0.25 was mostly the described text not being indexed; once it is, BM25
+reaches 0.84 on these queries. Caveat: the query is the stored comment, so this
+is an **exact-match upper bound**; a human paraphrase would be harder for both.
+
+The fusion result flips with which channel is stronger: uniform RRF dilutes the
+better list. Before (text weak) hybrid 0.40 < vector 0.53; after (text strong)
+hybrid 0.74 < bm25 0.84. That is the theoretical reason a **confidence gate or
+learned weights** are needed — equal-weight RRF is not adaptive.
+
 ## Conclusion
 
 - For identifier queries the text channel is strong and **uniform RRF adds over
   vector** (0.54 -> 0.68 nDCG).
-- For natural-language queries the text channel is about half as good as vector
-  (0.25 vs 0.53), and **uniform RRF regresses vector to 0.40**. This is now a
-  real result on a real BM25, not an artifact.
-- Therefore: **weighted RRF, or a confidence gate** that drops a channel whose
-  top score is weak, is the correct next change. Equal fusion is only safe when
-  both channels are comparable for the query type.
+- On natural language, the original "vector beats BM25" was **confounded**: the
+  described text was not in the searchable field (33.7% term overlap). Indexing
+  the doc comment lifts BM25 to 0.84 on the same queries.
+- In both directions **uniform RRF regresses toward the weaker channel**. The
+  correct next change is a confidence gate or weighted RRF, not equal weights.
+- The product still needs a decision: index doc/comment text (cheap, large win
+  for description queries) and adopt a real BM25 (SQL port or pg_textsearch).
 
 ## Libraries evaluated for real BM25 in Postgres
 
