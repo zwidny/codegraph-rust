@@ -31,17 +31,21 @@
 //! ## Node retrieval
 //!
 //! `nodes` can be searched three ways: [`PgStore::knn_nodes`] (pgvector cosine
-//! distance over `embedding_1024`), [`PgStore::full_text_nodes`] (`ts_rank_cd` over
-//! the generated `search_tsv`: name + content + `metadata->>'doc'`) and
+//! distance over `embedding_1024`), [`PgStore::full_text_nodes`] (BM25 over the
+//! generated `search_tsv`: name + content + `metadata->>'doc'`) and
 //! [`PgStore::hybrid_nodes`], which fuses both lists with Reciprocal Rank Fusion and
 //! keeps single-retriever hits.
 //!
 //! Full-text recall is made equivalent to SurrealDB's `EDGENGRAM(2,12)` by turning
-//! every query term into a prefix tsquery (`term:*`); the `english` configuration
-//! supplies the same stemming as `SNOWBALL`. **Ranking is not equivalent**: Postgres
-//! uses `ts_rank_cd`, not BM25, so even when both backends return the same node set
-//! the top-k order differs (96% vs 100% precision, 9% top-10 overlap in
-//! `docs/BACKEND_EVALUATION.md`). BM25 ranking is out of scope here.
+//! every query term into a prefix tsquery (`term:*`), joined with `|` (OR) so a long
+//! description does not require every word to match; the `english` configuration
+//! supplies the same stemming as `SNOWBALL`. Ranking is true BM25: per-project
+//! document frequency (`bm25_stats`), inverse document frequency, term-frequency
+//! saturation and document-length normalization to the project's average length
+//! (`bm25_corpus`). The corpus is built lazily on the first query and rebuilt whenever
+//! the project's node count changes. Setting `CODEGRAPH_TEXT_SCORE=ts_rank_cd`
+//! restores the old `ts_rank_cd` ordering (no IDF, no length normalization) for
+//! comparison and rollback.
 //!
 //! ## Node embeddings
 //!
@@ -313,6 +317,24 @@ CREATE TABLE IF NOT EXISTS project_metadata (
   domain            text,
   metadata          jsonb NOT NULL DEFAULT '{}'::jsonb
 );
+
+-- BM25 corpus statistics, one row per project. `n` is the total node count and
+-- `avgdl` the average token count over those nodes; both are refreshed lazily by
+-- PgStore::ensure_bm25_stats. `avgdl` is never zero (empty projects store 1).
+CREATE TABLE IF NOT EXISTS bm25_corpus (
+  project_id text PRIMARY KEY,
+  n          bigint NOT NULL,
+  avgdl      double precision NOT NULL
+);
+
+-- BM25 document frequency: how many nodes in a project contain each lexeme.
+CREATE TABLE IF NOT EXISTS bm25_stats (
+  project_id text NOT NULL,
+  term       text NOT NULL,
+  df         integer NOT NULL,
+  PRIMARY KEY (project_id, term)
+);
+CREATE INDEX IF NOT EXISTS bm25_stats_project ON bm25_stats (project_id);
 "#;
 
 /// Staging table for `COPY`. The embedding is carried in pgvector's native binary
@@ -745,16 +767,114 @@ ORDER BY embedding_1024 <=> $1::text::vector
 LIMIT $3
 "#;
 
-/// Node-level full-text retrieval. Ranking uses `ts_rank_cd`, not BM25: the recall
-/// matches SurrealDB's BM25 but the ordering does not (see
-/// `docs/BACKEND_EVALUATION.md`). The indexed text now also includes the `doc`
-/// comment from `metadata->>'doc'`, so name + content + doc are all searchable.
+/// Legacy node-level full-text retrieval, used only when
+/// `CODEGRAPH_TEXT_SCORE=ts_rank_cd`. Ranking uses `ts_rank_cd`, which has neither
+/// IDF nor length normalization (see `docs/BACKEND_EVALUATION.md`). The indexed text
+/// now also includes the `doc` comment from `metadata->>'doc'`, so name + content +
+/// doc are all searchable.
 const FULL_TEXT_NODES_SQL: &str = r#"
 SELECT id, ts_rank_cd(search_tsv, to_tsquery('english', $1))::double precision AS rank
 FROM nodes
 WHERE project_id = $2 AND search_tsv @@ to_tsquery('english', $1)
 ORDER BY rank DESC, id ASC
 LIMIT $3
+"#;
+
+/// Maximum candidates the BM25 query re-ranks. The GIN index narrows the project to
+/// documents matching any query term; `ts_rank_cd` only sets the candidate order, the
+/// returned score is BM25.
+const BM25_CANDIDATE_CAP: usize = 2000;
+
+/// Rebuild one project's BM25 corpus row. `n` counts every node in the project (so it
+/// matches the staleness check in [`PgStore::ensure_bm25_stats`]); `avgdl` averages
+/// the token count over those same nodes, treating a node with no lexemes as length
+/// zero, and falls back to 1 for an empty project so scoring never divides by zero.
+const BM25_CORPUS_SQL: &str = r#"
+INSERT INTO bm25_corpus(project_id, n, avgdl)
+SELECT $1, count(*), coalesce(avg(coalesce(tokens, 0)), 1)::double precision
+FROM (
+  SELECT n.id,
+         (SELECT sum(cardinality(u.positions)) FROM unnest(n.search_tsv) u) AS tokens
+  FROM nodes n
+  WHERE n.project_id = $1
+) s
+"#;
+
+/// Rebuild one project's document frequencies. `df` is the number of nodes whose
+/// `search_tsv` contains the lexeme, which is what BM25's IDF needs (not raw term
+/// occurrences).
+const BM25_STATS_SQL: &str = r#"
+INSERT INTO bm25_stats(project_id, term, df)
+SELECT $1, u.lexeme, count(*)::integer
+FROM nodes, unnest(search_tsv) u
+WHERE project_id = $1
+GROUP BY u.lexeme
+"#;
+
+/// True BM25 node retrieval.
+///
+/// `$2` is the **raw** query text, not a rendered tsquery: the `english` dictionary
+/// must stem both the query and the indexed lexemes, so the OR-prefix tsquery and the
+/// scored term list are both derived here from `to_tsvector('english', $2)`. This
+/// keeps the two sides on the same lexemes (`embedding` -> `embed`), which a
+/// client-side tsquery cannot do without a Rust stemmer.
+///
+/// `$1` project, `$2` raw query, `$3` candidate cap, `$4` k. A document matches when
+/// any query lexeme matches, exactly or as a prefix (so `emb:*` still finds `embed`).
+/// The score is the sum over matched terms of
+/// `ln(1 + (N - df + 0.5) / (df + 0.5)) * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))`
+/// with `k1 = 1.2` and `b = 0.75`. `df` is looked up for the **document's** lexeme, so
+/// a prefix match uses the frequency of the term it actually hit.
+const BM25_NODES_SQL: &str = r#"
+WITH qt AS (
+  SELECT string_agg(lexeme || ':*', ' | ') AS txt
+  FROM unnest(to_tsvector('english', $2)) AS u(lexeme)
+),
+tq AS (
+  SELECT to_tsquery('english', txt) AS q
+  FROM qt
+  WHERE txt IS NOT NULL
+),
+terms AS (
+  SELECT DISTINCT lexeme FROM unnest(to_tsvector('english', $2)) AS u(lexeme)
+),
+cand AS (
+  SELECT n.id, n.search_tsv
+  FROM nodes n
+  WHERE n.project_id = $1
+    AND n.search_tsv @@ (SELECT q FROM tq)
+  ORDER BY ts_rank_cd(n.search_tsv, (SELECT q FROM tq)) DESC, n.id ASC
+  LIMIT $3
+),
+scored AS (
+  SELECT cand.id,
+    sum(
+      ln(1 + (c.n - df.df + 0.5) / (df.df + 0.5))
+      * (t.tf * 2.2)
+      / (t.tf + 1.2 * (0.25 + 0.75 * (d.dl / c.avgdl)))
+    ) AS score
+  FROM cand
+  CROSS JOIN bm25_corpus c
+  CROSS JOIN LATERAL (
+    SELECT sum(cardinality(x.positions)) AS dl FROM unnest(cand.search_tsv) x
+  ) d
+  JOIN LATERAL (
+    SELECT u.lexeme AS term, cardinality(u.positions) AS tf
+    FROM unnest(cand.search_tsv) u
+    WHERE EXISTS (
+      SELECT 1 FROM terms
+      WHERE u.lexeme = terms.lexeme
+         OR (length(terms.lexeme) >= 2 AND u.lexeme LIKE terms.lexeme || '%')
+    )
+  ) t ON true
+  JOIN bm25_stats df ON df.project_id = $1 AND df.term = t.term
+  WHERE c.project_id = $1
+  GROUP BY cand.id
+)
+SELECT id, score FROM scored
+WHERE score IS NOT NULL
+ORDER BY score DESC, id ASC
+LIMIT $4
 "#;
 
 const REVERSE_DEPS_SQL: &str = r#"
@@ -930,20 +1050,12 @@ pub(crate) fn metadata_text(value: Option<&serde_json::Value>) -> Result<Option<
         .map_err(Into::into)
 }
 
-/// Build a `to_tsquery('english', ...)` argument from a free-form user query.
+/// Extract the sanitized terms of a free-form query.
 ///
-/// The query is split on everything that is not ASCII-or-Unicode alphanumeric or
-/// `_`, lowercased, and every surviving term becomes `term:*` (a prefix match).
-/// Prefix matching is what makes the node path equivalent to SurrealDB's
-/// `EDGENGRAM(2,12)` tokenizer: `term` matches `terms`, `terminate`, ... .
-///
-/// Returns `None` when no usable term is left, so callers skip the database instead
-/// of sending an empty tsquery (which Postgres rejects). Splitting already removes
-/// `'`, `"`, `&`, `|`, `!`, `(`, `)` and `:`, so no quoting is needed.
-///
-/// camelCase is **not** split: `HandleFile` becomes `handlefile:*`, which would only
-/// match tokens that start with the literal `handlefile`.
-pub(crate) fn tsquery_prefix(query: &str) -> Option<String> {
+/// Everything that is not ASCII-or-Unicode alphanumeric or `_` splits a term; each
+/// surviving term is lowercased to ASCII `[a-z0-9_]` and dropped when empty or when
+/// longer than [`MAX_TSQUERY_TERM_LEN`] bytes. camelCase is **not** split.
+fn tsquery_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();
     for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
         let cleaned: String = raw
@@ -954,14 +1066,68 @@ pub(crate) fn tsquery_prefix(query: &str) -> Option<String> {
         if cleaned.is_empty() || cleaned.chars().count() > MAX_TSQUERY_TERM_LEN {
             continue;
         }
-        terms.push(format!("{cleaned}:*"));
+        terms.push(cleaned);
     }
+    terms
+}
 
+/// Build a `to_tsquery('english', ...)` argument that requires **every** term.
+///
+/// The query is split on everything that is not ASCII-or-Unicode alphanumeric or
+/// `_`, lowercased, and every surviving term becomes `term:*` (a prefix match),
+/// joined with ` & ` (AND). Prefix matching is what makes the node path equivalent
+/// to SurrealDB's `EDGENGRAM(2,12)` tokenizer: `term` matches `terms`, `terminate`.
+///
+/// Returns `None` when no usable term is left, so callers skip the database instead
+/// of sending an empty tsquery (which Postgres rejects). Splitting already removes
+/// `'`, `"`, `&`, `|`, `!`, `(`, `)` and `:`, so no quoting is needed.
+///
+/// This is the legacy (AND) form used by `CODEGRAPH_TEXT_SCORE=ts_rank_cd`. Note
+/// that it does not stem; Postgres stems the terms inside `to_tsquery`.
+pub(crate) fn tsquery_prefix(query: &str) -> Option<String> {
+    let terms = tsquery_terms(query);
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" & "))
+        Some(
+            terms
+                .into_iter()
+                .map(|term| format!("{term}:*"))
+                .collect::<Vec<_>>()
+                .join(" & "),
+        )
     }
+}
+
+/// Like [`tsquery_prefix`] but joins terms with ` | ` (OR).
+///
+/// OR is what keeps a long natural-language description from requiring every word
+/// to appear in a node; the BM25 query in [`BM25_NODES_SQL`] uses this shape. Terms
+/// are still cleaned identically, and `None` means "no usable term". Stemming for
+/// the actual query happens in SQL (`to_tsvector('english', ...)`), because Rust has
+/// no stemmer; this helper only decides whether the query is usable.
+pub(crate) fn tsquery_prefix_or(query: &str) -> Option<String> {
+    let terms = tsquery_terms(query);
+    if terms.is_empty() {
+        None
+    } else {
+        Some(
+            terms
+                .into_iter()
+                .map(|term| format!("{term}:*"))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        )
+    }
+}
+
+/// Whether `CODEGRAPH_TEXT_SCORE=ts_rank_cd` asks for the legacy ranking.
+///
+/// Unset, empty or any other value selects BM25.
+fn text_score_uses_ts_rank_cd() -> bool {
+    std::env::var("CODEGRAPH_TEXT_SCORE")
+        .map(|value| value.trim().eq_ignore_ascii_case("ts_rank_cd"))
+        .unwrap_or(false)
 }
 
 /// Reciprocal Rank Fusion score contribution of one 1-based rank.
@@ -1649,15 +1815,88 @@ impl PgStore {
             .collect())
     }
 
+    /// Ensure the BM25 statistics for `project_id` match its current node count.
+    ///
+    /// The build is lazy (the first full-text query pays for it) and idempotent: a
+    /// transaction-scoped advisory lock serialises concurrent callers, then the stored
+    /// `bm25_corpus.n` is compared with `count(*) FROM nodes`. Only a mismatch triggers
+    /// a rebuild, so repeated queries are one cheap count plus a lookup.
+    ///
+    /// Empty projects store `n = 0, avgdl = 1`; the `1` keeps BM25's length ratio from
+    /// dividing by zero.
+    async fn ensure_bm25_stats(&self, project_id: &str) -> Result<()> {
+        let mut client = self.pool.get().await.map_err(db_err)?;
+        let transaction = client.transaction().await.map_err(db_err)?;
+        transaction
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&project_id],
+            )
+            .await
+            .map_err(db_err)?;
+
+        let current: i64 = transaction
+            .query_one(
+                "SELECT count(*) FROM nodes WHERE project_id = $1",
+                &[&project_id],
+            )
+            .await
+            .map_err(db_err)?
+            .get(0);
+        let cached: Option<i64> = transaction
+            .query_opt(
+                "SELECT n FROM bm25_corpus WHERE project_id = $1",
+                &[&project_id],
+            )
+            .await
+            .map_err(db_err)?
+            .map(|row| row.get(0));
+
+        if cached == Some(current) {
+            transaction.commit().await.map_err(db_err)?;
+            return Ok(());
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM bm25_stats WHERE project_id = $1",
+                &[&project_id],
+            )
+            .await
+            .map_err(db_err)?;
+        transaction
+            .execute(
+                "DELETE FROM bm25_corpus WHERE project_id = $1",
+                &[&project_id],
+            )
+            .await
+            .map_err(db_err)?;
+        transaction
+            .execute(BM25_CORPUS_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+        transaction
+            .execute(BM25_STATS_SQL, &[&project_id])
+            .await
+            .map_err(db_err)?;
+        transaction.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
     /// Full-text node retrieval over `nodes.search_tsv` (name + content + doc).
+    ///
+    /// By default this is **BM25**: query terms are joined with OR and matched as
+    /// prefixes (`term:*`), then re-ranked with IDF, term-frequency saturation and
+    /// document-length normalization against the project's corpus statistics. The
+    /// statistics are built lazily by [`Self::ensure_bm25_stats`].
+    ///
+    /// Setting `CODEGRAPH_TEXT_SCORE=ts_rank_cd` restores the legacy `ts_rank_cd`
+    /// ordering, which has no IDF and no length normalization.
     ///
     /// Each query term becomes a prefix match (`term:*`), which reproduces the
     /// recall of SurrealDB's `EDGENGRAM(2,12)`; the Postgres `english` configuration
     /// provides the same stemming as `SNOWBALL`. The indexed text includes the doc
     /// comment stored at `metadata->>'doc'`, so a doc-only mention is recallable.
-    /// Ranking is `ts_rank_cd`, **not**
-    /// BM25, so the top-k order differs from SurrealDB even when the candidate sets
-    /// agree (see `docs/BACKEND_EVALUATION.md`).
     ///
     /// A query with no usable term returns an empty list without touching the
     /// database, and `k` is capped at [`MAX_RETRIEVAL_K`].
@@ -1671,17 +1910,38 @@ impl PgStore {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let Some(tsquery) = tsquery_prefix(query) else {
+        if tsquery_prefix_or(query).is_none() {
             return Ok(Vec::new());
-        };
+        }
 
         let limit = i64::try_from(k).unwrap_or(i64::MAX);
         let client = self.pool.get().await.map_err(db_err)?;
+
+        if text_score_uses_ts_rank_cd() {
+            let Some(tsquery) = tsquery_prefix(query) else {
+                return Ok(Vec::new());
+            };
+            let rows = client
+                .query(FULL_TEXT_NODES_SQL, &[&tsquery, &project_id, &limit])
+                .await
+                .map_err(db_err)?;
+            return Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect());
+        }
+
+        // Drop the pooled connection before the stats transaction so the pool does not
+        // hold two connections for one call.
+        drop(client);
+        self.ensure_bm25_stats(project_id).await?;
+
+        let client = self.pool.get().await.map_err(db_err)?;
+        let candidate_cap = i64::try_from(BM25_CANDIDATE_CAP).unwrap_or(i64::MAX);
         let rows = client
-            .query(FULL_TEXT_NODES_SQL, &[&tsquery, &project_id, &limit])
+            .query(
+                BM25_NODES_SQL,
+                &[&project_id, &query, &candidate_cap, &limit],
+            )
             .await
             .map_err(db_err)?;
-
         Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
     }
 
@@ -2936,15 +3196,23 @@ mod tests {
             }
         }
         assert_eq!(
-            table_count, 6,
+            table_count, 8,
             "expected chunks + edges + nodes + symbol_embeddings + file_metadata + \
-             project_metadata tables"
+             project_metadata + bm25_corpus + bm25_stats tables"
         );
         assert_eq!(
-            index_count, 16,
-            "expected 16 chunks/edges/nodes/symbol/file_metadata indexes \
+            index_count, 17,
+            "expected 17 chunks/edges/nodes/symbol/file_metadata/bm25 indexes \
              (project_metadata is keyed by its primary key and needs no extra index; \
              the three HNSW indexes are built after the write by ensure_vector_indexes)"
+        );
+        assert!(
+            SCHEMA_DDL.contains("CREATE TABLE IF NOT EXISTS bm25_corpus"),
+            "the BM25 corpus table must be part of the DDL"
+        );
+        assert!(
+            SCHEMA_DDL.contains("CREATE TABLE IF NOT EXISTS bm25_stats"),
+            "the BM25 document-frequency table must be part of the DDL"
         );
         assert!(
             SCHEMA_DDL.contains("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS search_tsv"),
@@ -3212,6 +3480,42 @@ mod tests {
         );
         // Non-ASCII alphanumerics split out entirely rather than reaching tsquery.
         assert_eq!(tsquery_prefix("名字"), None);
+    }
+
+    #[test]
+    fn tsquery_prefix_or_joins_with_or() {
+        // Rust has no stemmer, so terms stay unstemmed here; BM25_NODES_SQL derives
+        // the stemmed OR-prefix tsquery from the raw text. The join shape is what
+        // this helper guarantees.
+        assert_eq!(
+            tsquery_prefix_or("Reconcile Project"),
+            Some("reconcile:* | project:*".to_string())
+        );
+        assert_eq!(
+            tsquery_prefix_or("  Parse\tERROR\n"),
+            Some("parse:* | error:*".to_string()),
+            "whitespace and case are normalised"
+        );
+        assert_eq!(
+            tsquery_prefix_or("a&b|c"),
+            Some("a:* | b:* | c:*".to_string()),
+            "operators cannot survive the split"
+        );
+    }
+
+    #[test]
+    fn tsquery_prefix_or_rejects_empty_and_symbols() {
+        assert_eq!(tsquery_prefix_or(""), None);
+        assert_eq!(tsquery_prefix_or("!!!"), None);
+        assert_eq!(tsquery_prefix_or("   \t\n"), None);
+        assert_eq!(
+            tsquery_prefix_or(&"a".repeat(MAX_TSQUERY_TERM_LEN + 1)),
+            None
+        );
+        assert_eq!(
+            tsquery_prefix_or("reconcile !! project"),
+            Some("reconcile:* | project:*".to_string())
+        );
     }
 
     // ---- Node retrieval: RRF fusion ----
@@ -4955,6 +5259,130 @@ mod tests {
             index,
             "nodes_search_tsv GIN index is missing after ensure_schema"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn full_text_nodes_bm25_prefers_rare_term() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("node_bm25_rare");
+        let mut rare = node("bm25_rare", &project);
+        rare.name = "zebracorn".to_string();
+        rare.content = Some("a very rare token lives here".to_string());
+
+        let mut common = node("bm25_common", &project);
+        common.name = "common".to_string();
+        common.content = Some("this document only talks about the common token".to_string());
+
+        // Filler documents make `common` genuinely common and `zebracorn` rare, which
+        // is exactly the signal `ts_rank_cd` ignores.
+        let mut fillers = Vec::new();
+        for index in 0..20 {
+            let mut filler = node(&format!("bm25_filler_{index}"), &project);
+            filler.name = "common".to_string();
+            filler.content = Some("common token repeated".to_string());
+            fillers.push(filler);
+        }
+
+        let mut rows = vec![rare, common];
+        rows.extend(fillers);
+        store.upsert_nodes(&rows).await.expect("upsert_nodes");
+
+        // Only the rare node contains "zebracorn", so it must rank first.
+        let hits = store
+            .full_text_nodes(&project, "zebracorn", 10)
+            .await
+            .expect("bm25 query");
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids.first().copied(),
+            Some("bm25_rare"),
+            "the rare-term document must rank first; hits were {ids:?}"
+        );
+
+        // With OR + IDF, a query mixing the rare and common terms still puts the rare
+        // match first because its IDF contribution dominates.
+        let mixed = store
+            .full_text_nodes(&project, "zebracorn common", 10)
+            .await
+            .expect("mixed bm25 query");
+        assert_eq!(
+            mixed.first().map(|(id, _)| id.as_str()),
+            Some("bm25_rare"),
+            "the OR query must still favour the rare term; hits were {:?}",
+            mixed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn bm25_stats_built_on_first_query() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("node_bm25_stats");
+        let mut first = node("bm25_stat_first", &project);
+        first.name = "alpha".to_string();
+        first.content = Some("alpha beta gamma".to_string());
+        let mut second = node("bm25_stat_second", &project);
+        second.name = "delta".to_string();
+        second.content = Some("delta epsilon".to_string());
+        store
+            .upsert_nodes(&[first, second])
+            .await
+            .expect("upsert_nodes");
+
+        let corpus_before: i64 = store
+            .pool
+            .get()
+            .await
+            .expect("pool client")
+            .query_one(
+                "SELECT count(*) FROM bm25_corpus WHERE project_id = $1",
+                &[&project],
+            )
+            .await
+            .expect("corpus lookup")
+            .get(0);
+        assert_eq!(corpus_before, 0, "stats are built lazily, not on write");
+
+        store
+            .full_text_nodes(&project, "alpha", 10)
+            .await
+            .expect("first query builds stats");
+
+        let client = store.pool.get().await.expect("pool client");
+        let stats_rows: i64 = client
+            .query_one(
+                "SELECT count(*) FROM bm25_stats WHERE project_id = $1",
+                &[&project],
+            )
+            .await
+            .expect("stats lookup")
+            .get(0);
+        assert!(
+            stats_rows > 0,
+            "bm25_stats must contain rows for the project after the first query"
+        );
+
+        let (n, avgdl): (i64, f64) = {
+            let row = client
+                .query_one(
+                    "SELECT n, avgdl FROM bm25_corpus WHERE project_id = $1",
+                    &[&project],
+                )
+                .await
+                .expect("corpus lookup");
+            (row.get(0), row.get(1))
+        };
+        assert_eq!(n, 2, "the corpus document count matches the node count");
+        assert!(avgdl > 0.0, "avgdl must never be zero: {avgdl}");
     }
 
     #[tokio::test]

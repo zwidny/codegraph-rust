@@ -398,7 +398,7 @@ impl Tool for SemanticCodeSearch {
     type Output = JsonValue;
 
     fn description(&self) -> String {
-        "Search the codebase by meaning or by identifier. Returns matching nodes with their node ID, name, file path, line, and a code snippet. This is the way to obtain the node IDs the other tools require, so it is usually the first call. Each row has three scores: vector_score (cosine similarity, filtered by `threshold`), text_score (ts_rank_cd, not BM25), and combined_score (RRF rank, 1/(60+rank), ordering only); the response's score_semantics field restates this."
+        "Search the codebase by meaning or by identifier. Returns matching nodes with their node ID, name, file path, line, and a code snippet. This is the way to obtain the node IDs the other tools require, so it is usually the first call. Each row has three scores: vector_score (cosine similarity, filtered by `threshold`), text_score (BM25 over name+content+doc; ts_rank_cd fallback), and combined_score (RRF rank, 1/(60+rank), ordering only); the response's score_semantics field restates this."
             .to_string()
     }
 
