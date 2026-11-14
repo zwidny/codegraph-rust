@@ -125,7 +125,28 @@ mod tests {
         };
 
         let enhanced = enhancer.enhance(result, content);
-        assert!(enhanced.edges.len() > 0, "Should add pattern-based edges");
+        let is_synthetic_pattern_edge = |to: &str| {
+            [
+                "rust:", "ts:", "js:", "py:", "go:", "java:", "cpp:", "swift:", "csharp:", "ruby:",
+                "php:",
+            ]
+            .iter()
+            .any(|prefix| to.starts_with(prefix))
+        };
+        assert!(
+            enhanced
+                .edges
+                .iter()
+                .all(|edge| !is_synthetic_pattern_edge(&edge.to)),
+            "Should not add edges whose target is a pattern name"
+        );
+        assert!(
+            enhanced.nodes[0]
+                .metadata
+                .attributes
+                .contains_key("fast_ml_patterns"),
+            "Should still enrich file-level node metadata"
+        );
     }
 
     #[test]

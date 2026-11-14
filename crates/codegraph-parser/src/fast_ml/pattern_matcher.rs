@@ -2,8 +2,7 @@
 // ABOUTME: Provides sub-microsecond pattern matching without training requirements
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use codegraph_core::{EdgeRelationship, EdgeType, ExtractionResult};
-use std::collections::HashMap;
+use codegraph_core::{EdgeType, ExtractionResult};
 use tracing::debug;
 
 /// Fast pattern matcher using Aho-Corasick automaton (50-500ns per search)
@@ -127,7 +126,7 @@ impl PatternMatcher {
         }
     }
 
-    /// Enhance extraction result with pattern-based edges AND node enrichment (50-500ns per file)
+    /// Enhance extraction result with node-level pattern enrichment (50-500ns per file)
     pub fn enhance_extraction(&self, result: ExtractionResult, content: &str) -> ExtractionResult {
         self.enhance_with_policy(result, content, Default::default())
     }
@@ -167,14 +166,13 @@ impl PatternMatcher {
             return result;
         }
 
-        // Collect pattern statistics for node enrichment
-        let mut new_edges = Vec::new();
-        let mut pattern_counts: HashMap<usize, usize> = HashMap::new();
+        // Collect pattern names for node enrichment. Pattern matches no longer
+        // produce edges: their `to` was a pattern name (e.g. "py:import "), which
+        // is not a real symbol and could never resolve to a node.
         let mut pattern_names = Vec::new();
 
         for m in &matches {
             let pattern_idx = m.pattern().as_usize();
-            *pattern_counts.entry(pattern_idx).or_insert(0) += 1;
 
             // Track pattern names for node metadata enrichment
             if let Some((pattern_name, _)) = self.patterns.get(pattern_idx) {
@@ -182,73 +180,6 @@ impl PatternMatcher {
                     pattern_names.push(pattern_name.clone());
                 }
             }
-        }
-
-        // Pick a representative node (file/module node, else longest node content)
-        let representative_node = result
-            .nodes
-            .iter()
-            .find(|n| {
-                matches!(n.node_type, Some(codegraph_core::NodeType::Module))
-                    || n.node_type.is_none()
-            })
-            .or_else(|| {
-                result
-                    .nodes
-                    .iter()
-                    .max_by_key(|n| n.content.as_ref().map(|c| c.len()).unwrap_or(0))
-            })
-            .map(|node| node.id);
-
-        // Generate edges based on pattern frequency (top-k per file, capped per pattern)
-        if let Some(rep) = representative_node {
-            // Sort patterns by count desc
-            let mut freq: Vec<(usize, usize)> = pattern_counts.into_iter().collect();
-            freq.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            let top_k = 5usize;
-            let max_edges_per_file = 25usize;
-            let max_per_pattern = 5usize;
-            let mut edges_added = 0usize;
-
-            for (pattern_idx, count) in freq.into_iter().take(top_k) {
-                if edges_added >= max_edges_per_file {
-                    break;
-                }
-                if let Some((pattern_name, edge_type)) = self.patterns.get(pattern_idx) {
-                    let edge_reps = count.min(max_per_pattern);
-                    let mut metadata = HashMap::new();
-                    metadata.insert("pattern".to_string(), pattern_name.clone());
-                    metadata.insert("pattern_count".to_string(), count.to_string());
-                    metadata.insert(
-                        "fast_ml_enhancement".to_string(),
-                        "pattern_match".to_string(),
-                    );
-
-                    for _ in 0..edge_reps {
-                        if edges_added >= max_edges_per_file {
-                            break;
-                        }
-                        new_edges.push(EdgeRelationship {
-                            from: rep,
-                            to: pattern_name.clone(),
-                            edge_type: edge_type.clone(),
-                            metadata: metadata.clone(),
-                            span: None,
-                        });
-                        edges_added += 1;
-                    }
-                }
-            }
-        }
-
-        let enhancement_count = new_edges.len();
-        if enhancement_count > 0 {
-            debug!(
-                "⚡ PatternMatcher: Added {} pattern-based edges (found {} total matches)",
-                enhancement_count,
-                matches.len()
-            );
-            result.edges.extend(new_edges);
         }
 
         // Enrich file-level nodes with pattern context for better embeddings
@@ -293,6 +224,17 @@ mod tests {
     use super::*;
     use codegraph_core::{CodeNode, Language};
 
+    /// Pattern matches must not be emitted as edges: their `to` was a pattern
+    /// name such as `"py:import "`, not a real symbol.
+    fn is_synthetic_pattern_edge(to: &str) -> bool {
+        [
+            "rust:", "ts:", "js:", "py:", "go:", "java:", "cpp:", "swift:", "csharp:", "ruby:",
+            "php:",
+        ]
+        .iter()
+        .any(|prefix| to.starts_with(prefix))
+    }
+
     #[test]
     fn matches_later_lines_and_filters_other_languages_and_tiers() {
         let matcher = PatternMatcher::new();
@@ -302,11 +244,34 @@ mod tests {
             nodes: vec![node],
             edges: vec![],
         };
-        let content = "// heading\n    pub fn a() {}\n    impl Trait for A {}\n    import x\n";
+        let content = "// heading\n    use std::fmt;\n    pub fn a() {}\n    impl Trait for A {}\n    import x\n";
         let full = matcher.enhance_extraction(result.clone(), content);
-        assert!(full.edges.iter().any(|edge| edge.to == "rust:pub fn"));
-        assert!(full.edges.iter().any(|edge| edge.to == "rust:impl "));
-        assert!(full.edges.iter().all(|edge| edge.to.starts_with("rust:")));
+        assert!(
+            full.edges
+                .iter()
+                .all(|edge| !is_synthetic_pattern_edge(&edge.to)),
+            "pattern matches must not become edges, got: {:?}",
+            full.edges.iter().map(|e| &e.to).collect::<Vec<_>>()
+        );
+        let full_patterns = full.nodes[0]
+            .metadata
+            .attributes
+            .get("fast_ml_patterns")
+            .expect("file-level node should be enriched with fast_ml_patterns")
+            .clone();
+        // Language filtering: only Rust patterns are recorded, never `py:import ` etc.
+        assert!(
+            full_patterns.split(", ").all(|p| p.starts_with("rust:")),
+            "unexpected cross-language patterns: {full_patterns}"
+        );
+        let full_count: usize = full.nodes[0]
+            .metadata
+            .attributes
+            .get("fast_ml_pattern_count")
+            .expect("file-level node should be enriched with fast_ml_pattern_count")
+            .parse()
+            .expect("pattern count should be numeric");
+
         let fast = matcher.enhance_with_policy(
             result,
             content,
@@ -315,10 +280,18 @@ mod tests {
                 references: false,
             },
         );
+        assert!(fast.edges.is_empty());
+        let fast_count: usize = fast.nodes[0]
+            .metadata
+            .attributes
+            .get("fast_ml_pattern_count")
+            .expect("fast_ml_pattern_count should survive tier filtering")
+            .parse()
+            .expect("pattern count should be numeric");
+        // Tier filtering still applies: Uses matches dropped, so fewer matches.
         assert!(
-            fast.edges
-                .iter()
-                .all(|edge| edge.edge_type != EdgeType::Uses)
+            fast_count < full_count,
+            "uses=false should filter Uses matches ({fast_count} vs {full_count})"
         );
     }
 
@@ -337,9 +310,18 @@ mod tests {
         };
 
         let enhanced = matcher.enhance_extraction(result, content);
-        println!("Edges: {:?}", enhanced.edges.len());
         assert!(
-            enhanced.edges.len() > 0,
+            enhanced
+                .edges
+                .iter()
+                .all(|edge| !is_synthetic_pattern_edge(&edge.to)),
+            "Should not emit synthetic pattern edges"
+        );
+        assert!(
+            enhanced.nodes[0]
+                .metadata
+                .attributes
+                .contains_key("fast_ml_patterns"),
             "Should have found Rust patterns in content"
         );
     }
