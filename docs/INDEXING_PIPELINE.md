@@ -67,34 +67,42 @@ counting pass ran *before* the length prune.
 
 Three orthogonal levers, measured on EasyTier (611 Rust files / 847 scanned files, `rust.scip`
 supplied, local OpenAI-compatible provider, `CODEGRAPH_SEMANTIC_RESOLUTION=deferred`,
-`CODEGRAPH_VECTOR_INDEX_MODE=deferred`):
+`CODEGRAPH_VECTOR_INDEX_MODE=deferred`, warm vector cache):
 
-| tier | embedding | WALL | chunks | nodes | edges | `analyzers` | `embeddings_and_writes` |
-|---|---|---|---|---|---|---|---|
-| fast | off | 8.70 s | 0 | 37,111 | 45,287 | ~0.7 s | 0 |
-| fast | on | 106.30 s | 37,132 | 37,111 | 45,287 | ~0.7 s | 95.4 s |
-| balanced | off | 14.84 s | 0 | 38,057 | 79,801 | 0.86 s | 0 |
-| balanced | on | 135.00 s | 38,080 | 38,057 | 79,781 | 0.85 s | 120.2 s |
-| full | off | 26.55 s | 0 | 75,353 | 246,291 | 2.47 s | 0 |
-| full | on | 211.82 s | 75,376 | 75,353 | 246,270 | 2.46 s | 184.6 s |
+| tier | embedding | WALL | chunks | nodes | edges | `analyzers` | `embeddings_and_writes` | HNSW build |
+|---|---|---|---|---|---|---|---|---|
+| fast | off | 8.70 s | 0 | 37,111 | 45,287 | ~0.7 s | 0 | 0 |
+| fast | on | **40.03 s** | 37,132 | 37,111 | 45,287 | 0.68 s | 7.5 s | 21.5 s |
+| balanced | off | 14.84 s | 0 | 38,057 | 79,801 | 0.86 s | 0 | 0 |
+| balanced | on | **47.98 s** | 38,080 | 38,057 | 79,781 | 0.85 s | 7.7 s | 23.7 s |
+| full | off | 26.55 s | 0 | 75,353 | 246,291 | 2.47 s | 0 | 0 |
+| full | on | **76.72 s** | 75,376 | 75,353 | 246,270 | 1.61 s | 11.7 s | 39.9 s |
 
 Read it as three independent dials:
 
-- **Embedding is 79–91% of the run.** 8.7 → 106.3 s (fast), 14.8 → 135.0 s (balanced),
-  26.6 → 211.8 s (full).
+- **Turning embedding on costs 31–50 s**, and most of that is now the one-shot
+  HNSW build (21–40 s), not inference. Vector generation plus the binary write is
+  7.5–11.7 s when the cache is warm.
 - **All analyzer stages together cost 18 s.** fast → balanced is +6 s; balanced → full
   (dataflow + architecture + `references` edges) is +12 s.
 - **Embedding changes no graph structure.** Node counts are identical and the ~20-edge
   difference between on/off is SCIP resolution noise; only the `chunks` column moves.
 
-Per-chunk cost: 2.57 ms (fast), 3.16 ms (balanced), 2.45 ms (full); the spread is provider
-queueing at a batch size of 64. A supplied SCIP index is imported on every tier — `balanced`
-drops `references` edges and does not synthesize them from SCIP occurrences, `full` does. See
+Two hardware-dependent details:
+
+- HNSW is built **after** all rows are written (`CODEGRAPH_VECTOR_INDEX_MODE=deferred`),
+  and `--force` drops the indexes before writing so inserts never maintain them. Before
+  that change the same run spent 92 s inside `embeddings_and_writes` maintaining HNSW
+  per row; see the commit history around `d14acfb` / `ed6fc67`.
+- index build time scales with `m`/`ef_construction` (12/150 here). It is the largest
+  remaining item on the embedding path, so tune it before looking for other wins.
+
+A supplied SCIP index is imported on every tier — `balanced` drops `references` edges and
+does not synthesize them from SCIP occurrences, `full` does. See
 [LSP determinism](LSP_DETERMINISM.md).
 
 Practical consequence: for call-path and dependency queries only,
-`CODEGRAPH_EMBEDDING_POLICY=off` takes a full index from 211.8 s to 26.5 s. When semantic
-search is required, the only lever that matters is the chunk count, not the tier.
+`CODEGRAPH_EMBEDDING_POLICY=off` takes a full index from 76.7 s to 26.5 s.
 
 ## Controls that change each phase
 
