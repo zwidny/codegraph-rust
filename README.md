@@ -70,12 +70,13 @@ own agent loop and MCP calls, `deepseek-flash`) — not a purpose-built harness.
 Full method, per-task traces and limitations:
 [docs/evaluations/mcp-value-2026-11-04.md](docs/evaluations/mcp-value-2026-11-04.md).
 
-Reproduce:
+Reproduce (deterministic sampling — same `--generate` and `--seed` give the same tasks):
 
 ```bash
-python3 scripts/benchmarks/mcp_value.py --generate 14       # locate
-python3 scripts/benchmarks/mcp_value.py --mode impact       # who calls
-python3 scripts/benchmarks/mcp_value.py --mode chain --depth 2
+python3 scripts/benchmarks/mcp_value.py --generate 40                  # locate (sentence arm)
+python3 scripts/benchmarks/mcp_value.py --generate 40 --codegraph-query phrase
+python3 scripts/benchmarks/mcp_value.py --mode impact --generate 15
+python3 scripts/benchmarks/mcp_value.py --mode chain --depth 2 --generate 12
 ```
 
 ---
