@@ -373,3 +373,30 @@ Cost, stated plainly: the Surreal-specific integration tests (`reconciliation_te
 `daemon_watch`, `graph_tools_smoke`, `open_storage_export`, the rig agent tests) and
 `codegraph-vector`'s `search`/`rag` modules now require `--features surrealdb`. A CI job that
 only builds the default would stop exercising them.
+
+## Write path after the migration (measured)
+
+The 107x row above compares SurrealDB's per-insert HNSW maintenance against a
+Postgres write that had no indexes yet. Once the migration was complete, Postgres
+turned out to have its own version of the same cost: `SCHEMA_DDL` created the HNSW
+indexes up front, so every INSERT maintained them, and `deferred` was a no-op.
+
+EasyTier, 38,080 chunks, embedding on, each row a measured commit:
+
+| Stage | WALL | `embeddings_and_writes` | HNSW build |
+|---|---|---|---|
+| HNSW maintained per insert | 111.3 s | 97.7 s | 0.2 s |
+| HNSW moved out of DDL | 59.1 s | 24.0 s | 22.1 s |
+| + pgvector binary vectors | 49.5 s | 8.6 s | 24.8 s |
+| + drop indexes before `--force` | 48.0 s | 7.7 s | 23.7 s |
+| + `ef_construction=64` | 34.5 s | 8.1 s | 11.8 s |
+| + 256MB `maintenance_work_mem` | 28.0 s | 8.2 s | 4.7 s |
+
+The last row needs `/dev/shm >= 256MB`; below that the build falls back and takes
+11.7 s. Two lessons that cost real time:
+
+- An insert benchmark without the real index set measures nothing useful. The
+  107x figure is a zero-index ceiling.
+- Recall comparisons on this corpus are invalid when done by id overlap: 38,080
+  chunks hold 33,222 distinct vectors, so top-10 is a set of ties. Compare distance
+  quality instead.

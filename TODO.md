@@ -349,6 +349,12 @@ suites stay green):
 | `8ccce03` | Postgres semantic search (three-way RRF) |
 | `45bc533` | Postgres circular dependency detection |
 | `a9fa36d` | Postgres scoped reconciliation, so `index <subdir>` works |
+| `d14acfb` | HNSW leaves `SCHEMA_DDL`, so `deferred` finally means "build after the writes" |
+| `19c3c14` | Chunk vectors go out in pgvector's binary format (4,100 B vs 9,544 B text) |
+| `ed6fc67` | `--force` drops vector indexes before writing; a second forced run no longer re-maintains them |
+| `211acfb` | `ef_construction` 150 -> 64 |
+| `d98aab7` | HNSW build asks for 256MB `maintenance_work_mem`, with a shared-memory fallback |
+| `e988264` | `deploy/docker-compose.postgres.yml` |
 
 **End-to-end measured** (details and conditions in
 [docs/BACKEND_EVALUATION.md](docs/BACKEND_EVALUATION.md#end-to-end-verification-measured-not-projected)):
@@ -360,6 +366,23 @@ suites stay green):
 
 The write phases alone are 4.8x–9.0x; the 107x figure is the storage ceiling, reached only at the
 micro-benchmark's row and connection counts. Do not quote 107x as an indexing speedup.
+
+**Write path and index build, tuned after the migration.** EasyTier, 38,080 chunks,
+`CODEGRAPH_VECTOR_INDEX_MODE=deferred`, warm vector cache. Each row is a measured commit:
+
+| Stage | WALL | `embeddings_and_writes` | HNSW build |
+|---|---|---|---|
+| Before (HNSW maintained per insert) | 111.3 s | 97.7 s | 0.2 s |
+| HNSW moved out of DDL (`d14acfb`) | 59.1 s | 24.0 s | 22.1 s |
+| + binary vectors (`19c3c14`) | 49.5 s | 8.6 s | 24.8 s |
+| + drop-before-force (`ed6fc67`) | 48.0 s | 7.7 s | 23.7 s |
+| + `ef_construction=64` (`211acfb`) | 34.5 s | 8.1 s | 11.8 s |
+| + 256MB `maintenance_work_mem` (`d98aab7`) | **28.0 s** | 8.2 s | **4.7 s** |
+
+The last row needs `/dev/shm >= 256MB`; smaller falls back to 11.7 s and still succeeds.
+Do not tune `ef_construction` by id-overlap recall on this corpus: 38,080 chunks contain
+only 33,222 distinct vectors, so top-10 is a set of ties (see
+[docs/INDEXING_PIPELINE.md](docs/INDEXING_PIPELINE.md#tier-and-embedding-cost)).
 
 **Still open:**
 
