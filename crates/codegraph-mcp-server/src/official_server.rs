@@ -478,6 +478,7 @@ impl CodeGraphMCPServer {
     }
 
     async fn run_graph_tool(&self, name: &str, params: Value) -> Result<CallToolResult, McpError> {
+        let started = std::time::Instant::now();
         let executor = match self.graph_tool_executor().await {
             Ok(executor) => executor,
             Err(error) => {
@@ -485,20 +486,27 @@ impl CodeGraphMCPServer {
                 if is_recoverable_tool_error(&message) {
                     // Success-shaped guidance, never isError: an agent that sees errors
                     // early stops calling the tool entirely.
+                    log_tool_call(name, "recoverable", started.elapsed().as_millis());
                     return Ok(CallToolResult::success(vec![Content::text(message)]));
                 }
+                log_tool_call(name, "error", started.elapsed().as_millis());
                 return Err(error);
             }
         };
         match executor.execute(name, params).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
-            )])),
+            Ok(result) => {
+                log_tool_call(name, "ok", started.elapsed().as_millis());
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
+                )]))
+            }
             Err(error) => {
                 let message = format!("{} failed: {}", name, error);
                 if is_recoverable_tool_error(&message) {
+                    log_tool_call(name, "recoverable", started.elapsed().as_millis());
                     Ok(CallToolResult::success(vec![Content::text(message)]))
                 } else {
+                    log_tool_call(name, "error", started.elapsed().as_millis());
                     Err(McpError {
                         code: rmcp::model::ErrorCode(-32603),
                         message: message.into(),
@@ -600,14 +608,17 @@ impl CodeGraphMCPServer {
         &self,
         params: Parameters<PlanCheckRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let started = std::time::Instant::now();
         let report = match crate::plan_cli::analyze_value(params.0.plan) {
             Ok(report) => report,
             Err(error) => {
+                log_tool_call("plan_check", "recoverable", started.elapsed().as_millis());
                 return Ok(CallToolResult::success(vec![Content::text(format!(
                     "plan_check could not parse the plan: {error}. Fix the `nodes`/`edges`/`constraints` object and call plan_check again."
                 ))]));
             }
         };
+        log_tool_call("plan_check", "ok", started.elapsed().as_millis());
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string()),
         )]))
@@ -1454,6 +1465,43 @@ async fn build_graph_tool_executor() -> Result<Arc<GraphToolExecutor>, McpError>
     )))
 }
 
+/// Render one JSONL record for an optional structured tool-call log. Keeping this
+/// pure makes the format testable without touching the filesystem or the environment.
+fn tool_log_line(tool: &str, outcome: &str, duration_ms: u128, ts: u128) -> String {
+    // `tool` and `outcome` are internal literals; strip quotes defensively so a
+    // future dynamic name cannot break the one-record-per-line format.
+    format!(
+        "{{\"ts\":{ts},\"tool\":\"{}\",\"outcome\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+        tool.replace('"', ""),
+        outcome.replace('"', "")
+    )
+}
+
+/// Append one structured record per tool call when `CODEGRAPH_MCP_TOOL_LOG` points
+/// at a file. Unset or empty means no I/O and no extra work. Never logs parameters,
+/// inputs or outputs. Failures (unwritable path, clock before the epoch) are silent.
+fn log_tool_call(tool: &str, outcome: &str, duration_ms: u128) {
+    let Ok(path) = std::env::var("CODEGRAPH_MCP_TOOL_LOG") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = tool_log_line(tool, outcome, duration_ms, ts);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Conditions the caller can recover from. They must come back as a normal
 /// (success-shaped) text result; returning `isError` teaches the agent to stop
 /// calling the tool. `isError` stays for real malfunctions (storage down, a
@@ -1500,6 +1548,74 @@ mod recoverable_error_tests {
                 !is_recoverable_tool_error(message),
                 "expected non-recoverable: {message}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_log_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    fn tool_log_line_is_valid_json() {
+        let line = tool_log_line("semantic_code_search", "ok", 42, 1_700_000_000_000);
+        assert!(line.ends_with('\n'), "each record is one JSONL line");
+
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("tool log line must be valid JSON");
+        let object = value.as_object().expect("record must be a JSON object");
+        assert_eq!(object.len(), 4, "only the four documented keys are written");
+        assert_eq!(value["ts"], 1_700_000_000_000u64);
+        assert_eq!(value["tool"], "semantic_code_search");
+        assert_eq!(value["outcome"], "ok");
+        assert_eq!(value["duration_ms"], 42);
+    }
+
+    #[test]
+    #[serial]
+    fn tool_log_is_disabled_when_env_is_unset() {
+        let previous = std::env::var("CODEGRAPH_MCP_TOOL_LOG").ok();
+        // SAFETY: `#[serial]` keeps this test from interleaving with the other
+        // environment-mutating test in this module, and the value is restored below.
+        unsafe { std::env::remove_var("CODEGRAPH_MCP_TOOL_LOG") };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        log_tool_call("get_hub_nodes", "ok", 1);
+        let entries = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .count();
+        assert_eq!(entries, 0, "unset CODEGRAPH_MCP_TOOL_LOG must not write");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CODEGRAPH_MCP_TOOL_LOG", value) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_MCP_TOOL_LOG") },
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn tool_log_appends_one_line_when_enabled() {
+        let previous = std::env::var("CODEGRAPH_MCP_TOOL_LOG").ok();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tool-calls.jsonl");
+        // SAFETY: `#[serial]` serializes environment mutation; restored below.
+        unsafe { std::env::set_var("CODEGRAPH_MCP_TOOL_LOG", &path) };
+
+        log_tool_call("plan_check", "recoverable", 7);
+
+        let written = std::fs::read_to_string(&path).expect("log file should exist");
+        let last_line = written.lines().last().expect("one JSONL record");
+        let value: serde_json::Value =
+            serde_json::from_str(last_line).expect("record must be valid JSON");
+        assert_eq!(value["tool"], "plan_check");
+        assert_eq!(value["outcome"], "recoverable");
+        assert_eq!(value["duration_ms"], 7);
+        assert!(value["ts"].as_u64().is_some(), "ts is a Unix ms number");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CODEGRAPH_MCP_TOOL_LOG", value) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_MCP_TOOL_LOG") },
         }
     }
 }
