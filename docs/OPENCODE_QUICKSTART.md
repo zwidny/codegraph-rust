@@ -166,7 +166,7 @@ codegraph plan check plan.json
 # 4) OpenCode 的 MCP 连接
 opencode mcp list        # 期望 codegraph  connected
 #    然后在 OpenCode 里让 agent 调一次 semantic_code_search，能返回 node_id 即通
-#    可用工具应为 9 个：8 个直连图工具 + plan_check（校验草稿逻辑图）
+#    可用工具应为 9 个：8 个图查询 + plan_check（离线校验草稿逻辑图，不读 DB）
 ```
 
 `semantic_code_search` 返回的 `node_id` 要原样使用（`nodes:<uuid>`，含反引号与前缀）。
