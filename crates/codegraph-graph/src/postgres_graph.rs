@@ -126,12 +126,15 @@ LIMIT $3";
 /// wider so a node whose best chunk ranks just past SurrealDB's cut is not lost.
 const VECTOR_CANDIDATE_CHUNKS: i64 = 200;
 
-/// Exact or prefix `name` matches. `$2` is already `LIKE`-escaped by
-/// [`escape_like_pattern`], and the escape character is pinned to `\`.
+/// Exact or prefix `name` matches against a list of identifier needles.
+/// `$2` is a `text[]`; the escape character is pinned to `\`.
 const SEARCH_NAME_SQL: &str = "\
 SELECT id FROM nodes \
-WHERE project_id = $1 AND (name = $2 OR name LIKE $2 || '%' ESCAPE '\\') \
-ORDER BY name ASC \
+WHERE project_id = $1 \
+  AND (name = ANY($2) OR EXISTS ( \
+        SELECT 1 FROM unnest($2) AS p \
+         WHERE name LIKE p || '%' ESCAPE '\\')) \
+ORDER BY (name = ANY($2)) DESC, name ASC \
 LIMIT $3";
 
 /// Edges leaving any of the hit nodes, for the optional graph context.
@@ -162,6 +165,10 @@ fn db_err<E: std::fmt::Display>(error: E) -> CodeGraphError {
 /// Escape the `LIKE` metacharacters in `term` so a symbol named `a_b` cannot match
 /// `axb`. Postgres' default escape character is the backslash, which the search
 /// statements pin explicitly with `ESCAPE '\'`.
+///
+/// Name matching now goes through [`extract_identifiers`]; the helper is kept for
+/// callers that still need a literal `LIKE` pattern and for its unit test.
+#[cfg_attr(not(test), allow(dead_code))]
 fn escape_like_pattern(term: &str) -> String {
     let mut escaped = String::with_capacity(term.len());
     for ch in term.chars() {
@@ -171,6 +178,82 @@ fn escape_like_pattern(term: &str) -> String {
         escaped.push(ch);
     }
     escaped
+}
+
+/// Identifier-shaped tokens from a natural-language query.
+///
+/// A query that is already a single identifier keeps the old exact/prefix
+/// behaviour. Otherwise backticked spans are taken verbatim and plain text is
+/// split into tokens, keeping only those that look like code identifiers
+/// (snake_case, `::` paths, camel/Pascal case, or short all-caps acronyms).
+fn extract_identifiers(query: &str) -> Vec<String> {
+    const MAX_IDENTIFIERS: usize = 8;
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let is_bare = !trimmed.chars().any(char::is_whitespace)
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_bare {
+        return vec![trimmed.to_string()];
+    }
+
+    let mut needles: Vec<String> = Vec::new();
+    let segments: Vec<&str> = query.split('`').collect();
+    for (index, segment) in segments.iter().enumerate() {
+        if index % 2 == 1 {
+            push_identifier(&mut needles, segment, MAX_IDENTIFIERS);
+            continue;
+        }
+        for token in segment.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':')) {
+            if looks_like_identifier(token) {
+                push_identifier(&mut needles, token, MAX_IDENTIFIERS);
+            }
+        }
+    }
+    needles
+}
+
+/// One identifier-shaped token: snake_case, a `::` path, camel/Pascal case of at
+/// least four chars, or a short all-caps acronym.
+fn looks_like_identifier(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    if token.contains('_') || token.contains("::") {
+        return true;
+    }
+    let chars: Vec<char> = token.chars().collect();
+    let len = chars.len();
+    let camel = len >= 4
+        && chars
+            .windows(2)
+            .any(|pair| pair[0].is_lowercase() && pair[1].is_uppercase());
+    let acronym = len >= 3
+        && chars
+            .iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_');
+    camel || acronym
+}
+
+/// Trim a candidate and append it unless blank or already present.
+fn push_identifier(needles: &mut Vec<String>, candidate: &str, max: usize) {
+    if needles.len() >= max {
+        return;
+    }
+    let cleaned = candidate
+        .trim()
+        .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'));
+    if cleaned.is_empty() || needles.iter().any(|existing| existing == cleaned) {
+        return;
+    }
+    needles.push(cleaned.to_string());
 }
 
 /// Accept the id shapes `fn::resolve_node` accepts: `nodes:x`, `x`, and the
@@ -869,6 +952,7 @@ impl crate::graph_types::GraphQuery for PgGraph {
         include_graph_context: bool,
     ) -> Result<Vec<serde_json::Value>> {
         let _ = dimension;
+        let needles = extract_identifiers(query_text);
         if query_embedding.len() != EMBEDDING_DIMENSION {
             return Err(CodeGraphError::Configuration(format!(
                 "semantic search on the Postgres backend requires a {EMBEDDING_DIMENSION}-dimension \
@@ -914,29 +998,30 @@ impl crate::graph_types::GraphQuery for PgGraph {
         }
 
         // 2) Name list (exact or prefix) and 3) content list (`ts_rank_cd`).
-        // An empty query would make `name LIKE '%'` match the whole project, so the
-        // name list is skipped instead (the content list skips itself for no terms).
-        let name_ids: Vec<String> = if query_text.is_empty() {
+        // Only identifier-shaped needles reach the name leg: a whole-sentence
+        // query would otherwise match nothing, and a blank needle would match
+        // the whole project through `name LIKE '%'`.
+        let name_ids: Vec<String> = if needles.is_empty() {
             Vec::new()
         } else {
             let name_limit = i64::try_from(safe_limit * 2).unwrap_or(i64::MAX);
             let name_rows = client
-                .query(
-                    SEARCH_NAME_SQL,
-                    &[
-                        &self.project_id,
-                        &escape_like_pattern(query_text),
-                        &name_limit,
-                    ],
-                )
+                .query(SEARCH_NAME_SQL, &[&self.project_id, &needles, &name_limit])
                 .await
                 .map_err(db_err)?;
             name_rows.iter().map(|row| row.get(0)).collect()
         };
 
+        // Prefer the extracted identifiers for BM25 so common English words in a
+        // sentence do not drown out the one symbol the query is about.
+        let text_query = if needles.is_empty() {
+            query_text.to_string()
+        } else {
+            needles.join(" ")
+        };
         let content_rows = self
             .store
-            .full_text_nodes(&self.project_id, query_text, safe_limit * 2)
+            .full_text_nodes(&self.project_id, &text_query, safe_limit * 2)
             .await?;
         let content_ids: Vec<String> = content_rows.iter().map(|(id, _)| id.clone()).collect();
         let text_scores: HashMap<String, f64> = content_rows.into_iter().collect();
@@ -1217,6 +1302,57 @@ mod tests {
         assert_eq!(escape_like_pattern("a_b"), "a\\_b");
         assert_eq!(escape_like_pattern("100%"), "100\\%");
         assert_eq!(escape_like_pattern("a\\b"), "a\\\\b");
+    }
+
+    /// Backticked identifiers survive a sentence query.
+    #[test]
+    fn extract_identifiers_reads_backticks() {
+        assert_eq!(
+            extract_identifiers("Where is `ArenaIndex` defined?"),
+            vec!["ArenaIndex"]
+        );
+        assert_eq!(
+            extract_identifiers("Where is `file_filter_runs_before_the_limit` defined?"),
+            vec!["file_filter_runs_before_the_limit"]
+        );
+    }
+
+    /// Camel/Pascal tokens in plain text are identifiers.
+    #[test]
+    fn extract_identifiers_keeps_camel_case() {
+        assert!(
+            extract_identifiers("Where is ArenaIndex defined?")
+                .iter()
+                .any(|token| token == "ArenaIndex")
+        );
+    }
+
+    /// A bare identifier keeps the old direct-name behaviour.
+    #[test]
+    fn extract_identifiers_passes_through_bare_identifier() {
+        assert_eq!(extract_identifiers("sanitize"), vec!["sanitize"]);
+    }
+
+    /// Natural-language filler must not produce needles.
+    #[test]
+    fn extract_identifiers_ignores_prose() {
+        assert!(
+            extract_identifiers("Four same-named definitions elsewhere, the wanted one last: with")
+                .is_empty()
+        );
+        assert!(
+            extract_identifiers("analysis query or focus area for comprehensive codebase analysis")
+                .is_empty()
+        );
+    }
+
+    /// The same identifier reached through both paths appears once.
+    #[test]
+    fn extract_identifiers_deduplicates() {
+        assert_eq!(
+            extract_identifiers("`ArenaIndex` and ArenaIndex"),
+            vec!["ArenaIndex"]
+        );
     }
 
     /// The hub ranking must be exactly what the pure analysis functions produce.
