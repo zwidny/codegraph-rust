@@ -157,11 +157,52 @@ Rejected alternatives:
 3. Stop feeding LSP data into resolution while keeping the server — keeps 44 s of
    latency for enrichment that no longer affects the graph.
 
-Remaining gap: Kotlin (13 files) needs the Android SDK — those `.kt` files live in Android
-projects such as `src-tauri/gen/android` and `easytier-contrib/...`, and `scip-java` needs a
-full Gradle + Android SDK build to index them. C (1 file) needs `compile_commands.json`.
-Both stay AST-only until they get an index; the language-server fallback no longer starts for
-them unless `CODEGRAPH_LSP_FALLBACK=1` is set.
+## Why Kotlin stays AST-only
+
+Kotlin (13 files on EasyTier) has **no working SCIP path today**. This was measured, not
+assumed — it is recorded here so nobody spends the time again.
+
+The files sit in Android projects (`src-tauri/gen/android/app/...`,
+`tauri-plugin-vpnservice/android/...`, `easytier-contrib/easytier-android-jni/kotlin/...`).
+`scip-java` indexes Kotlin by injecting a SemanticDB compiler plugin, and its documentation
+says which build tools it supports:
+
+| Route | Status |
+|---|---|
+| Gradle (automatic) | **Android integration unsupported** — [scip-java#177](https://github.com/scip-code/scip-java/issues/177) |
+| Maven | `kotlin-maven-plugin` unsupported — [scip-java#304](https://github.com/scip-code/scip-java/issues/304) |
+| Bare `kotlinc -Xplugin=semanticdb-kotlinc` | **Tried, does not work** (below) |
+
+The bare-compiler route was the one worth trying, because it avoids Gradle and the 1–2 GB
+Android SDK entirely: it would need only `android.jar` (~30 MB) plus the AndroidX/Tauri jars.
+It fails on a binary incompatibility between the plugin and the standalone compiler:
+
+```
+kotlinc 1.8.22 + semanticdb-kotlinc 0.3.2   -> AbstractMethodError
+kotlinc 1.9.0  + semanticdb-kotlinc 0.4.0   -> AbstractMethodError
+kotlinc 1.9.25 + semanticdb-kotlinc 0.4.0   -> AbstractMethodError
+
+Receiver class com.sourcegraph.semanticdb_kotlinc.AnalyzerRegistrar
+does not define or inherit an implementation of the resolved method
+'registerProjectComponents(MockProject, CompilerConfiguration)'
+of interface org.jetbrains.kotlin.compiler.plugin.ComponentRegistrar.
+```
+
+Three Kotlin versions and both published plugin versions produce the identical error, so this
+is not a version-matching problem: `semanticdb-kotlinc` is built against a compiler whose
+`ComponentRegistrar` layout differs from the standalone `kotlinc` distribution (most likely
+IntelliJ's compiler or `kotlin-compiler-embeddable`).
+
+Consequence: the 13 Kotlin files keep AST-only results. They are visible in
+`--stats-json` as part of `files_without_enrichment` (287 on EasyTier with `rust.scip` only;
+the number drops as more languages get indexes). No language server starts for them unless
+`CODEGRAPH_LSP_FALLBACK=1` is set.
+
+JDK 17 is installed at `~/.local/jdk-17` and was not the blocker — the missing piece is a
+plugin that binds to the standalone compiler.
+
+C (1 file) also stays AST-only: `scip-clang` needs `compile_commands.json`, which this project
+does not produce.
 
 ## Reproducing
 
