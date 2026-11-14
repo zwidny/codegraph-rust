@@ -32,8 +32,9 @@
 //!
 //! `nodes` can be searched three ways: [`PgStore::knn_nodes`] (pgvector cosine
 //! distance over `embedding_1024`), [`PgStore::full_text_nodes`] (`ts_rank_cd` over
-//! the generated `content_tsv`) and [`PgStore::hybrid_nodes`], which fuses both lists
-//! with Reciprocal Rank Fusion and keeps single-retriever hits.
+//! the generated `search_tsv`: name + content + `metadata->>'doc'`) and
+//! [`PgStore::hybrid_nodes`], which fuses both lists with Reciprocal Rank Fusion and
+//! keeps single-retriever hits.
 //!
 //! Full-text recall is made equivalent to SurrealDB's `EDGENGRAM(2,12)` by turning
 //! every query term into a prefix tsquery (`term:*`); the `english` configuration
@@ -246,13 +247,24 @@ CREATE TABLE IF NOT EXISTS nodes (
   created_at      timestamptz DEFAULT now(),
   updated_at      timestamptz DEFAULT now(),
   content_tsv     tsvector GENERATED ALWAYS AS (
-    to_tsvector('english', coalesce(name,'') || ' ' || coalesce(content,''))) STORED
+    to_tsvector('english', coalesce(name,'') || ' ' || coalesce(content,''))) STORED,
+  search_tsv      tsvector GENERATED ALWAYS AS (
+    to_tsvector('english'::regconfig, coalesce(name,'') || ' ' || coalesce(content,'')
+      || ' ' || coalesce(metadata->>'doc',''))) STORED
 );
+-- Idempotent upgrade for databases created before `search_tsv` existed. The table
+-- above already has the column on a fresh install, so this is a no-op there; on an
+-- existing table it backfills every row. Both the column and its index are needed
+-- before `FULL_TEXT_NODES_SQL` can run, so they are applied here, after CREATE TABLE.
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS (
+  to_tsvector('english'::regconfig, coalesce(name,'') || ' ' || coalesce(content,'')
+    || ' ' || coalesce(metadata->>'doc',''))) STORED;
 CREATE INDEX IF NOT EXISTS nodes_project ON nodes(project_id);
 CREATE INDEX IF NOT EXISTS nodes_project_file ON nodes(project_id, file_path);
 CREATE INDEX IF NOT EXISTS nodes_project_name ON nodes(project_id, name);
 CREATE INDEX IF NOT EXISTS nodes_name_prefix ON nodes(project_id, name text_pattern_ops);
 CREATE INDEX IF NOT EXISTS nodes_tsv ON nodes USING gin(content_tsv);
+CREATE INDEX IF NOT EXISTS nodes_search_tsv ON nodes USING gin(search_tsv);
 
 CREATE TABLE IF NOT EXISTS symbol_embeddings (
   id                text PRIMARY KEY,
@@ -735,11 +747,12 @@ LIMIT $3
 
 /// Node-level full-text retrieval. Ranking uses `ts_rank_cd`, not BM25: the recall
 /// matches SurrealDB's BM25 but the ordering does not (see
-/// `docs/BACKEND_EVALUATION.md`).
+/// `docs/BACKEND_EVALUATION.md`). The indexed text now also includes the `doc`
+/// comment from `metadata->>'doc'`, so name + content + doc are all searchable.
 const FULL_TEXT_NODES_SQL: &str = r#"
-SELECT id, ts_rank_cd(content_tsv, to_tsquery('english', $1))::double precision AS rank
+SELECT id, ts_rank_cd(search_tsv, to_tsquery('english', $1))::double precision AS rank
 FROM nodes
-WHERE project_id = $2 AND content_tsv @@ to_tsquery('english', $1)
+WHERE project_id = $2 AND search_tsv @@ to_tsquery('english', $1)
 ORDER BY rank DESC, id ASC
 LIMIT $3
 "#;
@@ -1566,11 +1579,13 @@ impl PgStore {
             .collect())
     }
 
-    /// Full-text node retrieval over `nodes.content_tsv` (name + content).
+    /// Full-text node retrieval over `nodes.search_tsv` (name + content + doc).
     ///
     /// Each query term becomes a prefix match (`term:*`), which reproduces the
     /// recall of SurrealDB's `EDGENGRAM(2,12)`; the Postgres `english` configuration
-    /// provides the same stemming as `SNOWBALL`. Ranking is `ts_rank_cd`, **not**
+    /// provides the same stemming as `SNOWBALL`. The indexed text includes the doc
+    /// comment stored at `metadata->>'doc'`, so a doc-only mention is recallable.
+    /// Ranking is `ts_rank_cd`, **not**
     /// BM25, so the top-k order differs from SurrealDB even when the candidate sets
     /// agree (see `docs/BACKEND_EVALUATION.md`).
     ///
@@ -2856,10 +2871,14 @@ mod tests {
              project_metadata tables"
         );
         assert_eq!(
-            index_count, 15,
-            "expected 15 chunks/edges/nodes/symbol/file_metadata indexes \
+            index_count, 16,
+            "expected 16 chunks/edges/nodes/symbol/file_metadata indexes \
              (project_metadata is keyed by its primary key and needs no extra index; \
              the three HNSW indexes are built after the write by ensure_vector_indexes)"
+        );
+        assert!(
+            SCHEMA_DDL.contains("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS search_tsv"),
+            "the search_tsv migration must be idempotent so existing databases upgrade"
         );
         assert!(
             !SCHEMA_DDL.contains("USING hnsw"),
@@ -4691,6 +4710,77 @@ mod tests {
                 .expect("symbol query")
                 .is_empty(),
             "a query with no usable term never reaches the database"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn full_text_nodes_matches_metadata_doc() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let project = project_id("node_fts_doc");
+        let mut documented = node("fts_documented", &project);
+        // Neither name nor content contains the query phrase; only the doc does.
+        documented.name = "Server::new".to_string();
+        documented.content = Some("fn new() -> Self { Self {} }".to_string());
+        documented.metadata = Some(serde_json::json!({ "doc": "start http server" }));
+        store
+            .upsert_nodes(&[documented])
+            .await
+            .expect("upsert_nodes");
+
+        let hits = store
+            .full_text_nodes(&project, "start http server", 10)
+            .await
+            .expect("doc query");
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.contains(&"fts_documented"),
+            "search_tsv must index metadata->>'doc'; hits were {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_PG_URL pointing at a pgvector database"]
+    async fn schema_has_search_tsv_column_and_index() {
+        let Some(store) = store_or_skip() else {
+            return;
+        };
+        store.ensure_schema().await.expect("ensure_schema");
+
+        let client = store.pool.get().await.expect("pool client");
+        let column: bool = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = 'public' AND table_name = 'nodes'
+                       AND column_name = 'search_tsv'
+                )",
+                &[],
+            )
+            .await
+            .expect("column lookup")
+            .get(0);
+        assert!(column, "nodes.search_tsv is missing after ensure_schema");
+
+        let index: bool = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1 FROM pg_indexes
+                     WHERE schemaname = 'public' AND tablename = 'nodes'
+                       AND indexname = 'nodes_search_tsv'
+                )",
+                &[],
+            )
+            .await
+            .expect("index lookup")
+            .get(0);
+        assert!(
+            index,
+            "nodes_search_tsv GIN index is missing after ensure_schema"
         );
     }
 
