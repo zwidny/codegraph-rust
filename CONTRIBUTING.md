@@ -67,9 +67,8 @@ Guidelines:
 - Ensure analyzer output is deterministic and scoped by `project_id`.
 - Emit provenance metadata (analyzer name, confidence) so later tools can explain where facts came from.
 
-If your analyzer depends on external tools (e.g. language servers), add the tool requirement in:
-
-- `crates/codegraph-mcp/src/analyzers/mod.rs`
+If your analyzer depends on external tools or artifacts (for example a SCIP index), document
+the requirement where the stage is orchestrated and keep it opt-in.
 
 ## Schema changes (SurrealDB)
 

@@ -18,7 +18,7 @@ AI coding assistants are powerful, but they're flying blind. They see files one 
 Most semantic search tools create embeddings and call it a day. CodeGraph builds a **real knowledge graph**:
 
 ```
-Your Code → Build Context → AST + FastML → LSP Resolution → Enrichment → Graph + Embeddings
+Your Code → Build Context → AST + FastML → SCIP Resolution → Enrichment → Graph + Embeddings
               ↓               ↓              ↓              ↓              ↓         ↓
           Packages        Nodes/edges    Type-aware     API surface      Graph    Semantic
           Features        Fast patterns  linking        Module graph   traversal   search
@@ -39,16 +39,16 @@ Indexing is tiered so you can choose between speed/storage and graph richness. T
 
 | Tier | What it enables | Typical use |
 |------|-----------------|-------------|
-| `fast` | AST nodes + core edges only (no LSP or enrichment) | Quick indexing, low storage |
-| `balanced` | LSP symbols + docs/enrichment + module linking | Richer navigation and documentation with moderate analyzer cost |
-| `full` | All analyzers + LSP definitions + dataflow + architecture | Maximum graph richness and analyzer coverage |
+| `fast` | AST nodes + core edges only; SCIP definitions when an index is supplied | Quick indexing, low storage |
+| `balanced` | SCIP definitions + docs/enrichment + module linking | Richer navigation and documentation with moderate analyzer cost |
+| `full` | All analyzers + SCIP references + dataflow + architecture | Maximum graph richness and analyzer coverage |
 
 Agent answer accuracy is evaluated separately; see the [CLI accuracy results](../README.md#agent-cli-accuracy-by-indexing-tier).
 
 Tier behavior details:
-- `fast`: disables build context, LSP, enrichment, module linking, dataflow, docs/contracts, and architecture; filters out `Uses`/`References` edges.
-- `balanced`: enables build context, LSP symbols, enrichment, module linking, and docs/contracts; filters out `References` edges.
-- `full`: enables all analyzers and LSP definitions; no edge filtering.
+- `fast`: disables build context, enrichment, module linking, dataflow, docs/contracts, and architecture; filters out `Uses`/`References` edges. A supplied SCIP index is still imported.
+- `balanced`: enables build context, enrichment, module linking, and docs/contracts; filters out `References` edges.
+- `full`: enables all analyzers and keeps `References` edges; no edge filtering.
 
 Configure the tier:
 - CLI: `codegraph index /path/to/project --index-tier balanced`
@@ -60,31 +60,23 @@ Directory indexing scans subdirectories by default, so
 `--no-recursive` for an intentional root-only scan; `-r`/`--recursive` remain accepted.
 `codegraph estimate` uses the same traversal defaults.
 
-#### Indexing prerequisites (LSP-enabled tiers)
+#### Compiler-index (SCIP) enrichment
 
-When the tier enables LSP (`balanced`/`full`), indexing **fails fast** if required external tools are missing.
-Rust indexing also runs `rust-analyzer --version` from the target project before parsing:
-an existing rustup shim does not guarantee that its active toolchain has the component.
-With rustup, run `rustup component add rust-analyzer` from that project directory,
-then verify `rust-analyzer --version`. Language-server failures retain the final 4 KiB
-of stderr so startup and runtime errors include the server's diagnostic.
+Compiler-grade enrichment is optional and comes from a pre-built SCIP index. There is no
+language-server process and no per-language tool check at index time:
 
-Required tools by language:
-- Rust: `rust-analyzer`
-- TypeScript/JavaScript: `node` and `typescript-language-server`
-- Python: `node` and `pyright-langserver`
-- Go: `gopls`
-- Java: `jdtls`
-- C/C++: `clangd`
+- Generate an index per language with `scripts/scip-index.sh` (which drives the language's
+  own indexer: `rust-analyzer scip` for Rust, `scip-typescript index` for TS/JS,
+  `scip-go` for Go).
+- Pass the paths in `CODEGRAPH_SCIP_INDEX` (comma-separated, `path@subdir` for an index
+  built inside a subdirectory). The same index is imported on every tier.
+- A language without an index stays AST-only; import fails loudly when no document matches
+  an indexed source, instead of reporting success with zero enrichment.
+- Positions are validated against the captured sources. `CODEGRAPH_SCIP_TRUST_SOURCE=1`
+  opts out of hash validation; `CODEGRAPH_SCIP_MAX_BYTES` caps artifact size.
+- `CODEGRAPH_ANALYZERS=0` disables the AST analyzer stages independently of tier.
 
-Warm language-server sessions retain versioned documents and deduplicate/pipeline
-definition requests. Symbol and definition requests retry transient `ContentModified`
-(`-32801`) responses up to five times with backoff within one 30-second deadline.
-Changed document versions, exhausted retries and other errors still fail indexing,
-with the request method and file URI in the diagnostic. `CODEGRAPH_LSP_REQUESTS` bounds
-outstanding requests per server (default 32). `CODEGRAPH_ANALYZERS=0` disables analyzers
-independently of tier. `CODEGRAPH_SCIP_INDEX=/path/index.scip` can substitute a compiler
-index for LSP; source validation and sidecar requirements are described in the
+Source validation and sidecar requirements are described in the
 [indexing implementation guide](indexing-performance-work.md).
 
 #### Incremental indexing and inference policies
@@ -188,7 +180,9 @@ order, the cosine threshold and ambiguous-tie handling remain unchanged. `--stat
 now separates exact/lexical matching, semantic candidate selection, symbol embedding,
 CPU scoring, and edge preparation/writes within relationship resolution.
 
-If LSP resolution fails immediately and the error includes something like `Unknown binary 'rust-analyzer' in official toolchain ...`, your `rust-analyzer` is a rustup shim without an installed binary. Install a runnable `rust-analyzer` (e.g. via `brew install rust-analyzer` or by switching to a toolchain that provides it).
+If SCIP import fails with a stale-index diagnostic, regenerate the artifact for the current
+sources (`scripts/scip-index.sh` or `rust-analyzer scip .`) and re-run indexing. A language
+without an index is not an error: it simply stays AST-only.
 
 #### Optional architecture boundary rules
 

@@ -1,5 +1,8 @@
 # Indexing performance implementation
 
+> Historical: language-server enrichment was removed in favour of SCIP; the
+> measurements below are kept as a record of why.
+
 This work implements the indexing review on `codex/indexing-performance`. Changes are
 split into independently reviewable commits. Performance claims require measurements;
 optional backend and quality tradeoffs remain opt-in.

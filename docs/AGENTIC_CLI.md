@@ -219,9 +219,10 @@ Init runs these steps in order:
 `--no-index` finishes after setup without loading application/provider configuration,
 creating a database or contacting services. It works in plain builds too. Init is
 separate from `codegraph config init`, which creates global application configuration.
-The default indexing tier is fast; select balanced/full only after satisfying their
-language-server prerequisites. Model providers must already be configured for any
-enabled inference stages.
+The default indexing tier is fast; `balanced` and `full` enable more analyzer stages and edge
+types, while compiler-grade enrichment comes from a SCIP index supplied through
+`CODEGRAPH_SCIP_INDEX` (no language-server prerequisites). Model providers must already be
+configured for any enabled inference stages.
 
 Repeating the same setup leaves files unchanged. Selected hook settings and both
 guidance files are validated before writing; malformed settings, broken ownership

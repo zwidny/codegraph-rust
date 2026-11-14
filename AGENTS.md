@@ -244,7 +244,7 @@ Bound parser workers, retained source bytes, queued writer payloads and provider
 
 For indexing batches, explicit `--batch-size` overrides `CODEGRAPH_EMBEDDINGS_BATCH_SIZE`, legacy `CODEGRAPH_EMBEDDING_BATCH_SIZE`, TOML `[embedding] batch_size`, then the default 64. Resolve environment defaults once, preserve explicit positive values (including 100), and pass the same row limit to the indexer, provider and submitted-text cache. Do not silently cap Ollama/LM Studio at 256. Token/byte/provider limits and smaller DB write batches remain independent; report their limits accurately. Verify actual HTTP request sizes with the loopback mock in `index_cli_integration`, without querying live providers or the working index.
 
-Rust LSP preflight must verify `rust-analyzer --version` in the target project, including rustup shims; presence on PATH is insufficient. Start language servers in that project directory, preserve a bounded stderr tail in failure reports and replace stopped pooled sessions. Retry only `ContentModified` (`-32801`) for symbol/definition reads, with fresh IDs, unchanged document versions and at most five retries within one 30-second deadline. Propagate cancellation, other errors, changed versions and exhausted retries. Test startup/crash/retry handling with isolated mock servers and `index_cli_integration` without installing toolchains or indexing the working repository.
+SCIP is the only compiler-enrichment path. Validate artifact positions against the captured sources, warn on a stale index and fail loudly when no document matches; decode one length-delimited message at a time so peak memory tracks the largest document. Preserve `path@subdir` parsing, comma-separated entries and the `CODEGRAPH_SCIP_MAX_BYTES` / `CODEGRAPH_SCIP_TRUST_SOURCE` controls. Cover the import with offline fixtures and `index_cli_integration`; do not index the working repository.
 
 `CODEGRAPH_EMBEDDING_POLICY` and `CODEGRAPH_SEMANTIC_RESOLUTION` accept `sync|deferred|off` independently of tier. Resume persisted inference with `codegraph index <root> --complete-deferred`. Precision, candidate limits, text-splitter and SCIP choices remain opt-in. See [implementation controls](docs/indexing-performance-work.md) and [speed/quality probes](docs/indexing-benchmarks.md); debug fixture timings are not production speedup claims.
 
@@ -252,8 +252,8 @@ Useful offline regressions: `cargo test -p codegraph-mcp --lib`, `cargo test -p 
 
 ### Generate SCIP before indexing (do not just run `codegraph index`)
 
-`codegraph index` drives one language-server request per file by default: ~21 minutes on a
-10k-file project. Generate a SCIP index first and import it instead:
+`codegraph index` without a SCIP index produces an AST-only graph. Generate a compiler index
+first and import it:
 
 ```bash
 export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"   # rust / TS / Go, per language
@@ -261,11 +261,10 @@ codegraph index . --index-tier balanced
 ```
 
 Measured on a 10k-file TypeScript project: analysis 21 min → **2.4 s + 3.9 s import**, plus
-62,711 definition edges the LSP path never produced. `scripts/scip-index.sh` picks the
+62,711 definition edges AST-only parsing never produced. `scripts/scip-index.sh` picks the
 indexer per language and writes `.codegraph/scip/`; for an index built inside a
-subdirectory, use the `@subdir` form (`go.scip@easytier-go`). A missing index for a language
-means that language gets **no** enrichment, because setting `CODEGRAPH_SCIP_INDEX` disables
-language servers for the whole run. See `docs/INDEXING_PIPELINE.md` and `TODO.md`.
+subdirectory, use the `@subdir` form (`go.scip@easytier-go`). A language without an index
+stays AST-only. See `docs/INDEXING_PIPELINE.md` and `TODO.md`.
 
 ## Commit & Pull Request Guidelines
 
@@ -371,30 +370,19 @@ MCP 的 `plan_check` 是**离线**校验，不读代码图；要和已有代码�
 `codegraph plan --project <已索引的项目根> verify plan.json`（看 `unplanned_code_edges`
 和 `existing_planned_nodes`）。详细说明见 `docs/PLAN_CHECK.md`。
 
-### 部分索引与 LSP（默认关闭，按需打开）
+### 部分索引与 SCIP
 
-`codegraph index <scan_root>` 只更新该范围，**默认不启动语言服务器**（LSP 会加载整个工程，
-单文件更新不值得付全工程导入的代价）。
-
-需要跨文件符号 / 定义时，显式打开并固定项目根：
-
-```bash
-CODEGRAPH_LSP_ON_PARTIAL=1 codegraph index packages/happy-android \
-  --project-root . --index-tier balanced --languages kotlin
-```
+`codegraph index <scan_root>` 只更新该范围。compiler 级富化来自你传入的
+`CODEGRAPH_SCIP_INDEX`：索引覆盖到的文件获得 qualified name 与 definition/reference 边，
+未覆盖的文件保持 AST-only。不存在需要额外启动的语言服务器。
 
 - `--project-root`（或 `CODEGRAPH_PROJECT_ID`）必须与索引时的项目一致；扫描路径（如
   `packages/happy-android`）相对该根书写。
-- LSP 以**项目根**初始化，不是扫描目录；大 Android / Java / TS 仓库首次导入可能 1–5 分钟。
-  `initialize` 默认等待 180s（`CODEGRAPH_LSP_INITIALIZE_TIMEOUT_SECS`），普通请求 30s
-  （`CODEGRAPH_LSP_REQUEST_TIMEOUT_SECS`）；超时会降级为 warning，索引继续。
-- 需要的工具：Kotlin=`kotlin-language-server`，Java=`jdtls`，TS/JS=`typescript-language-server`，
-  Rust=`rust-analyzer`，Go=`gopls`。
-- 大仓建议先用全量 `codegraph index <root>` 跑一次带 LSP 的索引，之后日常编辑用不带 LSP 的部分索引。
-- **tier 决定有没有 LSP 边**：`balanced` = `SymbolsOnly`，只做 `documentSymbol`，**不解析 definition，LSP 贡献 0 条边**；
-  只有 `full` = `SymbolsAndDefinitions` 才会产生 definition 边。balanced 日志里的
-  `N nodes enriched + 0 edges resolved` 是预期行为，不是失败。需要 balanced 也有边时设
-  `CODEGRAPH_LSP_DEFINITIONS=1`（更慢）。
+- 大仓建议先用全量 `codegraph index <root>`（带 SCIP）跑一次，之后日常编辑用部分索引。
+- **tier 只决定边过滤**：`fast` 过滤 `Uses`/`References`，`balanced` 过滤 `References`，
+  `full` 全保留。SCIP enrichment 在三个 tier 上都会执行（只要提供了索引）。
+- 需要更多语言的富化时，用 `scripts/scip-index.sh` 生成对应索引并加进
+  `CODEGRAPH_SCIP_INDEX`。
 
 ### 共享 server 的数据库隔离
 

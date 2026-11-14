@@ -56,53 +56,38 @@ pass is recommended after upgrading:
 codegraph index /path/to/repo --force
 ```
 
-## Language servers and memory
+## SCIP enrichment on partial indexes
 
-Language servers load a whole workspace (tsserver reads the tsconfig project,
-rust-analyzer the Cargo workspace), so their memory is not bounded by the files you
-re-index.
+Compiler-grade enrichment comes from the `CODEGRAPH_SCIP_INDEX` you supply, not from a
+long-running language server. A partial re-index reads the same index and applies it to the
+files it parses:
 
-Partial re-indexes therefore **disable language servers by default**. Force them on
-with `CODEGRAPH_LSP_ON_PARTIAL=1` when you accept the memory cost.
-
-For full indexes, these controls bound the damage:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `CODEGRAPH_LSP_NODE_HEAP_MB` | `4096` | `NODE_OPTIONS=--max-old-space-size` for Node servers (tsserver, pyright); an explicit `--max-old-space-size` already in `NODE_OPTIONS` wins |
-| `CODEGRAPH_LSP_CLANGD_BACKGROUND` | off | Set `1` to keep clangd's background index (default passes `--background-index=false`) |
-| `CODEGRAPH_LSP_KLS_GRADLE_DAEMON` | off | Set `1` to keep the Gradle daemon KLS spawns; by default it is disabled (`-Dorg.gradle.daemon=false`) so a finished index does not leave a multi-GB JVM behind |
-| `CODEGRAPH_LSP_MIN_FREE_MB` | `4096` | Skip language servers when available memory is below this |
-| `CODEGRAPH_LSP_DEFINITIONS` | off | Force definition resolution on `balanced` (adds edge resolution, slower; `full` already enables it) |
-| `CODEGRAPH_LSP_INITIALIZE_TIMEOUT_SECS` | `180` | `initialize` deadline (cold import of a large workspace) |
-| `CODEGRAPH_LSP_REQUEST_TIMEOUT_SECS` | `30` | Deadline for other LSP requests (documentSymbol/definition) |
-
-A language-server crash (including a Node out-of-memory abort) no longer fails the
-run: the phase logs a warning and indexing completes with AST and
-symbol-catalog results only.
+- Files the index covers get qualified names and definition/reference edges.
+- Files it does not cover keep AST-only results.
+- No language server starts for the partial scope, so there is no workspace-sized memory
+  cost to bound.
 
 For a hard machine-level bound, run indexing under a cgroup, for example
 `systemd-run --scope -p MemoryMax=8G codegraph index .` or a container with
 `--memory=8g`.
 
-### Tier and LSP edge resolution
+If an index has gone stale, regenerate it (`scripts/scip-index.sh` or the language's own
+indexer) and re-run. The import warns when the artifact is older than the captured sources
+and fails with the document and encoding named if a recorded position falls outside the
+file.
 
-Language-server enrichment depends on the indexing tier:
+### Tier and edge filtering
 
-| Tier | LSP mode | documentSymbol | definition edges |
+SCIP enrichment runs on every tier. The index tier only filters extracted edge types:
+
+| Tier | SCIP enrichment | `Uses` edges | `References` edges |
 |---|---|---|---|
-| `fast` | off | no | no |
-| `balanced` | `SymbolsOnly` | yes | **no (0 edges)** |
-| `full` | `SymbolsAndDefinitions` | yes | yes |
+| `fast` | when an index is supplied | filtered | filtered |
+| `balanced` | when an index is supplied | kept | filtered |
+| `full` | when an index is supplied | kept | kept |
 
-So `N nodes enriched + 0 edges resolved` on `balanced` is expected, not a failure:
-balanced only enriches node names. Use `--index-tier full` or
-`CODEGRAPH_LSP_DEFINITIONS=1` if you need definition edges.
-
-TypeScript 7 native preview ships `tsc --lsp --stdio` but no `lib/tsserver.js`, which
-`typescript-language-server` requires. When the project's TypeScript has no tsserver,
-indexing launches `tsc --lsp --stdio` instead; classic TypeScript still uses
-`typescript-language-server`.
+A project with no SCIP index produces the same graph as before SCIP existed: AST-only,
+with no compiler-derived definition edges.
 
 ## Per-project databases (shared server)
 

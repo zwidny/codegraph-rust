@@ -8,12 +8,12 @@ CodeGraph’s indexing pipeline has multiple layers:
 
 1. **AST extraction** (Tree-sitter): parses files and emits initial nodes/edges.
 2. **FastML** enhancement: fast heuristics that can improve recall.
-3. **Analyzers** (optional but enabled by default): build context, module linking, LSP enrichment, docs/contracts, architecture, dataflow (Rust-local).
+3. **Analyzers** (optional but enabled by default): build context, module linking, SCIP import, docs/contracts, architecture, dataflow (Rust-local).
 
 So a language can be:
 
 - **AST-supported**: Tree-sitter parsing + baseline node extraction works.
-- **Analyzer-supported**: additional enrichers run (module linker, LSP, etc.).
+- **Analyzer-supported**: additional enrichers run (module linker, SCIP, etc.).
 
 ## AST-supported languages (Tree-sitter)
 
@@ -35,24 +35,27 @@ These languages are registered in `crates/codegraph-parser/src/language.rs`:
 
 ## Analyzer support by language
 
-### LSP-backed enrichment
+### SCIP-backed enrichment
 
-CodeGraph can optionally enrich nodes/edges using Language Server Protocol tooling. The LSP server selection is defined in `crates/codegraph-mcp/src/analyzers/mod.rs`.
+CodeGraph enriches nodes/edges from a pre-built SCIP artifact. There is no language-server
+process: `scripts/scip-index.sh` selects the right indexer per language and prints the
+`CODEGRAPH_SCIP_INDEX` value.
 
-| Language | LSP tool | Notes |
+| Language | SCIP indexer | Notes |
 |---|---|---|
-| Rust | `rust-analyzer` | Adds qualified names and resolves references |
-| TypeScript | `typescript-language-server` (+ `node`) | Requires Node + TS LS |
-| JavaScript | `typescript-language-server` (+ `node`) | Same server as TS |
-| Python | `pyright-langserver` (+ `node`) | Requires Node + Pyright LS |
-| Go | `gopls` | |
-| Java | `jdtls` | |
-| C/C++ | `clangd` | |
+| Rust | `rust-analyzer scip` | Adds qualified names and definition/reference edges |
+| TypeScript | `scip-typescript index` | Needs a TypeScript project |
+| JavaScript | `scip-typescript index` | Same indexer as TS |
+| Go | `scip-go` | |
 
-You can disable analyzers entirely (or tool requirements) via:
+Languages without a SCIP indexer (Python, Java, C/C++, Swift, C#, Ruby, PHP, Kotlin) are
+**AST-only**: they are parsed and linked, but receive no compiler-derived definition edges.
+A SCIP index built by other tooling can still be supplied for them through
+`CODEGRAPH_SCIP_INDEX`.
+
+You can disable the analyzer stages entirely via:
 
 - `CODEGRAPH_ANALYZERS=false`
-- `CODEGRAPH_ANALYZERS_REQUIRE_TOOLS=false`
 
 ### Module linking
 

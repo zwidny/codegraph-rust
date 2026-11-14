@@ -1,7 +1,10 @@
 ABOUTME: Specifies performance and behavioral contracts for the LSP enrichment phase.
 ABOUTME: Focuses on throughput and bounded work per file to keep indexing responsive.
 
-# Specification: LSP Enrichment Throughput
+# Specification: LSP Enrichment Throughput (obsolete)
+
+> Historical: language-server enrichment was removed in favour of SCIP; the
+> measurements below are kept as a record of why.
 
 ## Intent
 

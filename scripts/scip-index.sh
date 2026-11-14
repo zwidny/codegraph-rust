@@ -2,9 +2,9 @@
 # Generate SCIP indexes for every language in this repository and print the
 # CODEGRAPH_SCIP_INDEX value to use.
 #
-# Why: `codegraph index` drives one language server request per file by default.
+# Why: `codegraph index` without a SCIP index produces an AST-only graph.
 # On a 10k-file project that is 21 minutes; importing a pre-built SCIP index took
-# 2.4s + a 3.9s import on the same tree, and adds definition edges the LSP path
+# 2.4s + a 3.9s import on the same tree, and adds definition edges AST-only
 # never produces.
 #
 # Usage:
@@ -50,7 +50,7 @@ if [ -f "$ROOT/Cargo.toml" ] || find "$ROOT" -maxdepth 3 -name Cargo.toml -print
     ( cd "$ROOT" && rust-analyzer scip . >/dev/null 2>&1 && mv "$ROOT/index.scip" "$out" )
     entries+=("$out")
   else
-    echo "warn: rust-analyzer not found; Rust stays on LSP" >&2
+    echo "warn: rust-analyzer not found; Rust stays AST-only" >&2
   fi
 fi
 
@@ -71,7 +71,7 @@ done < <(find "$ROOT" -maxdepth 3 -name package.json -not -path "*/node_modules/
            -exec grep -l '"workspaces"\|"name"' {} \; 2>/dev/null | head -20)
 
 if [ ${#entries[@]} -eq 0 ]; then
-  echo "no SCIP index produced; index will use language servers" >&2
+  echo "no SCIP index produced; the index will be AST-only" >&2
   exit 1
 fi
 

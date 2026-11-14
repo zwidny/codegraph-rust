@@ -60,29 +60,28 @@ has that the plan forgot) and `existing_planned_nodes` (symbols you may be re-cr
 Use it when adding a module, crossing layers, chaining 3+ hops, or changing the public
 interfaces of 3+ files; skip it for a single-file fix.
 
-A partial re-index skips language servers by default (they load the whole workspace).
-Enable them deliberately and pin the project:
+A partial re-index updates only the scanned scope. Compiler-grade enrichment comes from the
+SCIP index you pass in `CODEGRAPH_SCIP_INDEX`; files the index does not cover stay AST-only.
+Pin the project so the index and the scan agree:
 
 ```sh
-CODEGRAPH_LSP_ON_PARTIAL=1 codegraph index packages/happy-android \
-  --project-root . --index-tier balanced --languages kotlin
+CODEGRAPH_SCIP_INDEX=/abs/rust.scip codegraph index crates/codegraph-core \
+  --project-root . --index-tier balanced
 ```
 
 `--project-root` (or `CODEGRAPH_PROJECT_ID`) must match the indexed project; the scan
-path stays relative to it. A cold LSP import may exceed the 30s `initialize` deadline on
-large repos — retry once warmed up, or do one full `codegraph index <root>` pass first.
+path stays relative to it.
 
-LSP edges depend on the tier: `balanced` uses `SymbolsOnly` and produces **0 definition
-edges** (only `documentSymbol`); `full` uses `SymbolsAndDefinitions` and resolves them.
-`0 edges resolved` on balanced is expected. Set `CODEGRAPH_LSP_DEFINITIONS=1` to force
-definition resolution on balanced.
+The index tier filters edges, it does not gate enrichment: `fast` drops `Uses`/`References`,
+`balanced` drops `References`, and `full` keeps everything. A supplied SCIP index is imported
+on every tier.
 
-**Prefer SCIP over per-file LSP.** Generate a compiler index first and pass it via
+**Prefer SCIP over AST-only.** Generate a compiler index first and pass it via
 `CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`;
 comma-separated entries, `path@subdir` when the index was built inside a subdirectory).
 On a 10k-file tree this cut analysis from 21 minutes to 2.4 s plus a 3.9 s import, and it
 contributes definition edges even on `balanced`. `scripts/scip-index.sh` generates every
-language and prints the value. Setting the variable disables language servers for the run,
-so each language needs its own index; a language without one gets no enrichment.
+language and prints the value. A language without an index gets no compiler enrichment but
+is still parsed; there is no language-server fallback.
 
 Reload this guidance with `codegraph agent instructions` after context loss.

@@ -1,8 +1,8 @@
 # Indexing is not deterministic when LSP enrichment is enabled
 
-Status: **mitigated** — SCIP is the default enrichment path and the language-server fallback is
-opt-in (`CODEGRAPH_LSP_FALLBACK=1`), so the language server is out of the path by default.
-See [Recommendation](#recommendation). The analysis below still describes the mechanism.
+Status: **resolved by removal** — the language-server implementation was deleted (commits
+`caa8e66`, `5e2d43c`), so no switch can turn it back on. Enrichment comes only from a SCIP
+index. The analysis below is kept as the record of why it went.
 
 ## Symptom
 
@@ -123,16 +123,10 @@ export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"   # rust + ts + 
 codegraph index . --index-tier full
 ```
 
-Files that no supplied SCIP index covers keep AST-only results; the language server does not
-start for them. If you genuinely need language-server enrichment for one run, opt in
-explicitly:
-
-```bash
-CODEGRAPH_LSP_FALLBACK=1 codegraph index . --index-tier full
-```
-
-(`CODEGRAPH_LSP_FALLBACK` accepts `1`/`true`/`on`/`yes`; any other value, or leaving it unset,
-keeps the fallback off.)
+Files that no supplied SCIP index covers keep AST-only results. There is no way to start a
+language server for them any more — `CODEGRAPH_LSP_FALLBACK` and every other `CODEGRAPH_LSP_*`
+variable were removed with the implementation. To close a gap, produce an index for that
+language instead (`scripts/scip-index.sh`).
 
 This is option 4, and it is what the measurements now support. `full` still keeps
 the reference edges and the dataflow analyzers; only the language server is gone.
@@ -195,8 +189,8 @@ IntelliJ's compiler or `kotlin-compiler-embeddable`).
 
 Consequence: the 13 Kotlin files keep AST-only results. They are visible in
 `--stats-json` as part of `files_without_enrichment` (287 on EasyTier with `rust.scip` only;
-the number drops as more languages get indexes). No language server starts for them unless
-`CODEGRAPH_LSP_FALLBACK=1` is set.
+the number drops as more languages get indexes). No language server starts for them; the
+implementation no longer exists.
 
 JDK 17 is installed at `~/.local/jdk-17` and was not the blocker — the missing piece is a
 plugin that binds to the standalone compiler.

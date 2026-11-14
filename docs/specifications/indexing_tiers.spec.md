@@ -31,11 +31,15 @@ CLI > env > config defaults.
 
 ### Analyzer Behavior by Tier
 
-| Tier | Build Context | LSP Symbols | LSP Definitions | Enrichment (docs/api) | Module Linking | Dataflow | Docs/Contracts | Architecture |
-|------|----------------|-------------|-----------------|-----------------------|----------------|----------|----------------|--------------|
-| fast | off            | off         | off             | off                   | off            | off      | off            | off          |
-| balanced | on         | on          | off             | on                    | on             | off      | on             | off          |
-| full | on             | on          | on              | on                    | on             | on       | on             | on           |
+| Tier | Build Context | SCIP Enrichment | Enrichment (docs/api) | Module Linking | Dataflow | Docs/Contracts | Architecture |
+|------|----------------|-----------------|-----------------------|----------------|----------|----------------|--------------|
+| fast | off            | if index supplied | off                 | off            | off      | off            | off          |
+| balanced | on         | if index supplied | on                  | on             | off      | on             | off          |
+| full | on             | if index supplied | on                    | on             | on       | on             | on           |
+
+SCIP enrichment is not tier-gated: whenever `CODEGRAPH_SCIP_INDEX` provides an index it is
+imported on every tier. The tier decides which AST analyzer stages run and which edge types
+are retained.
 
 ### Edge Filtering by Tier
 

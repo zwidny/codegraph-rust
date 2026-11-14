@@ -122,45 +122,30 @@ module.
 4. `codegraph plan --project <root> store plan.json --plan-id <id>` keeps the plan and
    its constraints for later sessions; `codegraph plan show <id>` reads it back.
 
-## Language servers on a partial re-index
+## SCIP on a partial re-index
 
-`codegraph index <scan_root>` updates only that scope and **does not start language
-servers** by default. LSP servers load the whole workspace, so a single-file update
-would pay the full project import cost.
-
-Start them deliberately when you need cross-file symbols/definitions:
+`codegraph index <scan_root>` updates only that scope. Compiler-grade enrichment comes from
+the `CODEGRAPH_SCIP_INDEX` you pass; files the index does not cover keep AST-only results.
+No language server is started for the scan.
 
 ```bash
-CODEGRAPH_LSP_ON_PARTIAL=1 codegraph index packages/happy-android \
-  --project-root /path/to/repo --index-tier balanced --languages kotlin
+CODEGRAPH_SCIP_INDEX=/abs/rust.scip codegraph index crates/codegraph-core \
+  --project-root /path/to/repo --index-tier balanced
 ```
 
-- Pass the **project root** (`--project-root`, or set `CODEGRAPH_PROJECT_ID`) so the
-  index and the LSP server agree on the project. Keep the scan path (e.g.
-  `packages/happy-android`) relative to that root.
-- The LSP server is initialised with the **project root**, not the scan root: a cold
-  import can take 1–5 minutes on a large Android/Java/TypeScript repository.
-  `initialize` waits up to 180s (`CODEGRAPH_LSP_INITIALIZE_TIMEOUT_SECS`); other requests
-  wait 30s (`CODEGRAPH_LSP_REQUEST_TIMEOUT_SECS`). If it still times out, the run
-  downgrades to a warning and indexing continues with AST results.
-- Required tools: `kotlin-language-server` (Kotlin), `jdtls` (Java),
-  `typescript-language-server` (TS/JS), `rust-analyzer` (Rust), `gopls` (Go).
-  TypeScript 7 native preview has no `lib/tsserver.js`, so it is launched as
-  `tsc --lsp --stdio` instead of through `typescript-language-server`.
-- **Tier and edge resolution.** `balanced` runs language servers in `SymbolsOnly` mode:
-  it enriches node names with `documentSymbol` but does **not** request `definition`, so
-  LSP contributes **0 graph edges**. Only `full` uses `SymbolsAndDefinitions` and resolves
-  definition edges. `N nodes enriched + 0 edges resolved` on `balanced` is expected, not a
-  failure. To get LSP edges on balanced, set `CODEGRAPH_LSP_DEFINITIONS=1` (slower).
-- For a large repository, prefer one full `codegraph index <root>` pass with LSP, then
-  use partial re-indexes without LSP for day-to-day edits.
-- **Prefer SCIP over per-file LSP.** Generate a compiler index first and pass it via
+- Pass the **project root** (`--project-root`, or set `CODEGRAPH_PROJECT_ID`) so the index
+  and the scan agree on the project. Keep the scan path relative to that root.
+- The index is validated against the captured sources; regenerate it when sources change.
+- `--index-tier` filters edges, it does not gate enrichment: `fast` drops
+  `Uses`/`References`, `balanced` drops `References`, `full` keeps everything.
+- For a large repository, run one full `codegraph index <root>` pass with a SCIP index, then
+  use partial re-indexes for day-to-day edits.
+- **Prefer SCIP over AST-only.** Generate a compiler index first and pass it via
   `CODEGRAPH_SCIP_INDEX` (`rust-analyzer scip .`, `scip-typescript index`, `scip-go`;
   comma-separated, `path@subdir` for an index built inside a subdirectory). Measured on a
-  10k-file tree: analysis 21 min -> 2.4 s + 3.9 s import, and it yields definition edges
-  even on `balanced`, where LSP produces none. `scripts/scip-index.sh` does this per
-  language and prints the value. A language with no index gets no enrichment, because
-  setting `CODEGRAPH_SCIP_INDEX` disables language servers for the run.
+  10k-file tree: analysis 21 min -> 2.4 s + 3.9 s import. `scripts/scip-index.sh` does this
+  per language and prints the value. A language with no index stays AST-only; there is no
+  language-server fallback.
 
 ---
 

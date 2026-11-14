@@ -11,7 +11,7 @@ monorepo (169,528 nodes / 1,942,741 relationships) unless stated otherwise.
 2  source_capture          read every source file once into snapshots
 3  file collection         walk + gitignore + extension filter
 4  ast_parse               tree-sitter: nodes and raw edges        (~1s)
-5  analyzers               LSP or SCIP: qualified names + definition edges
+5  analyzers               SCIP: qualified names + definition edges
 6  module_linking          module nodes, contains/imports edges
 7  docs_contracts          documentation and contract edges
 8  chunk_plan              split nodes into embedding-sized chunks (~4s)
@@ -28,7 +28,7 @@ monorepo (169,528 nodes / 1,942,741 relationships) unless stated otherwise.
 | key | meaning |
 |---|---|
 | `input_validation`, `source_capture`, `ast_parse` | stages 1–4 |
-| `analyzers` | stage 5 (dominated by the language server or SCIP import) |
+| `analyzers` | stage 5 (dominated by the SCIP import) |
 | `chunk_plan` | stage 8 |
 | `enqueue_nodes` | stage 9 |
 | `embeddings_and_writes` | stage 10, including chunk fingerprinting and chunk writes |
@@ -46,7 +46,7 @@ Measured on the TypeScript monorepo, before optimisation:
 |---|---|---|
 | `embeddings_and_writes` | 23.4 min | 46% |
 | `resolve_and_enqueue_edges` | 25.0 min | 49% |
-| `analyzers` (LSP) | 16.0 min | 32% |
+| `analyzers` (SCIP) | 16.0 min (historical LSP measurement) | 32% |
 | `chunk_plan` | 4 s | — |
 | `ast_parse` | 3 s | — |
 
@@ -65,19 +65,19 @@ counting pass ran *before* the length prune.
 
 ## Controls that change each phase
 
-### Stage 5 — analyzers: LSP or SCIP
+### Stage 5 — analyzers: SCIP
 
 | control | effect |
 |---|---|
-| `CODEGRAPH_INDEX_TIER=fast` | no language server at all |
-| `CODEGRAPH_SCIP_INDEX=<index.scip>` | import a pre-built SCIP index instead of driving a language server; also skips LSP tool validation |
+| `CODEGRAPH_INDEX_TIER=fast` | skips the analyzer stages; a supplied SCIP index is still imported |
+| `CODEGRAPH_SCIP_INDEX=<index.scip>` | import a pre-built SCIP index for qualified names and definition edges |
 | `CODEGRAPH_SCIP_MAX_BYTES=<n>` | opt-in safety valve that rejects an artifact larger than `n` bytes; unset/`0` disables it (default) |
-| `CODEGRAPH_LSP_SKIP_TEST_FILES` | default on; skips `.stories.`, `.generated.`, `__mocks__/`, `__fixtures__/`, `generated/`. **Do not** add `.test.`/`.spec.` back to the skip list — that dropped 25,970 resolvable edges (31.57% → 30.23%) |
-| `CODEGRAPH_LSP_ON_PARTIAL=1` | allow language servers on partial (subdirectory) indexes |
 
 SCIP measured on the same project: **260 s for the whole index** versus 16 min of LSP
-round-trips, 12.3 GB peak (needs `NODE_OPTIONS=--max-old-space-size=16384`; the default
-4 GB heap OOMs in 38 s), producing a 525 MB `index.scip`.
+round-trips in the historical measurement that motivated the change, 12.3 GB peak (needs
+`NODE_OPTIONS=--max-old-space-size=16384`; the default 4 GB heap OOMs in 38 s), producing a
+525 MB `index.scip`. The language-server path has since been removed; SCIP is the only
+compiler-enrichment path.
 
 `scip-typescript` embeds no document text and writes no `index.sources.json`. Documents
 without a manifest entry are accepted with a single warning that reports the count;
@@ -134,8 +134,11 @@ codegraph index . --index-tier balanced
 codegraph index . --index-tier fast
 ```
 
-`fast` skips every analyzer, so the result depends only on the source tree. `balanced`
-depends on language-server state (see [LSP determinism](LSP_DETERMINISM.md)).
+`fast` skips the analyzer stages and filters out `Uses`/`References` edges; with no SCIP
+index the result depends only on the source tree. A supplied SCIP index is imported on every
+tier, so qualified names and definition edges come from it; `balanced` drops `references`
+edges while `full` keeps them. See
+[LSP determinism](LSP_DETERMINISM.md) for why the language-server path was removed.
 
 **A stalled or OOM-killed index**
 

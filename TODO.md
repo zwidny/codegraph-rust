@@ -172,8 +172,9 @@ the storage it is meant to measure). Read it before proposing another storage-la
   length window before the HashMap took `counts_ms` from 14.6M to 2.2M.
 - Self-loops are 11.4% of EasyTier's edges (8,317/72,940). Rust degree counting must include
   them; `mutual_pairs` must exclude them. Fixture-only tests missed this for three commits.
-- LSP enrichment is non-deterministic (depends on server readiness);
-  see `docs/LSP_DETERMINISM.md`. SCIP is static and does not have this problem.
+- Language-server enrichment was non-deterministic (it depended on server readiness);
+  see `docs/LSP_DETERMINISM.md`. The path has since been removed; SCIP is static and does
+  not have this problem.
 - Native (`*_native`) analysis methods are gated by `CODEGRAPH_NATIVE_ANALYSIS` (opt-in) and
   verified on real data by `crates/codegraph-graph/tests/native_real_data_diff.rs` (`#[ignore]`).
 - **Regenerate `rust.scip` after editing sources.** Reusing a stale index aborts the whole run
@@ -205,7 +206,8 @@ one index per language into `.codegraph/scip/`, and feeds the paths back as
 Caching lives in the `scip-auto-v1` artifact namespace, keyed by a fingerprint over
 `(relative path, byte length, mtime seconds)` of **that language's** sources, so a Rust edit
 does not invalidate a TypeScript index. Per-language failure handling: a missing indexer or a
-non-zero exit warns and falls back to language servers; `--scip-strict` turns both into errors
+non-zero exit warns and skips that language's compiler-index enrichment (there is no
+language-server fallback); `--scip-strict` turns both into errors
 carrying the last 20 stderr lines. An explicit `CODEGRAPH_SCIP_INDEX` wins and skips
 auto-generation.
 
@@ -224,19 +226,22 @@ back.
 Still manual: CI. `scripts/scip-index.sh` and `--scip-auto` both work locally; wiring either
 into CI (and caching the artifacts between jobs) is unstarted.
 
-### 1. Per-language analyzer selection — **done in `0a075d3`**
+### 1. Per-language analyzer selection — **historical, superseded**
+
+> Historical: this section records the per-language LSP fallback that was later removed.
+> SCIP is now the only enrichment path; files without coverage are AST-only.
 
 Previously `CODEGRAPH_SCIP_INDEX` disabled LSP **globally**, so any language without an
 index (Kotlin, C, a missing Go index) got zero enrichment — worse than the LSP-only baseline.
 
-Now `ImportStats.covered_files` records the project-relative keys of every document an index
-matched, and the indexer imports SCIP first, then runs LSP only on
-`files_without_scip_coverage`. LSP stats accumulate with `+=` (SCIP contributes first) and the
-LSP summary line reports its own `total_stats`.
+At the time, `ImportStats.covered_files` recorded the project-relative keys of every document
+an index matched, and the indexer imported SCIP first, then ran LSP only on
+`files_without_scip_coverage`. LSP stats accumulated with `+=` (SCIP contributes first) and the
+LSP summary line reported its own `total_stats`.
 
-Measured on this repo: SCIP covers **227 of 260** files, LSP runs on the remaining **33**
-(5.1 s, `languages: [Python, Rust]`, **478 nodes + 458 edges** — previously zero).
-`lsp_nodes_enriched` went 4,035 → 4,520 == 4,042 (SCIP) + 478 (LSP) exactly.
+Measured on this repo at the time: SCIP covered **227 of 260** files, LSP ran on the
+remaining **33** (5.1 s, `languages: [Python, Rust]`, **478 nodes + 458 edges** — previously
+zero). `lsp_nodes_enriched` went 4,035 → 4,520 == 4,042 (SCIP) + 478 (LSP) exactly.
 
 EasyTier acceptance (2026-11-12, four indexes: rust, go@easytier-go, ts, ts-js@easytier-js):
 
@@ -309,7 +314,7 @@ Nothing is wired up yet.
 | `scip` CLI has no merge | Merging is unnecessary now that multiple indexes are supported directly |
 | `pnpm dev` during indexing | It wrecked one measurement (`lsp_nodes_enriched` 42,874 → 2,556). Never measure with a dev server running |
 | paperclip's LSP-enriched count | 42,874 (LSP) vs 44,587 (SCIP). The earlier 2,556 sample was the polluted run |
-| LSP determinism | Still open, see `docs/LSP_DETERMINISM.md`; SCIP is the intended exit |
+| LSP determinism | **Resolved by removal**: the language-server path is gone; see `docs/LSP_DETERMINISM.md` for the historical record |
 | Stale SCIP error message | **Fixed in `291192f`**: the import now warns `SCIP index … is older than N of M captured sources` (mtime comparison, non-fatal) and position failures carry `<path>:<line>:<col> (end …, encoding N) … the index is probably stale`. The mtime heuristic can misfire on `git checkout`/`touch` — it only warns, so that is cosmetic |
 | Occurrence-aware edge ids | ~31% of this repo's 96,733 edges share `(from,to,type)` with another edge (max 71 occurrences of one `references`). Deliberate (`edge.rs` keeps distinct call sites distinct), but degree/coupling metrics must `DISTINCT` or they over-count |
 
@@ -423,12 +428,11 @@ jq '.phase_ms | to_entries | map(select(.key|endswith("_ms")))
 Flags that matter: `CODEGRAPH_SCIP_INDEX`, `CODEGRAPH_SCIP_MAX_BYTES`,
 `CODEGRAPH_SCIP_TRUST_SOURCE`, `CODEGRAPH_VECTOR_INDEX_MODE` (default `deferred`),
 `CODEGRAPH_FUZZY_CANDIDATE_LIMIT` (default 0 = unlimited), `CODEGRAPH_NATIVE_ANALYSIS`,
-`CODEGRAPH_LSP_SKIP_TEST_FILES` (default on; only stories/generated/mocks/fixtures),
 `CODEGRAPH_PROVIDER_CONCURRENCY` (4 on this host).
 
 ## References
 
 - `docs/INDEXING_PIPELINE.md` — every stage, its `phase_ms` key, and the controls
-- `docs/LSP_DETERMINISM.md` — why balanced-mode indexing is not reproducible
+- `docs/LSP_DETERMINISM.md` — historical record of why the language-server enrichment path was removed
 - `docs/INTERNAL_FUNCTION_MIGRATION.md` — `fn::*` → Rust status and the caller-switch plan
 - `deploy/README.md` — SurrealDB 4.x requirement, memory budgets, migration

@@ -20,7 +20,7 @@ CodeGraph 把仓库解析成 **符号 + 边的知识图谱**，再给每个符�
 数据流：
 
 ```
-源码 → 文件收集 → LSP 符号解析 → 富化(rustdoc/API) → 模块/文档链接
+源码 → 文件收集 → SCIP 符号解析 → 富化(rustdoc/API) → 模块/文档链接
      → tree-sitter AST → 节点+边持久化 → 节点向量 → chunk 向量
      → HNSW 索引构建 → 语义消解
 ```
@@ -69,22 +69,24 @@ curl -s http://127.0.0.1:8766/v1/models   # 期望：F2LLM-v2-0.6B
 --max-client-batch-size 64     单请求最多 64 条
 ```
 
-### 2.2 LSP（`balanced` / `full` tier 必需）
+### 2.2 SCIP（compiler 级富化，可选）
 
-| 语言 | 依赖 |
+语言服务器已移除。compiler 级富化来自 SCIP 索引；不提供索引时索引结果为 AST-only。
+
+| 语言 | 索引器 |
 |---|---|
-| Rust | `rust-analyzer`（必须在项目目录内能 `rust-analyzer --version`） |
-| Python | `pyright-langserver` + `node` |
-| TS/JS | `typescript-language-server` + `node` |
+| Rust | `rust-analyzer scip .` |
+| TS/JS | `scip-typescript index` |
+| Go | `scip-go` |
 
-安装：
+生成并导出：
 
 ```bash
-rustup component add rust-analyzer
-npm i -g pyright
+export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"
 ```
 
-缺工具时 `balanced`/`full` 会 **fail fast**（不是降级）。
+`scripts/scip-index.sh` 按语言选择索引器并写入 `.codegraph/scip/`。没有对应索引的语言保持
+AST-only，不会 fail fast。
 
 ### 2.3 构建
 
@@ -193,8 +195,8 @@ CODEGRAPH_LLM_* / OPENAI_* / CONTEXT_WINDOW
 #    （仅当退回嵌入式 SurrealKV 时才必须先停掉占用库的进程）
 pgrep -x codegraph && echo "INFO: 有 codegraph 进程在跑（server 模式下可共存）"
 
-# 2. 确认 LSP 可用
-rust-analyzer --version
+# 2. 生成 SCIP 索引（可选；没有则 AST-only）
+export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"
 
 # 3. 估算（不写库、不调 LLM）
 codegraph estimate . -r --languages rust --index-tier balanced
@@ -258,8 +260,8 @@ codegraph index . -r --exclude vendor --exclude target
 | 阶段 | 耗时 | 说明 |
 |---|---|---|
 | 文件收集 | <1s | |
-| rust-analyzer 启动 | 3–36s | 冷启动 36s，热启动仅 3s |
-| LSP + 富化 + 链接 | ~3s | |
+| SCIP 导入 | — | 未单独测量；历史 LSP 测量中该行是 rust-analyzer 冷启动 3–36s |
+| SCIP + 富化 + 链接 | ~3s | 历史 LSP 测量，保留作对比 |
 | tree-sitter AST | 2–37s | 有缓存 2s |
 | 节点持久化 | **5s** | `NODE_DB_BATCH_SIZE=512` |
 | **节点+chunk 向量** | **~7 min** | 26k × 1024 维 F2LLM-0.6B 本地推理（1.7B 时约 16 min） |
@@ -538,7 +540,7 @@ cargo +1.97.1 test -p codegraph-graph --features surrealdb --test ingestion_writ
 
 | 症状 | 原因 | 处理 |
 |---|---|---|
-| `Missing pyright-langserver` | balanced tier 需要 Python LSP | `npm i -g pyright` |
+| `SCIP column is invalid ...` | 索引与源码不一致（stale） | 重新运行 `scripts/scip-index.sh`，或用 `--scip-auto` |
 | `requires rustc 1.95.0` | 默认工具链太旧 | `cargo +1.97.1 build ...` |
 | `openssl.pc not found` | 缺开发包 | `sudo apt install -y libssl-dev pkg-config` |
 | 索引卡住无输出 20+ 分钟 | `INFO FOR INDEX` 或 compaction | 已加超时；确认 `VECTOR_INDEX_TIMEOUT_SECS` |

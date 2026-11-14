@@ -1,5 +1,8 @@
 # Indexing benchmarks
 
+> Historical: language-server enrichment was removed in favour of SCIP; the
+> measurements below are kept as a record of why.
+
 Build the benchmark separately so compilation does not contaminate wall time or RSS:
 
 ```sh

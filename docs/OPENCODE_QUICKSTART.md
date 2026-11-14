@@ -58,14 +58,18 @@ command -v codegraph
 
 `--features full` 才有 agent、embedding 与 HTTP 能力。
 
-LSP 依赖按语言安装；`balanced` / `full` tier 缺工具会 **fail fast**（不是降级）：
+compiler 级富化是可选的 SCIP 索引，不再依赖语言服务器。用 `scripts/scip-index.sh`
+生成并导出，未提供索引的语言保持 AST-only：
 
-| 语言 | 需要 |
+```bash
+export CODEGRAPH_SCIP_INDEX="$(scripts/scip-index.sh --export)"
+```
+
+| 语言 | 索引器 |
 |---|---|
-| Rust | `rustup component add rust-analyzer` |
-| Python | `npm i -g pyright` |
-| TS/JS | `typescript-language-server` + `node` |
-| Go / Java / C-C++ | `gopls` / `jdtls` / `clangd` |
+| Rust | `rust-analyzer scip .` |
+| TS/JS | `scip-typescript index` |
+| Go | `scip-go` |
 
 ---
 
@@ -178,5 +182,5 @@ opencode mcp list        # 期望 codegraph  connected
 | 语义检索返回 `~/.cargo/registry` 内容 | 旧版未过滤外部依赖节点 | 重建二进制并重启 MCP |
 | 自然语言查询返回空 | `threshold` 过高 | 显式传 `threshold: 0.25` |
 | 索引报“database locked” | 嵌入式模式下有进程占用 | 改用 SurrealDB server，或先停 MCP |
-| `balanced`/`full` 直接失败 | 缺 LSP 工具 | 装工具，或 `--index-tier fast` |
+| `SCIP column is invalid ...` | 索引与源码不一致（stale） | 重新生成 SCIP，或用 `--scip-auto` |
 | 每次索引都重算全部向量 | `CODEGRAPH_MODEL_REVISION` 未固定 | 设为固定值（如 `1`），一次性全量后稳定 |

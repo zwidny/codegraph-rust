@@ -56,7 +56,9 @@ A shared SurrealDB 3.x server is the supported deployment: run one with Docker o
 per-project store is opt-in by setting `CODEGRAPH_SURREALDB_URL` to a `surrealkv://` path,
 but it is a compatibility fallback: substantially slower, and it allows one process per project.
 
-Balanced and full indexing tiers additionally need the language servers for the languages you index (for example `rust-analyzer`); the default fast tier does not.
+Compiler-index enrichment is optional: generate a SCIP index with `scripts/scip-index.sh`
+and pass `CODEGRAPH_SCIP_INDEX`. This needs the matching language toolchain (for example
+`rust-analyzer` for Rust), but no language server; without an index, indexing is AST-only.
 
 ---
 
@@ -234,8 +236,8 @@ Options:
       --exclude <PATTERN>   Exclude patterns (gitignore format, repeatable)
       --include <PATTERN>   Include only these patterns
       --index-tier <TIER>   fast (default) | balanced | full
-                            balanced: documentSymbol only (0 LSP definition edges)
-                            full: also resolves definition edges
+                            balanced/full enable more analyzer stages; full
+                            keeps references edges (SCIP enrichment is separate)
       --batch-size <N>      Embedding batch size (overrides env and config)
       --force               Re-index even if already indexed
       --complete-deferred   Finish embedding/semantic work deferred by an earlier run

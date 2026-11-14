@@ -211,17 +211,18 @@ codegraph init . --hooks both --index-tier balanced
 codegraph index . -r -l typescript,javascript    # index only, no hooks
 ```
 
-**Index tiers.** `balanced` and `full` run language servers (`typescript-language-server`,
-`clangd`, `gopls`, …) and **fail if those tools are missing**. On a machine without them — or
-for a very large monorepo — use `--index-tier fast` and scope what you index:
+**Index tiers.** Tiers control AST extraction, edge filtering and which analyzer stages run.
+They no longer require external language servers: compiler-grade enrichment comes from a
+SCIP index (below) and applies on every tier when one is supplied. For a very large
+monorepo, use `--index-tier fast` and scope what you index:
 
 ```bash
 codegraph init . --hooks both --index-tier fast
 codegraph index server --index-tier fast -l typescript   # one subtree; belongs to the repo project
 ```
 
-**Faster, reproducible indexing with SCIP.** Instead of driving a language server once per
-file, import pre-built SCIP indexes:
+**Faster, reproducible indexing with SCIP.** Instead of relying on AST-only parsing,
+import pre-built compiler indexes:
 
 ```bash
 rust-analyzer scip .                          # Rust
@@ -233,10 +234,10 @@ CODEGRAPH_SCIP_INDEX="/abs/rust.scip,/abs/go.scip@easytier-go" \
 ```
 
 Each entry is `<path>[@<subdir>]`, where `subdir` is the index's directory relative to the
-project root. Setting the variable disables language servers for the run, so supply one index
-per language in a mixed-language project. On a 10k-file TypeScript project this cut the
-analysis phase from 21 minutes to 2.4 s plus a 3.9 s import, and contributed 62,711
-definition edges the LSP path never produced. Details: [Indexing pipeline](docs/INDEXING_PIPELINE.md).
+project root. Supply one index per language in a mixed-language project; a language without
+an index stays AST-only. On a 10k-file TypeScript project this cut the analysis phase from
+21 minutes to 2.4 s plus a 3.9 s import, and contributed 62,711 definition edges that
+AST-only parsing never produced. Details: [Indexing pipeline](docs/INDEXING_PIPELINE.md).
 
 Indexing a subdirectory or a single file updates only that scope and leaves the rest
 of the project graph intact; see
@@ -432,7 +433,7 @@ The original full run `20261006_060847_378162` also selected `gpt-6-luna` explic
 Seven commands returned answers and case 2 (tier-aware prompts) hit the 300-second deadline;
 the run took **648.4 seconds** including that timeout. The stored index reported
 238 files, 34,494 nodes, 104,224 edges and 34,494 chunks, marked complete with
-embedding and semantic stages ready, and includes dataflow, LSP, module and
+embedding and semantic stages ready, and includes dataflow, SCIP, module and
 documentation analyzer output. Embedding settings match the original balanced run.
 [Full answers, run details and source review](docs/evaluations/full-cli-2026-10-06.md)
 are retained separately.
@@ -491,7 +492,7 @@ instability; the other cases were not re-run. See the
 The refreshed full run `20261006_162918_871171` explicitly requested `gpt-6-luna`.
 All eight cases returned `OK` in **901.8 seconds**, with **99 tool calls** and
 **172 summed locations**. The catalog records 239 files, 34,998 nodes, 100,107 edges
-and 36,600 chunks, including LSP definitions and dataflow output. It uses the same
+and 36,600 chunks, including SCIP definitions and dataflow output. It uses the same
 installed binary, Jina v5 embedding/chunk policy and agent settings as refreshed
 balanced. [Full refreshed review and all eight answers](docs/evaluations/full-cli-2026-10-06.md#refreshed-full-run-1629-utc)
 remain alongside the original full run.

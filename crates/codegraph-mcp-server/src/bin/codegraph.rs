@@ -158,20 +158,19 @@ enum Commands {
                       Some flags are provider-specific (see individual flag help for details).\n\
                       \n\
                       Practical notes from indexing a large TypeScript monorepo:\n\
-                      - balanced/full run language servers (typescript-language-server, clangd, gopls, rust-analyzer)\n\
-                        and fail if they are missing; use --index-tier fast (AST + embeddings, no LSP) when unavailable.\n\
+                      - Enrichment comes from a SCIP index you supply; without one the graph is AST-only.\n\
+                        There is no language-server fallback.\n\
                       - Very large repos (over ~1M lines) are impractical to index whole: scope to a subdirectory or\n\
                         --include, filter with --languages, and exclude node_modules/dist/generated/*.d.ts.\n\
                       - A single non-UTF-8 source file aborts the whole run; exclude it with --exclude.\n\
                       - Indexing is incremental by default (changed files + cache); --force rebuilds from scratch.\n\
                       - A subdirectory or file path updates only that scope; --project-root sets the owning project\n\
                         (defaults to the nearest .git or .codegraph ancestor).\n\
-                      - Partial re-indexes skip language servers; set CODEGRAPH_LSP_ON_PARTIAL=1 and pass\n\
-                        --project-root to enable them (LSP loads the whole project, not just the scan path).\n\
-                      - RECOMMENDED: generate a SCIP index first, then import it. Without one, every\n\
-                        file costs a language-server round-trip (about 21 minutes per 10k files;\n\
-                        importing a SCIP index for the same tree takes seconds and also yields\n\
-                        definition edges). Generate with `rust-analyzer scip .` (Rust),\n\
+                      - Partial re-indexes use the SCIP index for the files it covers; everything else stays\n\
+                        AST-only. Pass --project-root so the scanned paths resolve against the owning project.\n\
+                      - RECOMMENDED: generate a SCIP index first, then import it. Without one the graph\n\
+                        has no definition or reference edges. Importing a SCIP index for a 10k-file\n\
+                        tree takes seconds and yields those edges. Generate with `rust-analyzer scip .` (Rust),\n\
                         `scip-typescript index` (TS/JS) or `scip-go` (Go), then set\n\
                         CODEGRAPH_SCIP_INDEX. This repository ships scripts/scip-index.sh to do all\n\
                         of that per language and print the value.\n\
