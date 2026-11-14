@@ -46,7 +46,7 @@ Measured on the TypeScript monorepo, before optimisation:
 |---|---|---|
 | `embeddings_and_writes` | 23.4 min | 46% |
 | `resolve_and_enqueue_edges` | 25.0 min | 49% |
-| `analyzers` (SCIP) | 16.0 min (historical LSP measurement) | 32% |
+| `analyzers` | 16.0 min (historical, measured while language servers were still the enrichment path) | 32% |
 | `chunk_plan` | 4 s | — |
 | `ast_parse` | 3 s | — |
 
@@ -62,6 +62,39 @@ at a time inside SurrealDB, which is single-threaded. 170k rows × ~8 ms ≈ 23 
 because the target did not match exactly; each one gathered trigram-overlapping candidates
 and ran Levenshtein. The breakdown showed `counts_ms` at 85.6% of fuzzy time — the candidate
 counting pass ran *before* the length prune.
+
+## Tier and embedding cost
+
+Three orthogonal levers, measured on EasyTier (611 Rust files / 847 scanned files, `rust.scip`
+supplied, local OpenAI-compatible provider, `CODEGRAPH_SEMANTIC_RESOLUTION=deferred`,
+`CODEGRAPH_VECTOR_INDEX_MODE=deferred`):
+
+| tier | embedding | WALL | chunks | nodes | edges | `analyzers` | `embeddings_and_writes` |
+|---|---|---|---|---|---|---|---|
+| fast | off | 8.70 s | 0 | 37,111 | 45,287 | ~0.7 s | 0 |
+| fast | on | 106.30 s | 37,132 | 37,111 | 45,287 | ~0.7 s | 95.4 s |
+| balanced | off | 14.84 s | 0 | 38,057 | 79,801 | 0.86 s | 0 |
+| balanced | on | 135.00 s | 38,080 | 38,057 | 79,781 | 0.85 s | 120.2 s |
+| full | off | 26.55 s | 0 | 75,353 | 246,291 | 2.47 s | 0 |
+| full | on | 211.82 s | 75,376 | 75,353 | 246,270 | 2.46 s | 184.6 s |
+
+Read it as three independent dials:
+
+- **Embedding is 79–91% of the run.** 8.7 → 106.3 s (fast), 14.8 → 135.0 s (balanced),
+  26.6 → 211.8 s (full).
+- **All analyzer stages together cost 18 s.** fast → balanced is +6 s; balanced → full
+  (dataflow + architecture + `references` edges) is +12 s.
+- **Embedding changes no graph structure.** Node counts are identical and the ~20-edge
+  difference between on/off is SCIP resolution noise; only the `chunks` column moves.
+
+Per-chunk cost: 2.57 ms (fast), 3.16 ms (balanced), 2.45 ms (full); the spread is provider
+queueing at a batch size of 64. A supplied SCIP index is imported on every tier — `balanced`
+drops `references` edges and does not synthesize them from SCIP occurrences, `full` does. See
+[LSP determinism](LSP_DETERMINISM.md).
+
+Practical consequence: for call-path and dependency queries only,
+`CODEGRAPH_EMBEDDING_POLICY=off` takes a full index from 211.8 s to 26.5 s. When semantic
+search is required, the only lever that matters is the chunk count, not the tier.
 
 ## Controls that change each phase
 
