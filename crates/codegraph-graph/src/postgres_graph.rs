@@ -29,7 +29,7 @@ use crate::graph_types::{
     CouplingMetricsResult, DependencyNode, EdgeTypeCount, HubNode, NodeEdgeSummary, NodeInfo,
     NodeLocation, NodeReference,
 };
-use crate::postgres_storage::{PgStore, rrf_fuse_lists, vector_text};
+use crate::postgres_storage::{PgStore, rrf_fuse_weighted, rrf_weights_from_env, vector_text};
 
 /// Cap `fn::get_hub_nodes` applies to its ranked output.
 const HUB_LIMIT: usize = 50;
@@ -942,8 +942,18 @@ impl crate::graph_types::GraphQuery for PgGraph {
         let text_scores: HashMap<String, f64> = content_rows.into_iter().collect();
         let t_text = t_start.elapsed();
 
-        // 4) Three-way Reciprocal Rank Fusion, ordered by combined score descending.
-        let fused = rrf_fuse_lists(&[&vector_ids, &name_ids, &content_ids], safe_limit);
+        // 4) Weighted three-way Reciprocal Rank Fusion, ordered by combined score
+        // descending. The default weights (`vector=0.5, name=1.0, content=1.0`)
+        // come from the retrieval-mode evaluation in
+        // `docs/benchmarks/retrieval-modes.md`: once documents are indexed, the
+        // text channels are stronger than the vector channel, so equal weights
+        // hold them back. Repositories with few or no documents can lower the
+        // content weight; `CODEGRAPH_RRF_WEIGHTS=1,1,1` restores equal weights.
+        let (wv, wn, wc) = rrf_weights_from_env();
+        let fused = rrf_fuse_weighted(
+            &[(&vector_ids, wv), (&name_ids, wn), (&content_ids, wc)],
+            safe_limit,
+        );
         if fused.is_empty() {
             return Ok(Vec::new());
         }

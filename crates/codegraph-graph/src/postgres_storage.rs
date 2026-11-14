@@ -1027,24 +1027,75 @@ pub(crate) fn rrf_fuse(vector_ids: &[String], text_ids: &[String], limit: usize)
     hits
 }
 
-/// Reciprocal Rank Fusion over an arbitrary number of ranked lists.
+/// Default per-channel RRF weights, ordered `vector, name, content`.
 ///
-/// Each list contributes `1 / (60 + rank)` for its first occurrence of an id
-/// (rank is 1-based); duplicates inside one list are ignored. Ties break on id
-/// so the order is deterministic. `limit == 0` means no truncation.
+/// These come from the retrieval-mode evaluation in
+/// `docs/benchmarks/retrieval-modes.md`: once documents entered the full-text
+/// index the text channels were clearly stronger, and equal-weight RRF dragged
+/// them down. Weighting the vector channel at 0.5 improved identifier
+/// retrieval (0.680 -> 0.685) and natural-language retrieval (0.736 -> 0.784)
+/// over equal weights.
+const DEFAULT_RRF_WEIGHTS: (f64, f64, f64) = (0.5, 1.0, 1.0);
+
+/// Upper bound applied to each parsed weight so a typo cannot dominate fusion.
+const RRF_WEIGHT_MAX: f64 = 10.0;
+
+/// Environment variable holding three comma-separated RRF weights
+/// (`vector,name,content`).
+const RRF_WEIGHTS_ENV: &str = "CODEGRAPH_RRF_WEIGHTS";
+
+/// Resolve the three channel weights from `CODEGRAPH_RRF_WEIGHTS`.
 ///
-/// This is the N-list form of [`rrf_fuse`]; for two lists the ids, the order and
-/// the scores are identical.
-pub(crate) fn rrf_fuse_lists(lists: &[&[String]], limit: usize) -> Vec<(String, f64)> {
+/// The value is three comma-separated floats in `vector,name,content` order.
+/// A missing or malformed value falls back to [`DEFAULT_RRF_WEIGHTS`], and each
+/// parsed weight is clamped to `0.0..=10.0`. Repositories with few or no
+/// documents can lower the content weight; setting
+/// `CODEGRAPH_RRF_WEIGHTS=1,1,1` restores equal-weight fusion.
+pub(crate) fn rrf_weights_from_env() -> (f64, f64, f64) {
+    let Ok(raw) = std::env::var(RRF_WEIGHTS_ENV) else {
+        return DEFAULT_RRF_WEIGHTS;
+    };
+    let parts: Vec<&str> = raw.split(',').collect();
+    if parts.len() != 3 {
+        return DEFAULT_RRF_WEIGHTS;
+    }
+
+    let mut weights = [0.0_f64; 3];
+    for (slot, part) in weights.iter_mut().zip(parts) {
+        let Ok(value) = part.trim().parse::<f64>() else {
+            return DEFAULT_RRF_WEIGHTS;
+        };
+        if !value.is_finite() {
+            return DEFAULT_RRF_WEIGHTS;
+        }
+        *slot = value.clamp(0.0, RRF_WEIGHT_MAX);
+    }
+
+    (weights[0], weights[1], weights[2])
+}
+
+/// Weighted Reciprocal Rank Fusion.
+///
+/// `score(id) = sum over lists of weight * 1/(RRF_K + rank)`, where `rank` is
+/// the 1-based position in that list. Only the first occurrence of an id within
+/// one list counts. Lists with a weight `<= 0` (or a non-finite weight) are
+/// skipped; empty lists contribute nothing.
+///
+/// Output is sorted by score descending, ties broken by id ascending, and
+/// truncated to `limit` when `limit > 0` (`limit == 0` means no limit).
+pub(crate) fn rrf_fuse_weighted(lists: &[(&[String], f64)], limit: usize) -> Vec<(String, f64)> {
     let mut fused: BTreeMap<String, f64> = BTreeMap::new();
 
-    for list in lists {
+    for (list, weight) in lists {
+        if !(*weight > 0.0) {
+            continue;
+        }
         let mut seen: HashSet<&str> = HashSet::new();
         for (index, id) in list.iter().enumerate() {
             if !seen.insert(id.as_str()) {
                 continue;
             }
-            *fused.entry(id.clone()).or_insert(0.0) += rrf_contribution(index + 1);
+            *fused.entry(id.clone()).or_insert(0.0) += weight * rrf_contribution(index + 1);
         }
     }
 
@@ -1058,6 +1109,25 @@ pub(crate) fn rrf_fuse_lists(lists: &[&[String]], limit: usize) -> Vec<(String, 
         hits.truncate(limit);
     }
     hits
+}
+
+/// Reciprocal Rank Fusion over an arbitrary number of equally weighted ranked lists.
+///
+/// Each list contributes `1 / (60 + rank)` for its first occurrence of an id
+/// (rank is 1-based); duplicates inside one list are ignored. Ties break on id
+/// so the order is deterministic. `limit == 0` means no truncation.
+///
+/// This is the N-list form of [`rrf_fuse`]; for two lists the ids, the order and
+/// the scores are identical. It delegates to [`rrf_fuse_weighted`] with every
+/// weight set to `1.0`.
+///
+/// Production search now calls [`rrf_fuse_weighted`] with per-channel weights;
+/// this equal-weight wrapper is kept as the documented baseline (and is exercised
+/// by the existing `rrf_fuse_lists_*` tests).
+#[allow(dead_code)]
+pub(crate) fn rrf_fuse_lists(lists: &[&[String]], limit: usize) -> Vec<(String, f64)> {
+    let weighted: Vec<(&[String], f64)> = lists.iter().map(|list| (*list, 1.0)).collect();
+    rrf_fuse_weighted(&weighted, limit)
 }
 
 /// Parse pgvector's text output format (`[0.1,0.25,-1.5]`) back into floats.
@@ -3283,6 +3353,109 @@ mod tests {
         );
         let b = fused.iter().find(|(id, _)| id == "b").expect("b present").1;
         assert!((b - 1.0 / 63.0).abs() < 1e-12, "rank is the list position");
+    }
+
+    #[test]
+    fn rrf_weighted_prefers_the_high_weight_list() {
+        let high = ids(&["high"]);
+        let low = ids(&["low"]);
+
+        let fused = rrf_fuse_weighted(&[(&high, 1.0), (&low, 0.1)], 0);
+
+        assert_eq!(
+            fused.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["high", "low"],
+            "a rank-1 hit at weight 1.0 must outrank a rank-1 hit at weight 0.1"
+        );
+        let score = |id: &str| {
+            fused
+                .iter()
+                .find(|(fused_id, _)| fused_id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the fused output"))
+                .1
+        };
+        assert!((score("high") - 1.0 / 61.0).abs() < 1e-12);
+        assert!((score("low") - 0.1 / 61.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rrf_weighted_zero_weight_drops_list() {
+        let kept = ids(&["kept"]);
+        let dropped = ids(&["dropped"]);
+
+        let fused = rrf_fuse_weighted(&[(&kept, 1.0), (&dropped, 0.0)], 0);
+
+        assert_eq!(fused.len(), 1, "a zero-weight list contributes no ids");
+        assert_eq!(fused[0].0, "kept");
+        assert!((fused[0].1 - 1.0 / 61.0).abs() < 1e-12);
+    }
+
+    /// `std::env::set_var` is process-wide, so the RRF weight tests must not run
+    /// concurrently. This guard restores the previous value on drop, including
+    /// when an assertion panics.
+    static RRF_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RrfWeightsGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl RrfWeightsGuard {
+        fn new(value: Option<&str>) -> Self {
+            let lock = RRF_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var(RRF_WEIGHTS_ENV).ok();
+            match value {
+                Some(value) => unsafe { std::env::set_var(RRF_WEIGHTS_ENV, value) },
+                None => unsafe { std::env::remove_var(RRF_WEIGHTS_ENV) },
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for RrfWeightsGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(RRF_WEIGHTS_ENV, value) },
+                None => unsafe { std::env::remove_var(RRF_WEIGHTS_ENV) },
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_weights_env_defaults_and_parsing() {
+        {
+            let _guard = RrfWeightsGuard::new(None);
+            assert_eq!(
+                rrf_weights_from_env(),
+                (0.5, 1.0, 1.0),
+                "unset must fall back to the evaluated defaults"
+            );
+        }
+        {
+            let _guard = RrfWeightsGuard::new(Some("1,1,1"));
+            assert_eq!(rrf_weights_from_env(), (1.0, 1.0, 1.0));
+        }
+        {
+            let _guard = RrfWeightsGuard::new(Some("x"));
+            assert_eq!(
+                rrf_weights_from_env(),
+                (0.5, 1.0, 1.0),
+                "malformed values fall back to the defaults"
+            );
+        }
+        {
+            let _guard = RrfWeightsGuard::new(Some("-1, 2.5, 99"));
+            assert_eq!(
+                rrf_weights_from_env(),
+                (0.0, 2.5, 10.0),
+                "each weight is clamped to 0.0..=10.0"
+            );
+        }
     }
 
     // ---- Integration tests (require CODEGRAPH_PG_URL, run with --ignored) ----
