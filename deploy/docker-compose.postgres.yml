@@ -1,0 +1,74 @@
+# Postgres 16 + pgvector for CodeGraph
+#
+# This is the reference deployment for CodeGraph's default storage backend. The
+# SurrealDB setup lives in docker-compose.yml and is still supported behind
+# `--features surrealdb`.
+#
+# Usage:
+#   cd deploy
+#   cp .env.example .env            # then set CODEGRAPH_PG_PASSWORD
+#   docker compose -f docker-compose.postgres.yml up -d
+#
+#   export CODEGRAPH_BACKEND=postgres
+#   export CODEGRAPH_PG_URL="postgres://codegraph:$CODEGRAPH_PG_PASSWORD@127.0.0.1:5433/codegraph"
+#   cd /path/to/project && codegraph index . --index-tier balanced
+#
+# No init scripts are needed: `codegraph index` creates the extension, tables and
+# indexes itself (`PgStore::ensure_schema`), then builds the HNSW indexes after the
+# rows are written (`CODEGRAPH_VECTOR_INDEX_MODE=deferred`).
+
+name: codegraph-pg
+
+services:
+  postgres:
+    image: pgvector/pgvector:${CODEGRAPH_PG_IMAGE_TAG:-pg16}
+    container_name: codegraph-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${CODEGRAPH_PG_USER:-codegraph}
+      POSTGRES_PASSWORD: ${CODEGRAPH_PG_PASSWORD:?CODEGRAPH_PG_PASSWORD must be set (see deploy/.env.example)}
+      POSTGRES_DB: ${CODEGRAPH_PG_DB:-codegraph}
+    command:
+      - postgres
+      # A 38k-chunk project (1024-d vectors) needs ~260MB of HNSW index. The 128MB
+      # default does not hold it, so every KNN query reads from disk.
+      - -c
+      - shared_buffers=${CODEGRAPH_PG_SHARED_BUFFERS:-1GB}
+      # HNSW index construction runs in parallel; 2 is the Postgres default and
+      # the value the published build-time measurements used.
+      - -c
+      - max_parallel_maintenance_workers=${CODEGRAPH_PG_PARALLEL_BUILD:-2}
+    # A parallel HNSW build allocates its working set from shared memory, so
+    # /dev/shm must be at least as large as maintenance_work_mem. Compose defaults
+    # it to 64MB, where `CREATE INDEX` fails with "could not resize shared memory
+    # segment" and the indexer falls back to a ~3x slower build.
+    #
+    # Measured on 38,080 chunks with 256MB of maintenance_work_mem:
+    #   shm 64MB  -> fallback, 11.7s
+    #   shm 512MB -> 4.7s
+    shm_size: ${CODEGRAPH_PG_SHM:-512m}
+    ports:
+      # Loopback by default; widen to 0.0.0.0 only when remote clients connect
+      # directly instead of through an SSH tunnel or a reverse proxy.
+      - "${CODEGRAPH_PG_HOST:-127.0.0.1}:${CODEGRAPH_PG_PORT:-5433}:5432"
+    volumes:
+      - codegraph-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${CODEGRAPH_PG_USER:-codegraph} -d ${CODEGRAPH_PG_DB:-codegraph}
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    mem_limit: ${CODEGRAPH_PG_MEM_LIMIT:-4g}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  # Named volume, not a bind mount: the image runs as its own `postgres` user and a
+  # bind mount would need matching ownership.
+  codegraph-pg-data:

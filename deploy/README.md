@@ -1,10 +1,70 @@
-# Deploying SurrealDB for CodeGraph
+# Deploying storage for CodeGraph
 
-This directory hosts the reference Docker Compose setup for the SurrealDB server that
-CodeGraph indexes into. It is optional: CodeGraph also works against an embedded
+This directory holds two reference Compose setups:
+
+| File | Backend | When |
+|---|---|---|
+| `docker-compose.postgres.yml` | Postgres 16 + pgvector | **the default**; `CODEGRAPH_BACKEND=postgres` or an unset client on a Postgres-only build |
+| `docker-compose.yml` | SurrealDB 4.x | only for builds with `--features surrealdb` |
+
+Both backends have a section below: Postgres first, since it is the default, then the
+SurrealDB setup along with the incident that shaped its memory limits and the
+client-side write deadline.
+
+## Postgres backend (default)
+
+```bash
+cd deploy
+cp .env.example .env                       # set CODEGRAPH_PG_PASSWORD
+docker compose -f docker-compose.postgres.yml up -d
+
+export CODEGRAPH_BACKEND=postgres
+export CODEGRAPH_PG_URL="postgres://codegraph:$CODEGRAPH_PG_PASSWORD@127.0.0.1:5433/codegraph"
+cd /path/to/project && codegraph index . --index-tier balanced
+```
+
+No init scripts: `codegraph index` creates the `vector` extension, the schema
+(`PgStore::ensure_schema`) and the HNSW indexes. Indexes are built **after** the rows
+are written, which is why the first run's `durable_reconcile_and_indexes` phase grows
+by a few seconds.
+
+Two settings in the compose file are not cosmetic:
+
+- **`shm_size: 512m`.** A parallel HNSW build allocates its working set from shared
+  memory, so `/dev/shm` must be at least as large as `maintenance_work_mem` (the
+  indexer asks for 256MB). Compose defaults it to 64MB, where `CREATE INDEX` fails
+  with `could not resize shared memory segment`; the indexer then rolls back and
+  rebuilds serially — correct, but ~3x slower. Measured on 38,080 chunks:
+  `shm 64MB -> 11.7s`, `shm 512MB -> 4.7s`.
+- **`shared_buffers=1GB`.** A 38k-chunk project's HNSW index is ~260MB and the
+  Postgres default page cache is 128MB, so the default thrashes on every KNN query.
+
+`mem_limit: 4g` is a starting point for a 38k-chunk project; `shared_buffers` plus a
+parallel index build peak well under it.
+
+### Migrating from SurrealDB
+
+The two backends share nothing on disk. A switch means a full re-index into the new
+store:
+
+```bash
+export CODEGRAPH_BACKEND=postgres
+export CODEGRAPH_PG_URL=...
+codegraph index /path/to/project --index-tier full --force
+```
+
+Keep the SurrealDB volume until the Postgres graph is verified.
+
+## SurrealDB backend (legacy)
+
+The remainder of this file describes the SurrealDB setup: why it exists, the memory
+limit it needs, and the incident that produced both the compose file and the
+client-side write deadline.
+
+It is optional in the sense that a SurrealDB build also works against an embedded
 `surrealkv://` store, but that serialises indexing and queries in one process.
 
-## Why this file exists
+### Why this file exists
 
 CodeGraph does **not** run SurrealDB itself. The server is the indexing backend, and
 its storage engine has its own failure mode under sustained writes. A production
@@ -44,7 +104,7 @@ This compose file fixes (2). Fix (1) lives in the Rust code:
   `graph writer: N rows persisted` every ~5k rows, so progress survives `nohup`
   (the interactive progress bars do not).
 
-## What the memory limit buys
+### What the memory limit buys
 
 SurrealDB v3.3.0 exposes **no** flag or environment variable for the block cache or the
 memtable size; SurrealKV derives both from the memory it can see. A cgroup limit is
@@ -65,7 +125,7 @@ docker logs codegraph-db 2>&1 | grep -E "block cache capacity|max memtable size"
 If the numbers do not match the table, the limit is not being applied (for example the
 container was started without `mem_limit`, or an old container is still running).
 
-## Usage
+### Usage
 
 ```bash
 cd deploy
@@ -89,7 +149,7 @@ CODEGRAPH_SURREALDB_USERNAME=root
 CODEGRAPH_SURREALDB_PASSWORD=...
 ```
 
-## Pin SurrealDB 4.x, not 3.x
+### Pin SurrealDB 4.x, not 3.x
 
 **4.x is not optional for large projects.** The 3.x datastore bounds memtable residency
 by entry count instead of bytes, so a first-time index of a large project grows the
@@ -123,7 +183,7 @@ cd /path/to/project && codegraph index . --index-tier balanced
 
 Keep the old volume until the new one is verified; it is the only rollback path.
 
-## Notes
+### Notes
 
 - The image runs as `nonroot`. Named volumes created by Docker are writable; bind mounts
   are not, unless you fix ownership.
