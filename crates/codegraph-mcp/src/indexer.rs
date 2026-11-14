@@ -99,7 +99,7 @@ pub struct IndexerConfig {
     /// Generate SCIP indexes for detected languages before indexing.
     #[serde(default)]
     pub scip_auto: bool,
-    /// With `scip_auto`, fail instead of falling back to LSP.
+    /// With `scip_auto`, fail instead of continuing without a compiler index.
     #[serde(default)]
     pub scip_strict: bool,
     pub languages: Vec<String>,
@@ -1210,7 +1210,7 @@ impl ProjectIndexer {
             nodes.sort_by_key(|node| node.id);
             nodes.dedup_by_key(|node| node.id);
 
-            let mut enrichment_stats = crate::analyzers::lsp::LspEnrichmentStats::default();
+            let mut enrichment_stats = crate::analyzers::EnrichmentStats::default();
             let mut scip_covered: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
             if !scip_specs.is_empty() {
@@ -1224,7 +1224,10 @@ impl ProjectIndexer {
                         &source_snapshots,
                         &mut nodes,
                         &mut edges,
-                        analyzer_settings.lsp_definitions_enabled(),
+                        matches!(
+                            self.config.indexing_tier,
+                            codegraph_core::config_manager::IndexingTier::Full
+                        ),
                     )?;
                     scip_covered.extend(scip_stats.covered_files.iter().cloned());
                     enrichment_stats.nodes_enriched += scip_stats.nodes_enriched;
@@ -1311,7 +1314,7 @@ impl ProjectIndexer {
 
                 basic_enrichment_stats = enrich_stats;
                 info!(
-                    "🧾 Enrichment analysis complete: docs={} api_marked={} exports={} reexports={} feature_enables={} lsp_uses={} in {:.1?}",
+                    "🧾 Enrichment analysis complete: docs={} api_marked={} exports={} reexports={} feature_enables={} uses={} in {:.1?}",
                     basic_enrichment_stats.docs_attached,
                     basic_enrichment_stats.api_marked,
                     basic_enrichment_stats.export_edges_added,
@@ -2416,10 +2419,10 @@ impl ProjectIndexer {
                 path,
                 &file_config,
             )?;
-            // Language servers (jdtls/KLS) generate IDE/Gradle files while importing the
-            // project, so the second walk can legitimately differ from the first. The graph
-            // already written is a consistent snapshot; mark it incomplete instead of
-            // failing the whole run and dropping the stats file.
+            // The SCIP indexers used before indexing may generate IDE/Gradle files while
+            // importing the project, so the second walk can legitimately differ from the
+            // first. The graph already written is a consistent snapshot; mark it
+            // incomplete instead of failing the whole run and dropping the stats file.
             let inputs_changed = current_files != all_files
                 || crate::reconciliation::support_fingerprints(&self.project_root)? != support
                 || crate::analyzers::build_context::external_input_fingerprints(

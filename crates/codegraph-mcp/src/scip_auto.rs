@@ -1,5 +1,5 @@
-// ABOUTME: Generates SCIP indexes for detected languages so indexing can skip per-file LSP rounds.
-// ABOUTME: Caches indexes by source fingerprint and falls back to language servers when a tool is unavailable.
+// ABOUTME: Generates SCIP indexes for detected languages so indexing needs no per-file language-server rounds.
+// ABOUTME: Caches indexes by source fingerprint and skips a language when its indexer is unavailable.
 use anyhow::{Context, Result, bail};
 use codegraph_core::artifact_cache::{ArtifactCache, fingerprint};
 use serde::{Deserialize, Serialize};
@@ -142,8 +142,8 @@ pub fn source_fingerprint(root: &Path, plan: &ScipPlan) -> Result<String> {
 
 /// Generate (or reuse) every detected index and return `CODEGRAPH_SCIP_INDEX` entries.
 ///
-/// With `strict`, a missing indexer or a failed run is an error instead of a fallback
-/// to language servers.
+/// With `strict`, a missing indexer or a failed run is an error instead of skipping
+/// that language's compiler-index enrichment.
 pub fn ensure_indexes(root: &Path, out_dir: &Path, strict: bool) -> Result<Vec<String>> {
     let plans = plan_indexes(root, out_dir);
     if plans.is_empty() {
@@ -175,7 +175,7 @@ pub fn ensure_indexes(root: &Path, out_dir: &Path, strict: bool) -> Result<Vec<S
                 );
             }
             warn!(
-                "SCIP indexer `{}` for {cache_key} was not found on PATH; falling back to language servers",
+                "SCIP indexer `{}` for {cache_key} was not found on PATH; skipping its compiler-index enrichment",
                 plan.program
             );
             continue;
@@ -203,7 +203,7 @@ pub fn ensure_indexes(root: &Path, out_dir: &Path, strict: bool) -> Result<Vec<S
                 );
             }
             warn!(
-                "`{}` failed while generating the {cache_key} SCIP index ({}); falling back to language servers:\n{tail}",
+                "`{}` failed while generating the {cache_key} SCIP index ({}); skipping its compiler-index enrichment:\n{tail}",
                 plan.program, output.status
             );
             continue;
