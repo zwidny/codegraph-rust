@@ -72,17 +72,18 @@ supplied, local OpenAI-compatible provider, `CODEGRAPH_SEMANTIC_RESOLUTION=defer
 | tier | embedding | WALL | chunks | nodes | edges | `analyzers` | `embeddings_and_writes` | HNSW build |
 |---|---|---|---|---|---|---|---|---|
 | fast | off | 8.70 s | 0 | 37,111 | 45,287 | ~0.7 s | 0 | 0 |
-| fast | on | **30.88 s** | 37,132 | 37,111 | 45,287 | 0.70 s | 8.1 s | 11.5 s |
+| fast | on | **23.17 s** | 37,132 | 37,111 | 45,287 | 0.71 s | 7.8 s | 4.7 s |
 | balanced | off | 14.84 s | 0 | 38,057 | 79,801 | 0.86 s | 0 | 0 |
-| balanced | on | **34.49 s** | 38,080 | 38,057 | 79,781 | 0.85 s | 8.1 s | 11.8 s |
+| balanced | on | **27.98 s** | 38,080 | 38,057 | 79,781 | 0.85 s | 8.2 s | 4.7 s |
 | full | off | 26.55 s | 0 | 75,353 | 246,291 | 2.47 s | 0 | 0 |
-| full | on | **58.01 s** | 75,376 | 75,353 | 246,270 | 2.45 s | 12.1 s | 19.5 s |
+| full | on | **52.69 s** | 75,376 | 75,353 | 246,270 | 2.44 s | 12.0 s | 14.1 s |
 
 Read it as three independent dials:
 
-- **Turning embedding on costs 20–32 s**, split roughly evenly between the one-shot
-  HNSW build (11.5–19.5 s) and vector generation plus the binary write (8.1–12.1 s,
-  warm cache).
+- **Turning embedding on costs 8–26 s**, split between the one-shot HNSW build
+  (4.7–14.1 s) and vector generation plus the binary write (7.8–12.0 s, warm cache).
+  The build figure assumes the container gives `/dev/shm` at least 256 MB — see the
+  HNSW notes below.
 - **All analyzer stages together cost 18 s.** fast → balanced is +6 s; balanced → full
   (dataflow + architecture + `references` edges) is +12 s.
 - **Embedding changes no graph structure.** Node counts are identical and the ~20-edge
@@ -94,12 +95,34 @@ Two hardware-dependent details:
   and `--force` drops the indexes before writing so inserts never maintain them. Before
   that change the same run spent 92 s inside `embeddings_and_writes` maintaining HNSW
   per row; see the commit history around `d14acfb` / `ed6fc67`.
-- `m`/`ef_construction` are 12/64. Measured on the same 38,080 chunks, three builds
-  each: `m=12 ef=150` took 21.7–22.3 s, `m=12 ef=64` 11.6–11.7 s, `m=8 ef=32`
-  5.5–5.6 s — while recall@10 stayed inside a 0.94–0.98 band for all three. The
-  higher `ef_construction` bought no recall, so the cheap setting is in use.
+- The build sets `maintenance_work_mem = 256MB` for itself, because pgvector's default
+  of 64 MB does not fit this graph (`hnsw graph no longer fits into
+  maintenance_work_mem after 13527 tuples`). Measured with two parallel workers:
+
+  | maintenance_work_mem | build (38,080 chunks) |
+  |---|---|
+  | 64MB (server default) | 11.6 s |
+  | 256MB | **4.4 s** |
+  | 1GB | 4.8 s |
+
+  A **parallel** HNSW build needs `/dev/shm` at least that large. A container with the
+  default 64 MB shm makes `CREATE INDEX` fail with "could not resize shared memory
+  segment"; the build then rolls back, logs a warning, and rebuilds with the server
+  default (11.7 s instead of 4.7 s, still correct). Set `--shm-size=512m` on the
+  Postgres container to get the fast path.
+
+- `m`/`ef_construction` are 12/64, and `hnsw.ef_search` keeps its default of 40.
   Because the index is created with `IF NOT EXISTS`, an existing store keeps its old
   parameters until a `--force` run drops and recreates it.
+
+- **Comparing HNSW parameters on this corpus needs distance quality, not id overlap.**
+  38,080 chunks contain only 33,222 distinct vectors; 1,869 vectors are shared, the
+  largest by 254 identical `use super::*;` chunks. Any query's exact top-10 is
+  therefore a set of ties, and comparing which ids came back measures tie-breaking,
+  not search quality — three id-set runs of `ef_construction=150` vs `64` suggested
+  "no difference". Compared by average distance of the tenth hit instead, 150 matched
+  the exact scan exactly (0.29535) and 64 sat 0.00007 above it. The 0.02% gap is not
+  worth 10 s of build time, so 64 stays.
 
 A supplied SCIP index is imported on every tier — `balanced` drops `references` edges and
 does not synthesize them from SCIP occurrences, `full` does. See
