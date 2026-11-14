@@ -47,18 +47,21 @@ known, use ordinary repository tools. Do not install, configure, download models
 reindex merely because this guidance was injected. Internal graph analysis tools
 are for CodeGraph's built-in agents; use only the four agentic commands above.
 
-For a large or multi-hop change, externalise the design and gate it before editing:
+Externalise the design and gate it before editing, and also **while you investigate or
+design** — `plan check` is offline (no DB, no LLM), so it is cheap to iterate on:
 
 ```sh
 codegraph plan --project . check plan.json     # offline: nodes/edges/constraints
 codegraph plan --project . verify plan.json    # compare with the indexed code graph
+codegraph plan --project . store plan.json --plan-id <id>   # keep it; `show <id>` reloads
 ```
 
 `plan check` catches undeclared references, layering violations and cycles before the
 code exists. `plan verify` reports `unplanned_code_edges` (dependencies the code already
 has that the plan forgot) and `existing_planned_nodes` (symbols you may be re-creating).
-Use it when adding a module, crossing layers, chaining 3+ hops, or changing the public
-interfaces of 3+ files; skip it for a single-file fix.
+Use it when investigating a multi-module behaviour, designing an approach, adding a
+module, crossing layers, chaining 3+ hops, or changing the public interfaces of 3+ files;
+skip it only for a one-line lookup or a mechanical rename.
 
 A partial re-index updates only the scanned scope. Compiler-grade enrichment comes from the
 SCIP index you pass in `CODEGRAPH_SCIP_INDEX`; files the index does not cover stay AST-only.

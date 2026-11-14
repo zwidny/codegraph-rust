@@ -350,25 +350,31 @@ Use the four public agent commands; internal graph tools belong to CodeGraph's
 built-in agents. Reload usage details with `codegraph agent instructions`.
 <!-- codegraph:end -->
 
-### 何时必须先用 `plan`（规划校验）
+### 何时用 `plan_check` / `plan`（思考、调研、设计、写代码前）
 
-写代码**之前**，只要命中下面任一条，就先外化节点/边/约束并调用 `plan_check`（离线）或
-`codegraph plan check`：
+不只是「写代码之前」。当你在**思考一个问题、调研某个行为、设计一个方案**时，只要逻辑超过一跳
+或涉及多个模块，就把你**认为存在**的节点/边/约束写出来，调 `plan_check`（离线）或
+`codegraph plan check` 梳理一遍——把隐含依赖、环、缺节点、分层违规在**还来得及改**的时候暴露出来。
+粗略的图就行：`known_nodes` 会告诉你漏声明了谁。
 
+触发（任一）：
+
+- 调研「为什么是这样」，原因跨多个模块，或你不确定各部件怎么连；
+- 设计/比较方案、决定走哪条路；
 - 新增模块 / crate 级特性 / provider-factory 路径；
-- 跨层改动（例如 `cli -> core -> vector`），或要改变这个方向；
-- 多跳依赖（A 调 B、B 调 C，或新类型在别处实现某个 trait）；
-- 同时改动 ≥3 个文件的公共接口（签名、trait 方法、配置键、schema）。
+- 跨层改动，或要改变依赖方向；
+- 多跳依赖（A 调 B、B 调 C，或新类型在别处实现 trait）；
+- 同时改动 ≥3 个文件公共接口。
 
-单文件 bug fix、改文案、单模块内机械重命名**不用** plan——那只是复述代码图里已有的东西。
+只有「一句话的事实查询」或「单模块内机械重命名」才跳过。
 
-调用要点：节点 = 模块 / 类型 / trait（`id` 用你打算写的真实符号名，`plan verify` 按名字比对），
-边 = `calls` / `implements` / `uses`，约束 = `acyclic` + `layering` + `coverage`（必要时
-`no_path` / `max_fan_*`）。`known_nodes` 抓未声明的引用，`layering` / `acyclic` 抓设计错误。
+记录：形成的计划用 `codegraph plan --project <root> store plan.json --plan-id <id>` 存下来
+（`project_id = plan:<id>`），下次 `plan show <id>` 读回继续——这就是跨会话的计划记录。
 
-MCP 的 `plan_check` 是**离线**校验，不读代码图；要和已有代码对照，用 CLI：
-`codegraph plan --project <已索引的项目根> verify plan.json`（看 `unplanned_code_edges`
-和 `existing_planned_nodes`）。详细说明见 `docs/PLAN_CHECK.md`。
+调用要点：节点 = 模块/类型/trait（`id` 用真实符号名，`plan verify` 按名字比对），
+边 = `calls`/`implements`/`uses`，约束 = `acyclic` + `layering` + `coverage`（必要时
+`no_path`/`max_fan_*`）。MCP `plan_check` 离线；对照已有代码用 CLI
+`codegraph plan --project <已索引项目根> verify plan.json`。详见 `docs/PLAN_CHECK.md`。
 
 ### 部分索引与 SCIP
 

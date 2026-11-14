@@ -51,9 +51,11 @@ Eight tools query the code graph directly. They are **20–100× faster** than t
 raw structured data you can compose yourself. **Prefer these for concrete
 questions; reach for `agentic_*` only when you need a synthesized explanation.**
 
-A ninth direct tool, `plan_check`, validates a **draft** graph you are planning
-(nodes/edges/constraints) before any code exists. Use it to externalise reasoning
-and catch cycles, uncovered paths, layering violations and dangling references.
+A ninth direct tool, `plan_check`, validates a **draft** graph (nodes/edges/constraints)
+offline. Reach for it whenever you are **thinking a problem through** — investigating a
+behaviour, designing an approach, or reasoning about how pieces connect — not only right
+before writing code. It externalises the logic so cycles, uncovered paths, layering
+violations and dangling references surface while you can still change course.
 
 | Question | Tool | Required params |
 |---|---|---|
@@ -65,7 +67,7 @@ and catch cycles, uncovered paths, layering violations and dangling references.
 | Detect circular dependency cycles | `detect_circular_dependencies` | `edge_type` |
 | Complexity hotspots | `find_complexity_hotspots` | — (`min_complexity`, `limit`) |
 | High-degree hub nodes | `get_hub_nodes` | — (`min_degree`) |
-| Validate a planned logic graph | `plan_check` | `plan` (object with `nodes`, `edges`, `constraints`) |
+| Externalise / validate your reasoning as a graph (plans, investigations, designs) | `plan_check` | `plan` (object with `nodes`, `edges`, `constraints`) |
 
 ### Getting a `node_id`
 
@@ -90,22 +92,27 @@ use `imports`.
 
 ---
 
-## Plan before a large change (`plan_check`)
+## Think with `plan_check` (investigation, design, pre-code plans)
 
-`plan_check` validates a **draft logic graph** (nodes, edges, constraints) offline,
-before the code exists. Use it to make implicit dependencies explicit: on a long,
-multi-hop task the model does not reliably re-read earlier context, so the same
-constraint can be violated several steps later.
+`plan_check` validates a **draft logic graph** (nodes, edges, constraints) offline — no
+database, no LLM — so it is cheap enough to use **while you think**, not only at the end.
+On a task with more than one hop the model does not reliably re-read earlier context, so
+writing the entities and relations down, then checking them, surfaces contradictions the
+prose hides. Encode what you *believe*; a rough graph is fine, and `known_nodes` /
+violations tell you what you missed.
 
 **When** (any one of these):
 
+- **investigating** why something behaves a certain way, when the cause spans several
+  modules or you are unsure how the pieces connect;
+- **designing an approach** or comparing options before committing to one;
 - adding a module, crate-level feature or provider/factory path;
 - a cross-layer change (e.g. `cli -> core -> vector`) or reversing that direction;
 - a multi-hop dependency (A calls B calls C, or a new type implements a trait elsewhere);
 - changing the public interface of 3+ files (signature, trait method, config key, schema).
 
-Skip it for a single-file fix, a docs/text change or a mechanical rename inside one
-module.
+For a one-line fact lookup just use the graph tools; skip `plan_check` when the reasoning
+is a single hop or the change is a mechanical rename in one module.
 
 **How**:
 
